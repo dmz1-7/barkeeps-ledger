@@ -7,8 +7,9 @@ levels** so you can walk the cellar and count fast. It spits out the two numbers
 that matter: **COGS %** and **Labor %** (plus prime cost).
 
 Phone-first, runs on your own machine or a cheap VPS, data stays in a single
-SQLite file. Aesthetic: illuminated-ledger medieval meets Double-RL Americana —
-parchment, oxblood, brass, and a blackletter sign over the door.
+SQLite file. Aesthetic: a bright 1930s American diner — cherry red, turquoise,
+cream and chrome, a checkerboard trim, a neon-script sign over the door, and
+big, easy-to-read numbers.
 
 ---
 
