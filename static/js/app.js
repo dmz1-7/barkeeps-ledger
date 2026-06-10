@@ -74,6 +74,28 @@ const iso = (d) => d.toISOString().slice(0, 10);
 function weekStart(d = new Date()) { const x = new Date(d); const day = (x.getDay() + 6) % 7; x.setDate(x.getDate() - day); return x; }
 function monthStart(d = new Date()) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 
+// Keep a From/To pair coherent: the picker is constrained (To can't precede From
+// and vice-versa), and a typed reversed range is clamped + flagged. `onChange`
+// fires only after the range is made coherent.
+function linkDates(startEl, endEl, onChange) {
+  const sync = () => {
+    endEl.min = startEl.value || "";
+    startEl.max = endEl.value || "";
+  };
+  const handle = (e) => {
+    if (startEl.value && endEl.value && startEl.value > endEl.value) {
+      if (e && e.target === startEl) endEl.value = startEl.value;
+      else startEl.value = endEl.value;
+      toast("From can’t be after To — adjusted.");
+    }
+    sync();
+    if (onChange) onChange();
+  };
+  sync();
+  startEl.addEventListener("change", handle);
+  endEl.addEventListener("change", handle);
+}
+
 /* ============================================================
    AUTH GATE
    ============================================================ */
@@ -293,7 +315,9 @@ async function renderDashboard() {
     const b = e.target.closest(".chip"); if (!b) return;
     setRange(b.dataset.k);
   });
+  linkDates($("#d-start"), $("#d-end"));  // keep custom From/To coherent
   $("#d-go").addEventListener("click", () => {
+    if (!$("#d-start").value || !$("#d-end").value) { toast("Pick both From and To."); return; }
     dashRange = { start: $("#d-start").value, end: $("#d-end").value, key: "custom" };
     loadDash();
   });
@@ -441,8 +465,8 @@ async function renderOrders() {
       vendors.map((vd) => `<option value="${esc(vd.name)}">${esc(vd.name)}</option>`).join(""));
   } catch (e) { /* filter is optional */ }
 
-  ["o-start", "o-end", "o-vendor", "o-status"].forEach((id) =>
-    $("#" + id).addEventListener("change", loadOrders));
+  linkDates($("#o-start"), $("#o-end"), loadOrders);
+  ["o-vendor", "o-status"].forEach((id) => $("#" + id).addEventListener("change", loadOrders));
   await loadOrders();
 }
 
@@ -898,8 +922,7 @@ async function renderSettings() {
       }));
     } catch (e) { box.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
   }
-  $("#mx-start").addEventListener("change", loadMix);
-  $("#mx-end").addEventListener("change", loadMix);
+  linkDates($("#mx-start"), $("#mx-end"), loadMix);
   loadMix();
   $("#save-mix").addEventListener("click", async () => {
     const mix = {};
@@ -1137,7 +1160,7 @@ function dateFilterBar(onChange) {
     <label class="fld"><span>To</span><input type="date" class="r-end" value="${def.end}"></label>
   </div>`);
   const get = () => ({ start: bar.querySelector(".r-start").value, end: bar.querySelector(".r-end").value });
-  bar.querySelectorAll("input").forEach((i) => i.addEventListener("change", () => onChange(get())));
+  linkDates(bar.querySelector(".r-start"), bar.querySelector(".r-end"), () => onChange(get()));
   return { bar, get };
 }
 
