@@ -725,7 +725,7 @@ def vendor_item_list():
         "SELECT vi.*, c.name AS category_name, c.category_type, p.name AS product_name "
         "FROM vendor_items vi LEFT JOIN categories c ON c.id = vi.category_id "
         "LEFT JOIN inventory_items p ON p.id = vi.product_id "
-        f"WHERE {' AND '.join(where)} ORDER BY vi.vendor_item_name COLLATE NOCASE LIMIT 1000",
+        f"WHERE {' AND '.join(where)} ORDER BY vi.vendor_item_name COLLATE NOCASE LIMIT 5000",
         params,
     ).fetchall()
     return jsonify([dict(r) for r in rows])

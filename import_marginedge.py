@@ -154,23 +154,29 @@ class Importer:
     def import_invoices(self, path):
         with open(path, newline="", encoding="utf-8-sig") as fh:
             reader = csv.reader(fh)
-            header = next(reader)
-            cat_cols = header[5:]               # category columns start after Total
+            header = [h.strip() for h in next(reader)]
+            # Locate columns by NAME (exports vary, e.g. an extra "Sync Status").
+            idx = {name: i for i, name in enumerate(header)}
+            total_i = idx["Total"]
+            date_i, num_i, vendor_i = idx["Invoice Date"], idx["Invoice #"], idx["Vendor"]
+            status_i = idx.get("Status")
+            cat_start = total_i + 1            # category columns follow Total
+            cat_cols = header[cat_start:]
             cat_ids = [self.category_id(c) for c in cat_cols]
             self.c.execute("DELETE FROM invoices WHERE location_id IS ?", (self.loc,))
             n_inv = n_line = 0
             for row in reader:
                 if not any(row):
                     continue
-                date, num, vendor, status, total = row[0], row[1], row[2], row[3], row[4]
+                status = row[status_i] if status_i is not None else "closed"
                 cur = self.c.execute(
                     "INSERT INTO invoices(location_id, vendor, invoice_date, invoice_number, status, total) "
                     "VALUES(?,?,?,?,?,?)",
-                    (self.loc, vendor.strip(), _iso(date), num.strip(),
-                     (status or "closed").strip().lower(), _price(total)))
+                    (self.loc, row[vendor_i].strip(), _iso(row[date_i]), row[num_i].strip(),
+                     (status or "closed").strip().lower(), _price(row[total_i])))
                 inv_id = cur.lastrowid
                 n_inv += 1
-                for amt_s, cid in zip(row[5:], cat_ids):
+                for amt_s, cid in zip(row[cat_start:], cat_ids):
                     amt = _price(amt_s)
                     if amt:
                         self.c.execute(
@@ -182,13 +188,36 @@ class Importer:
         print(f"  invoices: {n_inv} | category lines: {n_line}")
 
 
+def _resolve(dirpath, override, *patterns):
+    """Find a CSV by override path or case-insensitive glob (newest match),
+    so browser-renamed variants like 'vendorItems (1).csv' still resolve."""
+    import glob
+    if override:
+        return override
+    listing = os.listdir(dirpath)
+    for pat in patterns:
+        rx = re.compile(pat, re.IGNORECASE)
+        matches = [os.path.join(dirpath, n) for n in listing if rx.match(n)]
+        if matches:
+            return max(matches, key=os.path.getmtime)
+    sys.exit(f"Could not find a file matching {patterns} in {dirpath}")
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Import MarginEdge CSVs into a store.")
     ap.add_argument("downloads_dir", nargs="?", default=DEFAULT_DIR)
     ap.add_argument("--location", default="Pubkey DC",
                     help="Store name to import into (must exist in the locations table).")
+    ap.add_argument("--products", help="Path to the products CSV (else auto-detect).")
+    ap.add_argument("--vendor-items", dest="vendor_items", help="Path to the vendor items CSV.")
+    ap.add_argument("--category-report", dest="category_report", help="Path to the category report CSV.")
     args = ap.parse_args()
+
+    d = args.downloads_dir
+    products = _resolve(d, args.products, r"products.*\.csv$")
+    vendor_items = _resolve(d, args.vendor_items, r"vendor.?items.*\.csv$")
+    category_report = _resolve(d, args.category_report, r"category.?report.*\.csv$")
 
     db.init_db()
     conn = sqlite3.connect(db.DB_PATH)
@@ -200,11 +229,14 @@ def main():
         sys.exit(f"Unknown location {args.location!r}. Known: {names}")
 
     imp = Importer(conn, loc["id"])
-    print(f"Importing MarginEdge data from {args.downloads_dir} into '{args.location}' (id {loc['id']})")
+    print(f"Importing into '{args.location}' (id {loc['id']})")
+    print(f"  products:        {os.path.basename(products)}")
+    print(f"  vendor items:    {os.path.basename(vendor_items)}")
+    print(f"  category report: {os.path.basename(category_report)}")
     imp.clear_location()
-    imp.import_products(_read(os.path.join(args.downloads_dir, "products.csv")))
-    imp.import_vendor_items(_read(os.path.join(args.downloads_dir, "vendorItems.csv")))
-    imp.import_invoices(os.path.join(args.downloads_dir, "categoryReport.csv"))
+    imp.import_products(_read(products))
+    imp.import_vendor_items(_read(vendor_items))
+    imp.import_invoices(category_report)
     conn.commit()
     conn.close()
     print("Done.")
