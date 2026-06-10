@@ -19,6 +19,17 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT
 );
 
+-- Stores. Each location's data (products, vendors, vendor items, invoices,
+-- counts, sales mix) is kept separate; categories are shared. Each maps to a
+-- Square location so sales/labor follow the active store. Seeded on first run.
+CREATE TABLE IF NOT EXISTS locations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    name               TEXT NOT NULL UNIQUE,
+    square_location_id TEXT,
+    archived           INTEGER DEFAULT 0,
+    created_at         TEXT DEFAULT (datetime('now'))
+);
+
 -- The two-level spend taxonomy: every Category belongs to a Category Type.
 -- Seeded on first run (see TAXONOMY); the user can add/rename/archive later.
 CREATE TABLE IF NOT EXISTS categories (
@@ -31,6 +42,7 @@ CREATE TABLE IF NOT EXISTS categories (
 
 CREATE TABLE IF NOT EXISTS invoices (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    location_id    INTEGER REFERENCES locations(id),
     vendor         TEXT,
     invoice_date   TEXT,             -- ISO yyyy-mm-dd
     invoice_number TEXT,
@@ -64,6 +76,7 @@ CREATE TABLE IF NOT EXISTS invoice_items (
 -- Category. New ones land in the "New Item Review" queue (status = 'new').
 CREATE TABLE IF NOT EXISTS vendor_items (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    location_id        INTEGER REFERENCES locations(id),
     vendor_id          INTEGER REFERENCES vendors(id) ON DELETE SET NULL,
     vendor_name        TEXT,
     vendor_item_name   TEXT,
@@ -80,15 +93,17 @@ CREATE TABLE IF NOT EXISTS vendor_items (
 
 -- Actual sales mix the user enters per reporting period; powers P&L income.
 CREATE TABLE IF NOT EXISTS sales_mix (
+    location_id   INTEGER NOT NULL DEFAULT 0,
     period_start  TEXT NOT NULL,
     period_end    TEXT NOT NULL,
     category_type TEXT NOT NULL,
     pct           REAL DEFAULT 0,
-    PRIMARY KEY (period_start, period_end, category_type)
+    PRIMARY KEY (location_id, period_start, period_end, category_type)
 );
 
 CREATE TABLE IF NOT EXISTS vendors (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    location_id    INTEGER REFERENCES locations(id),
     name           TEXT NOT NULL,
     contact_name   TEXT,
     phone          TEXT,
@@ -105,6 +120,7 @@ CREATE TABLE IF NOT EXISTS vendors (
 -- Products UI/API drive off category_id and the extra columns below.)
 CREATE TABLE IF NOT EXISTS inventory_items (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    location_id    INTEGER REFERENCES locations(id),
     name           TEXT NOT NULL,
     category       TEXT,            -- legacy flat tag; superseded by category_id
     category_id    INTEGER REFERENCES categories(id) ON DELETE SET NULL,
@@ -124,6 +140,7 @@ CREATE TABLE IF NOT EXISTS inventory_items (
 
 CREATE TABLE IF NOT EXISTS counts (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    location_id INTEGER REFERENCES locations(id),
     taken_at  TEXT DEFAULT (datetime('now')),
     note      TEXT,
     value     REAL DEFAULT 0        -- snapshot of total $ value at count time
@@ -174,6 +191,13 @@ LEGACY_CATEGORY_MAP = {
     "other": None,
 }
 
+# Seeded stores: (name, Square location id). The first is the default; all
+# pre-location data is migrated onto it.
+LOCATIONS = [
+    ("Pubkey DC", "LNKNR2A7MBB4K"),
+    ("Pubkey NYC", "LS1WRASW8V02R"),
+]
+
 DEFAULT_SETTINGS = {
     "target_cogs_pct": "30",      # % of sales
     "target_labor_pct": "25",     # % of sales
@@ -206,6 +230,7 @@ _ADDED_COLUMNS = {
         "status": "TEXT DEFAULT 'closed'",
         "payment_account": "TEXT",
         "upload_date": "TEXT",
+        "location_id": "INTEGER",
     },
     "invoice_items": {
         "vendor_item_id": "INTEGER",
@@ -217,7 +242,11 @@ _ADDED_COLUMNS = {
         "accounting_code": "TEXT",
         "on_inventory": "INTEGER DEFAULT 1",
         "tax_exempt": "INTEGER DEFAULT 0",
+        "location_id": "INTEGER",
     },
+    "vendor_items": {"location_id": "INTEGER"},
+    "vendors": {"location_id": "INTEGER"},
+    "counts": {"location_id": "INTEGER"},
 }
 
 
@@ -241,6 +270,47 @@ def _seed_taxonomy(conn):
                 (name, ctype, order),
             )
             order += 1
+
+
+def _seed_locations(conn):
+    """Insert seeded stores that aren't present yet (idempotent)."""
+    for name, sq in LOCATIONS:
+        conn.execute(
+            "INSERT OR IGNORE INTO locations(name, square_location_id) VALUES(?,?)",
+            (name, sq),
+        )
+
+
+def _predrop_legacy_sales_mix(conn):
+    """sales_mix gained location_id in its primary key; ALTER can't change a PK,
+    so drop the old (pre-location, transient) table and let SCHEMA recreate it."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sales_mix)")}
+    if cols and "location_id" not in cols:
+        conn.execute("DROP TABLE sales_mix")
+
+
+def _migrate_locations(conn):
+    """One-time: tag all pre-location rows with the default store (DC), set the
+    active location, and mirror its Square id into the square_location_id setting."""
+    if conn.execute("SELECT 1 FROM settings WHERE key='migrated_locations'").fetchone():
+        return
+    row = conn.execute(
+        "SELECT id, square_location_id FROM locations ORDER BY id LIMIT 1"
+    ).fetchone()
+    if not row:
+        return
+    loc_id, sq = row["id"], row["square_location_id"]
+    for tbl in ("invoices", "inventory_items", "vendor_items", "vendors", "counts"):
+        conn.execute(f"UPDATE {tbl} SET location_id=? WHERE location_id IS NULL", (loc_id,))
+    conn.execute("UPDATE sales_mix SET location_id=? WHERE location_id=0", (loc_id,))
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES('active_location_id', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(loc_id),))
+    if sq:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('square_location_id', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (sq,))
+    conn.execute("INSERT INTO settings(key, value) VALUES('migrated_locations','1')")
 
 
 def _category_ids(conn):
@@ -314,6 +384,7 @@ def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    _predrop_legacy_sales_mix(conn)
     conn.executescript(SCHEMA)
     _ensure_columns(conn)
     conn.executescript(POST_INDEXES)
@@ -327,7 +398,9 @@ def init_db():
         if row is None:
             conn.execute("INSERT INTO settings(key, value) VALUES(?,?)", (key, val))
     _seed_taxonomy(conn)
+    _seed_locations(conn)
     _migrate_legacy_data(conn)
+    _migrate_locations(conn)
     conn.commit()
     conn.close()
 
