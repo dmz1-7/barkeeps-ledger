@@ -19,18 +19,31 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT
 );
 
+-- The two-level spend taxonomy: every Category belongs to a Category Type.
+-- Seeded on first run (see TAXONOMY); the user can add/rename/archive later.
+CREATE TABLE IF NOT EXISTS categories (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL UNIQUE,
+    category_type TEXT NOT NULL,      -- Food | Beer | Wine | Liquor | N/A Bev | Other
+    sort_order    INTEGER DEFAULT 0,
+    archived      INTEGER DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS invoices (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     vendor         TEXT,
     invoice_date   TEXT,             -- ISO yyyy-mm-dd
     invoice_number TEXT,
-    category       TEXT,             -- food | liquor | beer | wine | na_beverage | supplies | other
+    category       TEXT,             -- legacy whole-invoice tag, now optional
     subtotal       REAL,
     tax            REAL,
     total          REAL,
     image_path     TEXT,             -- relative filename under uploads/
     notes          TEXT,
     raw_json       TEXT,             -- the AI parse result, for audit
+    status         TEXT DEFAULT 'closed',   -- processing | action_required | closed
+    payment_account TEXT,
+    upload_date    TEXT DEFAULT (datetime('now')),
     created_at     TEXT DEFAULT (datetime('now'))
 );
 
@@ -42,7 +55,36 @@ CREATE TABLE IF NOT EXISTS invoice_items (
     unit              TEXT,
     unit_cost         REAL,
     total             REAL,
-    inventory_item_id INTEGER REFERENCES inventory_items(id) ON DELETE SET NULL
+    inventory_item_id INTEGER REFERENCES inventory_items(id) ON DELETE SET NULL,
+    vendor_item_id    INTEGER REFERENCES vendor_items(id) ON DELETE SET NULL,
+    category_id       INTEGER REFERENCES categories(id) ON DELETE SET NULL
+);
+
+-- Vendor-specific SKUs. Each maps (eventually) to a canonical Product and a
+-- Category. New ones land in the "New Item Review" queue (status = 'new').
+CREATE TABLE IF NOT EXISTS vendor_items (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    vendor_id          INTEGER REFERENCES vendors(id) ON DELETE SET NULL,
+    vendor_name        TEXT,
+    vendor_item_name   TEXT,
+    product_id         INTEGER REFERENCES inventory_items(id) ON DELETE SET NULL,
+    category_id        INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+    item_code          TEXT,
+    last_purchase_date TEXT,
+    last_purchase_price REAL,
+    order_guide        INTEGER DEFAULT 0,
+    status             TEXT DEFAULT 'new',   -- new | reviewed
+    archived           INTEGER DEFAULT 0,
+    created_at         TEXT DEFAULT (datetime('now'))
+);
+
+-- Actual sales mix the user enters per reporting period; powers P&L income.
+CREATE TABLE IF NOT EXISTS sales_mix (
+    period_start  TEXT NOT NULL,
+    period_end    TEXT NOT NULL,
+    category_type TEXT NOT NULL,
+    pct           REAL DEFAULT 0,
+    PRIMARY KEY (period_start, period_end, category_type)
 );
 
 CREATE TABLE IF NOT EXISTS vendors (
@@ -58,18 +100,26 @@ CREATE TABLE IF NOT EXISTS vendors (
     created_at     TEXT DEFAULT (datetime('now'))
 );
 
+-- "Products": the canonical item list. (Table keeps its original name so the
+-- existing Stock/Count features and their foreign keys keep working; the new
+-- Products UI/API drive off category_id and the extra columns below.)
 CREATE TABLE IF NOT EXISTS inventory_items (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL,
-    category    TEXT,               -- liquor | beer | wine | food | na_beverage | supplies | other
-    unit        TEXT,               -- bottle | case | keg | lb | each ...
-    par_level   REAL DEFAULT 0,
-    last_count  REAL DEFAULT 0,
-    unit_cost   REAL DEFAULT 0,
-    vendor      TEXT,
-    sort_order  INTEGER DEFAULT 0,
-    archived    INTEGER DEFAULT 0,
-    created_at  TEXT DEFAULT (datetime('now'))
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL,
+    category       TEXT,            -- legacy flat tag; superseded by category_id
+    category_id    INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+    unit           TEXT,            -- bottle | case | keg | lb | each ...
+    report_by_unit TEXT,            -- reporting unit, e.g. "Each", "Bottle", "Keg (1/2BBL)"
+    accounting_code TEXT,
+    on_inventory   INTEGER DEFAULT 1,
+    tax_exempt     INTEGER DEFAULT 0,
+    par_level      REAL DEFAULT 0,
+    last_count     REAL DEFAULT 0,
+    unit_cost      REAL DEFAULT 0,
+    vendor         TEXT,
+    sort_order     INTEGER DEFAULT 0,
+    archived       INTEGER DEFAULT 0,
+    created_at     TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS counts (
@@ -90,7 +140,39 @@ CREATE TABLE IF NOT EXISTS count_lines (
 CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date);
 CREATE INDEX IF NOT EXISTS idx_items_invoice ON invoice_items(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_countlines_count ON count_lines(count_id);
+CREATE INDEX IF NOT EXISTS idx_vendoritems_vendor ON vendor_items(vendor_id);
+CREATE INDEX IF NOT EXISTS idx_vendoritems_name ON vendor_items(vendor_name, vendor_item_name);
 """
+
+# Indexes on columns that may be added by _ensure_columns to pre-existing
+# tables — created only after those columns are guaranteed to exist.
+POST_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_items_category ON invoice_items(category_id);
+"""
+
+# The seeded two-level taxonomy: {Category Type: [Category, ...]}. Order within
+# each list is the display sort order. Drives the Category Report, Purchase
+# Report, and Controllable P&L grouping.
+TAXONOMY = {
+    "Food":    ["Meat", "Produce", "Bread", "Dairy", "Grocery and Dry Goods", "Seafood"],
+    "Beer":    ["Beer Bottle / Can", "Beer Keg"],
+    "Wine":    ["Wine"],
+    "Liquor":  ["Liquor", "Bar Consumables"],
+    "N/A Bev": ["NA Beverages"],
+    "Other":   ["Paper Supplies", "Smallwares", "Linen / Laundry", "Retail"],
+}
+
+# Maps the old flat invoice/item category tags onto a seeded category name so
+# existing rows get a sensible category_id during the one-time migration.
+LEGACY_CATEGORY_MAP = {
+    "liquor": "Liquor",
+    "beer": "Beer Bottle / Can",
+    "wine": "Wine",
+    "na_beverage": "NA Beverages",
+    "food": "Grocery and Dry Goods",
+    "supplies": "Paper Supplies",
+    "other": None,
+}
 
 DEFAULT_SETTINGS = {
     "target_cogs_pct": "30",      # % of sales
@@ -117,10 +199,124 @@ def close_db(_exc=None):
         db.close()
 
 
+# Columns added to tables that predate this schema. ALTER TABLE ADD COLUMN
+# disallows non-constant defaults, so upload_date is added bare and backfilled.
+_ADDED_COLUMNS = {
+    "invoices": {
+        "status": "TEXT DEFAULT 'closed'",
+        "payment_account": "TEXT",
+        "upload_date": "TEXT",
+    },
+    "invoice_items": {
+        "vendor_item_id": "INTEGER",
+        "category_id": "INTEGER",
+    },
+    "inventory_items": {
+        "category_id": "INTEGER",
+        "report_by_unit": "TEXT",
+        "accounting_code": "TEXT",
+        "on_inventory": "INTEGER DEFAULT 1",
+        "tax_exempt": "INTEGER DEFAULT 0",
+    },
+}
+
+
+def _ensure_columns(conn):
+    """Add any missing columns to pre-existing tables (idempotent)."""
+    for table, cols in _ADDED_COLUMNS.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col, decl in cols.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
+def _seed_taxonomy(conn):
+    """Insert any seeded categories that aren't present yet (idempotent)."""
+    order = 0
+    for ctype, names in TAXONOMY.items():
+        for name in names:
+            conn.execute(
+                "INSERT OR IGNORE INTO categories(name, category_type, sort_order) "
+                "VALUES(?,?,?)",
+                (name, ctype, order),
+            )
+            order += 1
+
+
+def _category_ids(conn):
+    return {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM categories")}
+
+
+def _migrate_legacy_data(conn):
+    """One-time backfill: map old flat categories -> category_id, denormalize
+    category onto invoice_items, and seed vendor_items from invoice lines."""
+    flag = conn.execute(
+        "SELECT 1 FROM settings WHERE key='migrated_v2'"
+    ).fetchone()
+    if flag:
+        return
+    cat_ids = _category_ids(conn)
+    legacy_to_id = {
+        old: (cat_ids.get(name) if name else None)
+        for old, name in LEGACY_CATEGORY_MAP.items()
+    }
+
+    # Products (inventory_items): legacy text category -> category_id.
+    for r in conn.execute("SELECT id, category FROM inventory_items").fetchall():
+        cid = legacy_to_id.get((r["category"] or "").lower())
+        if cid:
+            conn.execute("UPDATE inventory_items SET category_id=? WHERE id=?", (cid, r["id"]))
+
+    # Invoice lines: inherit the invoice's legacy category for now.
+    for r in conn.execute(
+        "SELECT ii.id AS iid, inv.category AS cat FROM invoice_items ii "
+        "JOIN invoices inv ON inv.id = ii.invoice_id"
+    ).fetchall():
+        cid = legacy_to_id.get((r["cat"] or "").lower())
+        if cid:
+            conn.execute("UPDATE invoice_items SET category_id=? WHERE id=?", (cid, r["iid"]))
+
+    # Backfill upload_date from created_at where missing.
+    conn.execute(
+        "UPDATE invoices SET upload_date = COALESCE(upload_date, created_at) "
+        "WHERE upload_date IS NULL"
+    )
+
+    # Seed vendor_items from the distinct (vendor, line name) pairs already
+    # logged, so the Vendor Items screen isn't empty on first load.
+    rows = conn.execute(
+        "SELECT inv.vendor AS vendor, ii.name AS name, ii.category_id AS category_id, "
+        "       MAX(inv.invoice_date) AS last_date, "
+        "       (SELECT unit_cost FROM invoice_items x JOIN invoices xi ON xi.id=x.invoice_id "
+        "        WHERE x.name=ii.name AND xi.vendor IS inv.vendor "
+        "        ORDER BY xi.invoice_date DESC LIMIT 1) AS last_price "
+        "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
+        "WHERE ii.name IS NOT NULL AND TRIM(ii.name) <> '' "
+        "GROUP BY inv.vendor, ii.name"
+    ).fetchall()
+    vendor_ids = {
+        (r["name"] or "").lower(): r["id"]
+        for r in conn.execute("SELECT id, name FROM vendors").fetchall()
+    }
+    for r in rows:
+        conn.execute(
+            "INSERT INTO vendor_items(vendor_id, vendor_name, vendor_item_name, "
+            "category_id, last_purchase_date, last_purchase_price, status) "
+            "VALUES(?,?,?,?,?,?, 'reviewed')",
+            (vendor_ids.get((r["vendor"] or "").lower()), r["vendor"], r["name"],
+             r["category_id"], r["last_date"], r["last_price"]),
+        )
+
+    conn.execute("INSERT INTO settings(key, value) VALUES('migrated_v2','1')")
+
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _ensure_columns(conn)
+    conn.executescript(POST_INDEXES)
     # Seed any default settings not already present, and pull secrets from env.
     env_seed = {
         "square_token": os.environ.get("SQUARE_ACCESS_TOKEN", ""),
@@ -130,6 +326,8 @@ def init_db():
         row = conn.execute("SELECT 1 FROM settings WHERE key=?", (key,)).fetchone()
         if row is None:
             conn.execute("INSERT INTO settings(key, value) VALUES(?,?)", (key, val))
+    _seed_taxonomy(conn)
+    _migrate_legacy_data(conn)
     conn.commit()
     conn.close()
 
