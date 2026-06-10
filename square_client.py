@@ -7,7 +7,7 @@ dashboard can show "Connect Square" instead of crashing.
 import datetime as dt
 import requests
 
-from db import get_setting
+from db import get_setting, get_db
 
 PROD_BASE = "https://connect.squareup.com"
 SANDBOX_BASE = "https://connect.squareupsandbox.com"
@@ -174,6 +174,53 @@ def get_daily_sales(start, end):
         return {d: round(v, 2) for d, v in by_day.items()}
     except requests.RequestException:
         return {}
+
+
+def daily_sales_cached(start, end):
+    """Per-day net sales for [start, end] for the active Square location, backed
+    by the daily_sales table. Only days that are missing from the cache or still
+    changing (today and yesterday) are fetched from Square; everything else is
+    served from the DB. Returns {iso_date: dollars} (0 for days with no sales)."""
+    c = _cfg()
+    if not is_configured():
+        return {}
+    sqid = c["location_id"]
+    dbc = get_db()
+    cached = {
+        r["date"]: r["net_sales"]
+        for r in dbc.execute(
+            "SELECT date, net_sales FROM daily_sales "
+            "WHERE square_location_id=? AND date>=? AND date<=?",
+            (sqid, start.isoformat(), end.isoformat()),
+        )
+    }
+    today = dt.date.today()
+    stale_from = (today - dt.timedelta(days=1)).isoformat()  # refresh today + yesterday
+    need = []
+    d = start
+    while d <= end:
+        ds = d.isoformat()
+        if ds not in cached or ds >= stale_from:
+            need.append(ds)
+        d += dt.timedelta(days=1)
+    if need:
+        fetch_start = dt.date.fromisoformat(min(need))
+        fresh = get_daily_sales(fetch_start, end)  # one paginated Square call
+        d = fetch_start
+        while d <= end:
+            ds = d.isoformat()
+            val = round(fresh.get(ds, 0.0), 2)
+            dbc.execute(
+                "INSERT INTO daily_sales(square_location_id, date, net_sales, fetched_at) "
+                "VALUES(?,?,?, datetime('now')) "
+                "ON CONFLICT(square_location_id, date) DO UPDATE SET "
+                "net_sales=excluded.net_sales, fetched_at=excluded.fetched_at",
+                (sqid, ds, val),
+            )
+            cached[ds] = val
+            d += dt.timedelta(days=1)
+        dbc.commit()
+    return cached
 
 
 def get_labor(start, end):

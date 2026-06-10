@@ -154,6 +154,16 @@ CREATE TABLE IF NOT EXISTS count_lines (
     unit_cost REAL                  -- unit cost captured at count time
 );
 
+-- Per-day net sales cache (keyed by Square location) so the Sales report only
+-- calls Square for days it hasn't seen or that are still changing (today/yesterday).
+CREATE TABLE IF NOT EXISTS daily_sales (
+    square_location_id TEXT NOT NULL,
+    date               TEXT NOT NULL,
+    net_sales          REAL DEFAULT 0,
+    fetched_at         TEXT,
+    PRIMARY KEY (square_location_id, date)
+);
+
 CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date);
 CREATE INDEX IF NOT EXISTS idx_items_invoice ON invoice_items(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_countlines_count ON count_lines(count_id);

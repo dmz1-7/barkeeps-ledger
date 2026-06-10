@@ -193,34 +193,39 @@ def sales_report(today=None):
     this_mon = _week_start(today)
     last_mon = this_mon - dt.timedelta(days=7)
     ly_mon = this_mon - dt.timedelta(days=364)  # same weekday a year back
+    month_start = today.replace(day=1)
+    year_start = today.replace(month=1, day=1)
 
-    def daily(week_start):
-        wk_end = week_start + dt.timedelta(days=6)
-        return square_client.get_daily_sales(week_start, wk_end)
+    # One cached pull covers the weekly grids (incl. last year), PTD and YTD.
+    full_start = min(ly_mon, year_start, last_mon)
+    sales = square_client.daily_sales_cached(full_start, today)
 
-    this_week = daily(this_mon)
-    last_week = daily(last_mon)
-    last_year = daily(ly_mon)
+    def g(d):
+        return sales.get(d.isoformat(), 0.0)
+
+    def rng(a, b):
+        s, d = 0.0, a
+        while d <= b:
+            s += sales.get(d.isoformat(), 0.0)
+            d += dt.timedelta(days=1)
+        return s
 
     days = []
     labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     tw_tot = lw_tot = ly_tot = 0.0
     for i, label in enumerate(labels):
         d_tw = this_mon + dt.timedelta(days=i)
-        tw = this_week.get(d_tw.isoformat(), 0.0) if d_tw <= today else None
-        lw = last_week.get((last_mon + dt.timedelta(days=i)).isoformat(), 0.0)
-        ly = last_year.get((ly_mon + dt.timedelta(days=i)).isoformat(), 0.0)
+        tw = g(d_tw) if d_tw <= today else None
+        lw = g(last_mon + dt.timedelta(days=i))
+        ly = g(ly_mon + dt.timedelta(days=i))
         if tw:
             tw_tot += tw
         lw_tot += lw
         ly_tot += ly
         days.append({"day": label, "this_week": tw, "last_week": _r(lw), "last_year": _r(ly)})
 
-    # Period-to-date (this month) and Year-to-date.
-    month_start = today.replace(day=1)
-    year_start = today.replace(month=1, day=1)
-    ptd = square_client.get_sales(month_start, today)["sales"]
-    ytd = square_client.get_sales(year_start, today)["sales"]
+    ptd = rng(month_start, today)
+    ytd = rng(year_start, today)
 
     return {
         "week_of": this_mon.isoformat(),
