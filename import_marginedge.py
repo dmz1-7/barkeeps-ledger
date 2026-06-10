@@ -57,8 +57,9 @@ def _read(path):
 
 
 class Importer:
-    def __init__(self, conn):
+    def __init__(self, conn, location_id):
         self.c = conn
+        self.loc = location_id
         self.cats = {r["name"].lower(): r["id"]
                      for r in conn.execute("SELECT id, name FROM categories")}
 
@@ -87,20 +88,22 @@ class Importer:
         name = (name or "").strip()
         if not name:
             return None
-        r = self.c.execute("SELECT id FROM vendors WHERE lower(name)=lower(?)", (name,)).fetchone()
+        r = self.c.execute(
+            "SELECT id FROM vendors WHERE location_id IS ? AND lower(name)=lower(?)",
+            (self.loc, name)).fetchone()
         if r:
             return r["id"]
-        cur = self.c.execute("INSERT INTO vendors(name) VALUES(?)", (name,))
+        cur = self.c.execute(
+            "INSERT INTO vendors(location_id, name) VALUES(?,?)", (self.loc, name))
         return cur.lastrowid
 
-    # --- clear the throwaway sample rows so the import is clean ---
-    def clear_samples(self):
-        self.c.execute("DELETE FROM invoices")           # cascades invoice_items
-        self.c.execute("DELETE FROM invoice_items")
-        self.c.execute("DELETE FROM vendor_items")
-        self.c.execute("DELETE FROM inventory_items")
-        self.c.execute("DELETE FROM vendors")
-        print("  cleared sample/prior data (invoices, items, vendor_items, products, vendors)")
+    # --- clear only THIS location's data so other stores are untouched ---
+    def clear_location(self):
+        self.c.execute("DELETE FROM invoices WHERE location_id IS ?", (self.loc,))  # cascades items
+        self.c.execute("DELETE FROM vendor_items WHERE location_id IS ?", (self.loc,))
+        self.c.execute("DELETE FROM inventory_items WHERE location_id IS ?", (self.loc,))
+        self.c.execute("DELETE FROM vendors WHERE location_id IS ?", (self.loc,))
+        print(f"  cleared prior data for location {self.loc} (invoices, items, vendor_items, products, vendors)")
 
     def import_products(self, rows):
         for r in rows:
@@ -112,7 +115,9 @@ class Importer:
             vals = (name, cat_name, cid, r.get("Report By Unit", "").strip(),
                     (r.get("Accounting Code") or "").strip(), _yn(r.get("On Inventory")),
                     _yn(r.get("Tax Exempt")), _price(r.get("Latest Price")) or 0)
-            existing = self.c.execute("SELECT id FROM inventory_items WHERE lower(name)=lower(?)", (name,)).fetchone()
+            existing = self.c.execute(
+                "SELECT id FROM inventory_items WHERE location_id IS ? AND lower(name)=lower(?)",
+                (self.loc, name)).fetchone()
             if existing:
                 self.c.execute(
                     "UPDATE inventory_items SET category=?, category_id=?, report_by_unit=?, "
@@ -120,31 +125,31 @@ class Importer:
                     (cat_name, cid, vals[3], vals[4], vals[5], vals[6], vals[7], existing["id"]))
             else:
                 self.c.execute(
-                    "INSERT INTO inventory_items(name, category, category_id, report_by_unit, "
-                    "accounting_code, on_inventory, tax_exempt, unit_cost) VALUES(?,?,?,?,?,?,?,?)",
-                    vals)
-        print(f"  products: {self.c.execute('SELECT COUNT(*) FROM inventory_items').fetchone()[0]}")
+                    "INSERT INTO inventory_items(location_id, name, category, category_id, report_by_unit, "
+                    "accounting_code, on_inventory, tax_exempt, unit_cost) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (self.loc,) + vals)
+        print(f"  products: {self.c.execute('SELECT COUNT(*) FROM inventory_items WHERE location_id IS ?', (self.loc,)).fetchone()[0]}")
 
     def import_vendor_items(self, rows):
-        self.c.execute("DELETE FROM vendor_items")
-        prod = {r["name"].lower(): r["id"]
-                for r in self.c.execute("SELECT id, name FROM inventory_items")}
+        self.c.execute("DELETE FROM vendor_items WHERE location_id IS ?", (self.loc,))
+        prod = {r["name"].lower(): r["id"] for r in self.c.execute(
+            "SELECT id, name FROM inventory_items WHERE location_id IS ?", (self.loc,))}
         for r in rows:
             name = (r.get("Vendor Item Name") or "").strip()
             if not name:
                 continue
             vname = (r.get("Vendor") or "").strip()
             self.c.execute(
-                "INSERT INTO vendor_items(vendor_id, vendor_name, vendor_item_name, product_id, "
+                "INSERT INTO vendor_items(location_id, vendor_id, vendor_name, vendor_item_name, product_id, "
                 "category_id, item_code, last_purchase_date, last_purchase_price, order_guide, status) "
-                "VALUES(?,?,?,?,?,?,?,?,?, 'reviewed')",
-                (self.vendor_id(vname), vname, name,
+                "VALUES(?,?,?,?,?,?,?,?,?,?, 'reviewed')",
+                (self.loc, self.vendor_id(vname), vname, name,
                  prod.get((r.get("Product") or "").strip().lower()),
                  self.category_id(r.get("Category")), (r.get("Item Code") or "").strip(),
                  _iso(r.get("Last Purch Date")), _price(r.get("Last Purch $")),
                  _yn(r.get("Order Guide"))))
-        print(f"  vendor_items: {self.c.execute('SELECT COUNT(*) FROM vendor_items').fetchone()[0]}"
-              f" | vendors: {self.c.execute('SELECT COUNT(*) FROM vendors').fetchone()[0]}")
+        c = lambda t: self.c.execute(f"SELECT COUNT(*) FROM {t} WHERE location_id IS ?", (self.loc,)).fetchone()[0]
+        print(f"  vendor_items: {c('vendor_items')} | vendors: {c('vendors')}")
 
     def import_invoices(self, path):
         with open(path, newline="", encoding="utf-8-sig") as fh:
@@ -152,18 +157,17 @@ class Importer:
             header = next(reader)
             cat_cols = header[5:]               # category columns start after Total
             cat_ids = [self.category_id(c) for c in cat_cols]
-            self.c.execute("DELETE FROM invoices")
-            self.c.execute("DELETE FROM invoice_items")
+            self.c.execute("DELETE FROM invoices WHERE location_id IS ?", (self.loc,))
             n_inv = n_line = 0
             for row in reader:
                 if not any(row):
                     continue
                 date, num, vendor, status, total = row[0], row[1], row[2], row[3], row[4]
                 cur = self.c.execute(
-                    "INSERT INTO invoices(vendor, invoice_date, invoice_number, status, total) "
-                    "VALUES(?,?,?,?,?)",
-                    (vendor.strip(), _iso(date), num.strip(), (status or "closed").strip().lower(),
-                     _price(total)))
+                    "INSERT INTO invoices(location_id, vendor, invoice_date, invoice_number, status, total) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (self.loc, vendor.strip(), _iso(date), num.strip(),
+                     (status or "closed").strip().lower(), _price(total)))
                 inv_id = cur.lastrowid
                 n_inv += 1
                 for amt_s, cid in zip(row[5:], cat_ids):
@@ -179,17 +183,28 @@ class Importer:
 
 
 def main():
-    d = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DIR
+    import argparse
+    ap = argparse.ArgumentParser(description="Import MarginEdge CSVs into a store.")
+    ap.add_argument("downloads_dir", nargs="?", default=DEFAULT_DIR)
+    ap.add_argument("--location", default="Pubkey DC",
+                    help="Store name to import into (must exist in the locations table).")
+    args = ap.parse_args()
+
     db.init_db()
     conn = sqlite3.connect(db.DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    imp = Importer(conn)
-    print("Importing MarginEdge data from", d)
-    imp.clear_samples()
-    imp.import_products(_read(os.path.join(d, "products.csv")))
-    imp.import_vendor_items(_read(os.path.join(d, "vendorItems.csv")))
-    imp.import_invoices(os.path.join(d, "categoryReport.csv"))
+    loc = conn.execute("SELECT id FROM locations WHERE name=?", (args.location,)).fetchone()
+    if not loc:
+        names = [r["name"] for r in conn.execute("SELECT name FROM locations")]
+        sys.exit(f"Unknown location {args.location!r}. Known: {names}")
+
+    imp = Importer(conn, loc["id"])
+    print(f"Importing MarginEdge data from {args.downloads_dir} into '{args.location}' (id {loc['id']})")
+    imp.clear_location()
+    imp.import_products(_read(os.path.join(args.downloads_dir, "products.csv")))
+    imp.import_vendor_items(_read(os.path.join(args.downloads_dir, "vendorItems.csv")))
+    imp.import_invoices(os.path.join(args.downloads_dir, "categoryReport.csv"))
     conn.commit()
     conn.close()
     print("Done.")
