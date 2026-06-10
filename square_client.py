@@ -46,6 +46,42 @@ def _iso(d):
     return d.replace(microsecond=0).isoformat() + "Z"
 
 
+# --- business day boundaries ------------------------------------------------
+# A "business day" runs from `day_start_hour` (local) to the same hour next day,
+# so late-night/after-midnight sales count toward the night they happened. Both
+# the Square query window and the per-order day bucketing use this.
+
+def _tz():
+    from zoneinfo import ZoneInfo
+    return ZoneInfo((get_setting("tz") or "America/New_York").strip())
+
+
+def _day_start_hour():
+    try:
+        return int(get_setting("day_start_hour") or 5)
+    except (TypeError, ValueError):
+        return 5
+
+
+def _window(start, end):
+    """UTC RFC3339 (start_at, end_at) for business days [start .. end] inclusive:
+    from `start` at day_start (local) to `end`+1 at day_start (local)."""
+    tz, h = _tz(), _day_start_hour()
+    s = dt.datetime.combine(start, dt.time(h), tzinfo=tz)
+    e = dt.datetime.combine(end + dt.timedelta(days=1), dt.time(h), tzinfo=tz)
+    fmt = lambda x: x.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return fmt(s), fmt(e)
+
+
+def _business_day(closed_at):
+    """The business-day date (ISO) an order's closed_at falls into."""
+    ts = _parse_ts(closed_at)
+    if not ts:
+        return None
+    local = ts.astimezone(_tz())
+    return (local - dt.timedelta(hours=_day_start_hour())).date().isoformat()
+
+
 def list_locations():
     c = _cfg()
     if not c["token"]:
@@ -81,10 +117,7 @@ def get_sales(start, end):
         "query": {
             "filter": {
                 "date_time_filter": {
-                    "closed_at": {
-                        "start_at": _iso(start),
-                        "end_at": _iso(end + dt.timedelta(days=1)),
-                    }
+                    "closed_at": dict(zip(("start_at", "end_at"), _window(start, end)))
                 },
                 "state_filter": {"states": ["COMPLETED"]},
             },
@@ -122,7 +155,7 @@ def get_sales(start, end):
 
 
 def get_daily_sales(start, end):
-    """Net sales bucketed by calendar date (local-ish, by closed_at date).
+    """Net sales bucketed by business day (see _business_day / day_start_hour).
 
     Returns {iso_date: dollars}. Empty dict if Square isn't configured or errors
     — callers treat missing days as zero.
@@ -135,10 +168,7 @@ def get_daily_sales(start, end):
         "query": {
             "filter": {
                 "date_time_filter": {
-                    "closed_at": {
-                        "start_at": _iso(start),
-                        "end_at": _iso(end + dt.timedelta(days=1)),
-                    }
+                    "closed_at": dict(zip(("start_at", "end_at"), _window(start, end)))
                 },
                 "state_filter": {"states": ["COMPLETED"]},
             },
@@ -161,10 +191,9 @@ def get_daily_sales(start, end):
             r.raise_for_status()
             data = r.json()
             for o in data.get("orders", []):
-                ts = _parse_ts(o.get("closed_at"))
-                if not ts:
+                day = _business_day(o.get("closed_at"))
+                if not day:
                     continue
-                day = ts.date().isoformat()
                 net = o.get("net_amounts", {}).get("total_money")
                 money = net or o.get("total_money") or {}
                 by_day[day] = by_day.get(day, 0.0) + money.get("amount", 0) / 100.0
@@ -236,10 +265,7 @@ def get_labor(start, end):
         "query": {
             "filter": {
                 "location_ids": [c["location_id"]],
-                "start": {
-                    "start_at": _iso(start),
-                    "end_at": _iso(end + dt.timedelta(days=1)),
-                },
+                "start": dict(zip(("start_at", "end_at"), _window(start, end))),
             }
         },
         "limit": 200,

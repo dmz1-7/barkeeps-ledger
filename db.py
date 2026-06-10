@@ -214,6 +214,8 @@ DEFAULT_SETTINGS = {
     "square_env": "production",   # production | sandbox
     "square_version": "2025-01-23",
     "ai_model": os.environ.get("LEDGER_AI_MODEL", "claude-opus-4-8"),
+    "tz": "America/New_York",     # timezone for business-day boundaries
+    "day_start_hour": "5",        # business day runs 5am -> 5am (next day)
 }
 
 
