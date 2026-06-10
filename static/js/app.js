@@ -17,7 +17,9 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 function el(html) {
   const t = document.createElement("template");
   t.innerHTML = html.trim();
-  return t.content.firstElementChild;
+  // Single root → return the element (callers may query/listen on it).
+  // Multiple roots → return the fragment so appendChild adds them all.
+  return t.content.childElementCount === 1 ? t.content.firstElementChild : t.content;
 }
 
 let toastTimer;
@@ -174,7 +176,7 @@ async function loadDash() {
   body.innerHTML = "";
   if (!d.square_configured) {
     body.appendChild(el(`<div class="note">Square isn&rsquo;t connected yet — sales &amp; labor read $0.
-      Add your access token in <a href="#/settings" class="linkbtn">the Forge</a>.</div>`));
+      Add your access token in <a href="#/settings" class="linkbtn">Settings</a>.</div>`));
   } else if (d.sales_error || d.labor_error) {
     body.appendChild(el(`<div class="note">Square says: ${esc(d.sales_error || d.labor_error)}</div>`));
   }
@@ -417,12 +419,12 @@ async function renderInvoiceDetail(parts) {
 }
 
 /* ============================================================
-   INVENTORY (Cellar)
+   INVENTORY
    ============================================================ */
 async function renderInventory() {
   const v = view();
   v.appendChild(el(`
-    <h2 class="section section-head">The Cellar</h2>
+    <h2 class="section section-head">Inventory</h2>
     <div class="btn-row">
       <button class="btn btn-brass" id="add-item">+ New Item</button>
       <button class="btn btn-ghost" id="order-list">Order List</button>
@@ -439,7 +441,7 @@ async function loadInventory() {
   try {
     const items = await api("GET", "/api/inventory");
     box.innerHTML = "";
-    if (!items.length) { box.appendChild(el(`<p class="empty">The cellar is empty.<br>Add your first item to set a par.</p>`)); return; }
+    if (!items.length) { box.appendChild(el(`<p class="empty">No items yet.<br>Add your first item to set a par.</p>`)); return; }
     const byCat = {};
     items.forEach((it) => (byCat[it.category] = byCat[it.category] || []).push(it));
     Object.keys(byCat).sort().forEach((cat) => {
@@ -502,7 +504,7 @@ function openItemEditor(it) {
     } catch (e) { toast(e.message); }
   });
   if (!isNew) $("#del-item").addEventListener("click", async () => {
-    if (!confirm("Remove this item from the cellar?")) return;
+    if (!confirm("Remove this item from inventory?")) return;
     await api("DELETE", `/api/inventory/${it.id}`);
     toast("Removed.");
     location.hash = "#/inventory";
@@ -527,7 +529,7 @@ async function showOrderList() {
       card.querySelector("#ord-total").textContent = money(total);
       v.appendChild(card);
     }
-    v.appendChild(el(`<button class="btn btn-ghost btn-block" id="back" style="margin-top:.6rem">Back to Cellar</button>`));
+    v.appendChild(el(`<button class="btn btn-ghost btn-block" id="back" style="margin-top:.6rem">Back to Stock</button>`));
     $("#back").addEventListener("click", () => { location.hash = "#/inventory"; });
   } catch (e) { view().innerHTML = `<p class="err">${esc(e.message)}</p>`; }
 }
@@ -544,12 +546,12 @@ async function renderCount() {
   const v = view();
   v.innerHTML = "";
   if (!items.length) {
-    v.appendChild(el(`<p class="empty">Add items to the cellar first, then come back to count.</p>`));
-    v.appendChild(el(`<a class="btn btn-brass btn-block" href="#/inventory" style="text-decoration:none;text-align:center">Go to the Cellar</a>`));
+    v.appendChild(el(`<p class="empty">Add items to inventory first, then come back to count.</p>`));
+    v.appendChild(el(`<a class="btn btn-brass btn-block" href="#/inventory" style="text-decoration:none;text-align:center">Go to Inventory</a>`));
     return;
   }
 
-  v.appendChild(el(`<h2 class="section section-head">Walk the Cellar</h2>
+  v.appendChild(el(`<h2 class="section section-head">Count Inventory</h2>
     <p class="muted" style="font-size:.82rem;margin-top:-.3rem">Tap to adjust each count. Starts from your last numbers.</p>`));
 
   const byCat = {};
@@ -599,7 +601,7 @@ async function renderCount() {
 }
 
 /* ============================================================
-   SETTINGS (Forge)
+   SETTINGS
    ============================================================ */
 async function renderSettings() {
   loading();
@@ -610,7 +612,7 @@ async function renderSettings() {
   const v = view();
   v.innerHTML = "";
   v.appendChild(el(`
-    <h2 class="section section-head">The Forge</h2>
+    <h2 class="section section-head">Settings</h2>
 
     <div class="card"><div class="card-band">Targets</div><div class="card-body">
       <div class="row2">
@@ -653,10 +655,19 @@ async function renderSettings() {
 
   $("#load-locs").addEventListener("click", async (e) => {
     e.target.disabled = true; e.target.textContent = "Loading…";
+    // Save a freshly-typed token first so "Load Locations" can use it without
+    // needing a separate Save step.
+    if ($("#s-token").value.trim()) {
+      await api("POST", "/api/settings", {
+        square_token: $("#s-token").value.trim(),
+        square_env: $("#s-env").value, square_version: $("#s-ver").value,
+      }).catch(() => {});
+    }
     try {
       const r = await api("GET", "/api/locations");
       const sel = $("#s-loc");
       if (r.error) { toast(r.error); }
+      else { toast(`Connected — ${(r.locations || []).length} location(s).`); }
       sel.innerHTML = (r.locations || []).map((l) =>
         `<option value="${esc(l.id)}" ${l.id === cfg.square_location_id ? "selected" : ""}>${esc(l.name)} (${esc(l.id)})</option>`).join("")
         || `<option value="">none found</option>`;
@@ -671,8 +682,13 @@ async function renderSettings() {
       square_location_id: $("#s-loc").value, ai_model: $("#s-model").value,
     };
     if ($("#s-token").value.trim()) payload.square_token = $("#s-token").value.trim();
-    try { await api("POST", "/api/settings", payload); toast("Settings saved."); }
-    catch (e) { toast(e.message); }
+    const btn = $("#save-settings");
+    btn.disabled = true;
+    try {
+      await api("POST", "/api/settings", payload);
+      toast("Settings saved.");
+      renderSettings();  // re-render so the status badges & location refresh
+    } catch (e) { toast(e.message); btn.disabled = false; }
   });
 
   $("#logout").addEventListener("click", () => { localStorage.removeItem(TOKEN_KEY); location.reload(); });
