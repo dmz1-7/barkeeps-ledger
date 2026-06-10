@@ -12,17 +12,27 @@ import square_client
 
 
 def purchases(start, end):
-    """Sum invoice totals in [start, end], grouped by category."""
-    rows = get_db().execute(
-        "SELECT category, COALESCE(SUM(total),0) AS amt, COUNT(*) AS n "
-        "FROM invoices WHERE invoice_date >= ? AND invoice_date <= ? "
-        "GROUP BY category",
+    """Total invoice spend in [start, end], plus a breakdown by category type.
+
+    The total comes from invoice grand totals; the breakdown comes from
+    categorized line items (so it reflects the two-level taxonomy)."""
+    db = get_db()
+    total_row = db.execute(
+        "SELECT COALESCE(SUM(total),0) AS amt, COUNT(*) AS n FROM invoices "
+        "WHERE invoice_date >= ? AND invoice_date <= ?",
+        (start.isoformat(), end.isoformat()),
+    ).fetchone()
+    rows = db.execute(
+        "SELECT COALESCE(c.category_type,'Uncategorized') AS ctype, "
+        "       COALESCE(SUM(ii.total),0) AS amt "
+        "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
+        "LEFT JOIN categories c ON c.id = ii.category_id "
+        "WHERE inv.invoice_date >= ? AND inv.invoice_date <= ? "
+        "GROUP BY c.category_type",
         (start.isoformat(), end.isoformat()),
     ).fetchall()
-    by_cat = {r["category"] or "other": round(r["amt"], 2) for r in rows}
-    total = round(sum(by_cat.values()), 2)
-    count = sum(r["n"] for r in rows)
-    return {"by_category": by_cat, "total": total, "count": count}
+    by_cat = {r["ctype"]: round(r["amt"], 2) for r in rows if r["amt"]}
+    return {"by_category": by_cat, "total": round(total_row["amt"], 2), "count": total_row["n"]}
 
 
 def _inventory_value_near(target, prefer_before=True):

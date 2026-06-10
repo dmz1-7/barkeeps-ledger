@@ -329,3 +329,107 @@ input:focus, select:focus, textarea:focus { outline: 3px solid var(--teal); outl
 .kv { display:flex; justify-content:space-between; align-items:center; padding:.4rem 0; font-size:1rem; border-bottom:2px dotted var(--line); gap:.6rem; }
 .kv b { font-family: var(--f-num); font-weight: 600; font-size:1.15rem; }
 .linkbtn { background:none;border:none;color:var(--red);text-decoration:underline;font-family:var(--f-body);font-weight:700;cursor:pointer;padding:0;font-size:.95rem;}
+
+/* ============================================================
+   Responsive shell: desktop sidebar / mobile drawer
+   ============================================================ */
+.hamburger { display: none; background: none; border: none; color: #fff;
+  font-size: 1.5rem; cursor: pointer; padding: .1rem .45rem; margin-right: .1rem; line-height: 1; }
+.shell { display: block; }
+.scrim { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 44; }
+
+#nav .nav-link {
+  display: flex; align-items: center; gap: .6rem; padding: .7rem 1rem;
+  text-decoration: none; color: var(--ink); font-family: var(--f-display);
+  text-transform: uppercase; font-size: .85rem; letter-spacing: .3px;
+  border-bottom: 1px solid var(--line);
+}
+#nav .nav-link .ic { font-size: 1.2rem; width: 1.4rem; text-align: center; }
+#nav .nav-link.active { background: var(--mint); color: var(--red); box-shadow: inset -4px 0 0 var(--red); }
+#nav .nav-sub { display: flex; flex-direction: column; background: var(--cream); border-bottom: 1px solid var(--line); }
+#nav .nav-sub a { padding: .5rem 1rem .5rem 2.8rem; text-decoration: none;
+  color: var(--ink-soft); font-size: .82rem; font-weight: 600; }
+#nav .nav-sub a.active { color: var(--red); }
+
+/* Desktop: persistent sidebar beside the content. */
+@media (min-width: 900px) {
+  .app { max-width: 1180px; padding-bottom: 1.5rem; }
+  .shell { display: grid; grid-template-columns: 224px 1fr; align-items: start; gap: 0; }
+  .sidebar { position: sticky; top: 70px; align-self: start; border: 2px solid var(--line);
+    border-radius: 14px; overflow: hidden; box-shadow: var(--shadow); margin: .9rem 0 0 1rem; }
+  #nav .nav-link:last-child, #nav .nav-sub:last-child { border-bottom: none; }
+  .view { padding: 0 1.4rem 2rem; }
+  .stat-grid { grid-template-columns: repeat(4, 1fr); }
+}
+
+/* Mobile: sidebar slides in as a drawer. */
+@media (max-width: 899px) {
+  .hamburger { display: block; }
+  .sidebar { position: fixed; top: 0; left: 0; bottom: 0; width: 82%; max-width: 300px;
+    z-index: 45; background: var(--paper); overflow-y: auto;
+    transform: translateX(-100%); transition: transform .2s ease;
+    box-shadow: var(--shadow); padding-top: env(safe-area-inset-top); }
+  .sidebar.open { transform: none; }
+}
+
+/* ============================================================
+   Data tables (sortable, searchable; collapse to cards on mobile)
+   ============================================================ */
+.dtable-wrap { margin: .7rem 0; }
+.dt-search { margin-bottom: .6rem; }
+.dtable-scroll { overflow-x: auto; border: 2px solid var(--line); border-radius: 12px;
+  background: var(--paper); box-shadow: var(--shadow); }
+table.dtable { width: 100%; border-collapse: collapse; font-size: .92rem; }
+.dtable th { background: var(--cream-2); font-family: var(--f-display); text-transform: uppercase;
+  font-size: .7rem; letter-spacing: .3px; color: var(--ink-soft); text-align: left;
+  padding: .55rem .7rem; white-space: nowrap; }
+.dtable th.sortable { cursor: pointer; user-select: none; }
+.dtable td { padding: .5rem .7rem; border-top: 1px solid var(--line); vertical-align: top; }
+.dtable td.r, .dtable th.r { text-align: right; font-family: var(--f-num); white-space: nowrap; }
+.dtable td.strong { font-weight: 700; }
+.dtable tbody tr[data-href] { cursor: pointer; }
+.dtable tbody tr:hover { background: var(--mint); }
+.dtable tfoot td { padding: .55rem .7rem; border-top: 2px solid var(--ink); font-family: var(--f-num);
+  font-weight: 700; background: var(--cream-2); }
+.dt-empty { text-align: center; color: var(--ink-soft); padding: 1.6rem; }
+
+@media (max-width: 720px) {
+  .dtable thead { display: none; }
+  .dtable, .dtable tbody, .dtable tr, .dtable td, .dtable tfoot { display: block; width: 100%; }
+  .dtable tbody tr { border-top: 3px solid var(--line); padding: .35rem 0; }
+  .dtable td { border: none; display: flex; justify-content: space-between; gap: 1rem; padding: .3rem .8rem; }
+  .dtable td::before { content: attr(data-label); font-family: var(--f-display); text-transform: uppercase;
+    font-size: .68rem; color: var(--ink-soft); flex: 0 0 auto; }
+  .dtable td.r { text-align: right; }
+  .dtable td:empty, .dtable td.dt-empty::before { display: none; }
+}
+
+/* category-type pills */
+.pill.type-Food    { background: var(--teal-dk); }
+.pill.type-Beer    { background: #c87a07; }
+.pill.type-Wine    { background: var(--maroon); }
+.pill.type-Liquor  { background: #7a3fa0; }
+.pill.type-Bev     { background: #1f9e8f; }
+.pill.type-Other   { background: #7b756a; }
+.pill.st-new       { background: var(--red); }
+.pill.st-closed,
+.pill.st-reviewed  { background: var(--teal-dk); }
+.pill.st-action_required { background: #c87a07; }
+.pill.st-processing { background: #3a6ea5; }
+
+/* filters bar */
+.filters { display: flex; flex-wrap: wrap; gap: .5rem; align-items: end; margin: .6rem 0; }
+.filters .fld { margin: 0; }
+.filters input, .filters select { font-size: .95rem; padding: .5rem .6rem; }
+
+/* P&L statement */
+.pl { font-size: .95rem; }
+.pl .pl-row { display: flex; justify-content: space-between; gap: 1rem; padding: .28rem 0; }
+.pl .pl-row.sub { padding-left: 1.1rem; color: var(--ink-soft); font-size: .9rem; }
+.pl .pl-row.head { font-family: var(--f-display); text-transform: uppercase; color: var(--red);
+  font-size: .82rem; margin-top: .7rem; }
+.pl .pl-row.total { border-top: 2px solid var(--ink); font-weight: 700; margin-top: .3rem; }
+.pl .pl-amt { font-family: var(--f-num); font-weight: 600; white-space: nowrap; }
+.pl .pl-pct { font-family: var(--f-num); color: var(--ink-soft); width: 4.5rem; text-align: right; }
+.pl .pl-row.grand { font-family: var(--f-display); color: var(--teal-dk); font-size: 1.05rem; }
+.neg { color: var(--red); }

@@ -1,11 +1,29 @@
 /* Barkeep's Ledger — front-of-house single-page app (no build step). */
 
 const TOKEN_KEY = "ledger_token";
-const CATS = {
-  food: "Food", liquor: "Liquor", beer: "Beer", wine: "Wine",
-  na_beverage: "N/A Bev", supplies: "Supplies", other: "Other",
-};
 let CONFIG = {};
+
+/* ---------- category taxonomy (Category Type -> Category) ---------- */
+let CATEGORIES = null;   // cache of /api/categories
+async function loadCategories() {
+  if (!CATEGORIES) CATEGORIES = await api("GET", "/api/categories");
+  return CATEGORIES;
+}
+const TYPE_CLASS = {
+  "Food": "type-Food", "Beer": "type-Beer", "Wine": "type-Wine",
+  "Liquor": "type-Liquor", "N/A Bev": "type-Bev", "Other": "type-Other",
+};
+function typePill(t) {
+  return `<span class="pill ${TYPE_CLASS[t] || "type-Other"}">${esc(t || "—")}</span>`;
+}
+const STATUS_LABEL = {
+  processing: "Processing", action_required: "Action Req", closed: "Closed",
+  reviewed: "Reviewed", new: "New",
+};
+function statusPill(s) {
+  s = s || "closed";
+  return `<span class="pill st-${esc(s)}">${esc(STATUS_LABEL[s] || s)}</span>`;
+}
 
 /* ---------- tiny helpers ---------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -82,31 +100,151 @@ $("#gate-form").addEventListener("submit", async (e) => {
 });
 
 /* ============================================================
-   ROUTER
+   NAV + ROUTER
    ============================================================ */
+const NAV = [
+  { tab: "dashboard", icon: "\u{1F3E0}", label: "Home", href: "#/dashboard" },
+  { tab: "orders", icon: "\u{1F9FE}", label: "Orders", href: "#/orders" },
+  { tab: "performance", icon: "\u{1F4CA}", label: "Performance", href: "#/performance/category",
+    children: [
+      { label: "Category Report", href: "#/performance/category" },
+      { label: "Controllable P&L", href: "#/performance/pl" },
+      { label: "Sales", href: "#/performance/sales" },
+      { label: "Price Movers", href: "#/performance/movers" },
+    ] },
+  { tab: "vendors", icon: "\u{1F69A}", label: "Vendors", href: "#/vendors",
+    children: [
+      { label: "Vendors", href: "#/vendors" },
+      { label: "Vendor Items", href: "#/vendors/items" },
+    ] },
+  { tab: "products", icon: "\u{1F376}", label: "Products", href: "#/products",
+    children: [
+      { label: "All Products", href: "#/products" },
+      { label: "New Item Review", href: "#/products/new" },
+      { label: "Purchase Report", href: "#/products/purchase" },
+    ] },
+  { tab: "inventory", icon: "\u{1F4E6}", label: "Inventory", href: "#/inventory",
+    children: [
+      { label: "Stock", href: "#/inventory" },
+      { label: "Count", href: "#/count" },
+    ] },
+  { tab: "settings", icon: "⚙", label: "Settings", href: "#/settings" },
+];
+
+// Map a route name -> the nav section it belongs under (for active highlight).
+const SECTION_OF = {
+  dashboard: "dashboard", orders: "orders", invoice: "orders",
+  performance: "performance", vendors: "vendors", vendor: "vendors",
+  products: "products", product: "products", inventory: "inventory",
+  count: "inventory", settings: "settings",
+};
+
 const ROUTES = {
   dashboard: renderDashboard,
-  invoices: renderInvoices,
+  orders: renderOrders,
   invoice: renderInvoiceDetail,
-  inventory: renderInventory,
+  performance: renderPerformance,
   vendors: renderVendors,
   vendor: renderVendorDetail,
+  products: renderProducts,
+  product: renderProductDetail,
+  inventory: renderInventory,
   count: renderCount,
   settings: renderSettings,
 };
+
+function buildNav() {
+  const section = SECTION_OF[(location.hash.replace(/^#\//, "").split("/")[0]) || "dashboard"];
+  const sub = location.hash.replace(/^#/, "");
+  $("#nav").innerHTML = NAV.map((n) => {
+    const active = n.tab === section;
+    let html = `<a class="nav-link ${active ? "active" : ""}" href="${n.href}">
+      <span class="ic">${n.icon}</span><span>${n.label}</span></a>`;
+    if (n.children && active) {
+      html += `<div class="nav-sub">` + n.children.map((c) =>
+        `<a href="${c.href}" class="${c.href === sub ? "active" : ""}">${c.label}</a>`).join("") + `</div>`;
+    }
+    return html;
+  }).join("");
+}
+
 function route() {
   const parts = (location.hash.replace(/^#\//, "") || "dashboard").split("/");
   const name = parts[0];
   const fn = ROUTES[name] || renderDashboard;
-  document.querySelectorAll(".tabbar a").forEach((a) =>
-    a.classList.toggle("active", a.dataset.tab === name));
+  buildNav();
+  closeDrawer();
   view().innerHTML = "";
   fn(parts.slice(1));
   window.scrollTo(0, 0);
 }
 window.addEventListener("hashchange", route);
 
+function closeDrawer() {
+  $("#sidebar").classList.remove("open");
+  $("#scrim").classList.add("hidden");
+}
+function openDrawer() {
+  $("#sidebar").classList.add("open");
+  $("#scrim").classList.remove("hidden");
+}
+$("#navtoggle").addEventListener("click", openDrawer);
+$("#scrim").addEventListener("click", closeDrawer);
+
 function loading() { view().innerHTML = '<div class="spinner"></div>'; }
+
+/* ============================================================
+   DATA TABLE (sortable, searchable; cards on mobile)
+   ============================================================ */
+function dataTable(columns, rows, opts = {}) {
+  const { search = false, empty = "Nothing here yet.", initialSort = null, footer = null } = opts;
+  const wrap = el(`<div class="dtable-wrap"></div>`);
+  let q = "", sortKey = initialSort ? initialSort.key : null, sortDir = initialSort ? (initialSort.dir || 1) : 1;
+  if (search) {
+    const s = el(`<input class="dt-search" placeholder="Search…">`);
+    s.addEventListener("input", () => { q = s.value.toLowerCase(); draw(); });
+    wrap.appendChild(s);
+  }
+  const host = el(`<div class="dtable-scroll"></div>`);
+  wrap.appendChild(host);
+
+  const raw = (row, c) => (c.sortVal ? c.sortVal(row) : row[c.key]);
+  function cmp(a, b) {
+    const na = parseFloat(a), nb = parseFloat(b);
+    if (!isNaN(na) && !isNaN(nb)) return na - nb;
+    return String(a == null ? "" : a).localeCompare(String(b == null ? "" : b));
+  }
+  function view_rows() {
+    let r = rows;
+    if (q) r = r.filter((row) => columns.some((c) => String(raw(row, c) ?? "").toLowerCase().includes(q)));
+    if (sortKey) {
+      const c = columns.find((x) => x.key === sortKey);
+      r = [...r].sort((a, b) => cmp(raw(a, c), raw(b, c)) * sortDir);
+    }
+    return r;
+  }
+  function draw() {
+    const r = view_rows();
+    const head = columns.map((c) =>
+      `<th class="${c.align === "right" ? "r" : ""} ${c.sortable === false ? "" : "sortable"}" data-k="${esc(c.key)}">${esc(c.label)}${sortKey === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>`).join("");
+    const body = r.length ? r.map((row) =>
+      `<tr ${row._href ? `data-href="${esc(row._href)}"` : ""}>` + columns.map((c) =>
+        `<td class="${c.align === "right" ? "r" : ""} ${c.cls || ""}" data-label="${esc(c.label)}">${c.fmt ? c.fmt(row) : esc(row[c.key] ?? "")}</td>`).join("") + `</tr>`).join("")
+      : `<tr><td class="dt-empty" colspan="${columns.length}">${esc(empty)}</td></tr>`;
+    const foot = footer ? `<tfoot><tr>${columns.map((c) =>
+      `<td class="${c.align === "right" ? "r" : ""}" data-label="${esc(c.label)}">${footer[c.key] != null ? footer[c.key] : ""}</td>`).join("")}</tr></tfoot>` : "";
+    host.innerHTML = `<table class="dtable"><thead><tr>${head}</tr></thead><tbody>${body}</tbody>${foot}</table>`;
+    host.querySelectorAll("th.sortable").forEach((th) => th.addEventListener("click", () => {
+      const k = th.dataset.k;
+      if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = 1; }
+      draw();
+    }));
+    host.querySelectorAll("tr[data-href]").forEach((tr) =>
+      tr.addEventListener("click", () => { location.hash = tr.dataset.href; }));
+  }
+  draw();
+  return wrap;
+}
 
 /* ============================================================
    DASHBOARD
@@ -220,7 +358,7 @@ async function loadDash() {
   const pb = card.querySelector("#pb");
   if (!cats.length) pb.appendChild(el(`<p class="muted center">No invoices in this range.</p>`));
   else cats.sort((a, b) => b[1] - a[1]).forEach(([c, amt]) =>
-    pb.appendChild(el(`<div class="kv"><span class="pill ${c}">${CATS[c] || c}</span><b>${money(amt)}</b></div>`)));
+    pb.appendChild(el(`<div class="kv"><span>${typePill(c)}</span><b>${money(amt)}</b></div>`)));
   body.appendChild(card);
 
   if (d.begin_inventory && d.end_inventory) {
@@ -255,39 +393,67 @@ function bar(val, target) {
 /* ============================================================
    INVOICES
    ============================================================ */
-async function renderInvoices() {
+async function renderOrders() {
   const v = view();
   v.appendChild(el(`
-    <h2 class="section section-head">Invoices</h2>
+    <h2 class="section section-head">Orders</h2>
     <div class="btn-row">
       <button class="btn btn-brass" id="snap">&#x1F4F7; Photograph Invoice</button>
       <button class="btn btn-ghost" id="manual">Enter by Hand</button>
     </div>
     <input type="file" id="file" accept="image/*" capture="environment" class="hidden">
-    <div id="inv-list"><div class="spinner"></div></div>`));
+    <div class="filters">
+      <label class="fld"><span>From</span><input type="date" id="o-start"></label>
+      <label class="fld"><span>To</span><input type="date" id="o-end"></label>
+      <label class="fld"><span>Vendor</span><select id="o-vendor"><option value="">All</option></select></label>
+      <label class="fld"><span>Status</span><select id="o-status">
+        <option value="">All</option><option value="processing">Processing</option>
+        <option value="action_required">Action Required</option><option value="closed">Closed</option>
+      </select></label>
+    </div>
+    <div id="ord-list"><div class="spinner"></div></div>`));
 
   $("#snap").addEventListener("click", () => $("#file").click());
   $("#manual").addEventListener("click", () => openInvoiceForm(null, null));
   $("#file").addEventListener("change", onPhoto);
 
   try {
-    const list = await api("GET", "/api/invoices");
-    const box = $("#inv-list");
+    const vendors = await api("GET", "/api/vendors");
+    $("#o-vendor").insertAdjacentHTML("beforeend",
+      vendors.map((vd) => `<option value="${esc(vd.name)}">${esc(vd.name)}</option>`).join(""));
+  } catch (e) { /* filter is optional */ }
+
+  ["o-start", "o-end", "o-vendor", "o-status"].forEach((id) =>
+    $("#" + id).addEventListener("change", loadOrders));
+  await loadOrders();
+}
+
+async function loadOrders() {
+  const box = $("#ord-list");
+  box.innerHTML = '<div class="spinner"></div>';
+  const qs = new URLSearchParams();
+  if ($("#o-start").value) qs.set("start", $("#o-start").value);
+  if ($("#o-end").value) qs.set("end", $("#o-end").value);
+  if ($("#o-vendor").value) qs.set("vendor", $("#o-vendor").value);
+  if ($("#o-status").value) qs.set("status", $("#o-status").value);
+  try {
+    const list = await api("GET", "/api/invoices?" + qs.toString());
     box.innerHTML = "";
-    if (!list.length) { box.appendChild(el(`<p class="empty">No invoices logged yet.<br>Snap your first delivery slip.</p>`)); return; }
-    list.forEach((iv) => {
-      const row = el(`<a class="row-item" href="#/invoice/${iv.id}" style="text-decoration:none;color:inherit">
-        ${iv.image_path ? `<img class="thumb" src="/uploads/${esc(iv.image_path)}" alt="">` : `<span class="ic">&#x1F4C4;</span>`}
-        <div class="grow">
-          <div class="ttl">${esc(iv.vendor || "Unknown vendor")}</div>
-          <div class="meta">${esc(iv.invoice_date || "no date")} ${iv.invoice_number ? "· #" + esc(iv.invoice_number) : ""}</div>
-        </div>
-        <span class="pill ${iv.category}">${CATS[iv.category] || iv.category}</span>
-        <div class="amt">${money(iv.total)}</div>
-      </a>`);
-      box.appendChild(row);
+    const total = list.reduce((s, iv) => s + (iv.total || 0), 0);
+    const table = dataTable([
+      { key: "invoice_date", label: "Date", fmt: (r) => esc(r.invoice_date || "—") },
+      { key: "vendor", label: "Vendor", cls: "strong", fmt: (r) => esc(r.vendor || "Unknown") },
+      { key: "invoice_number", label: "Invoice #", fmt: (r) => esc(r.invoice_number || "—") },
+      { key: "status", label: "Status", fmt: (r) => statusPill(r.status) },
+      { key: "payment_account", label: "Payment", fmt: (r) => esc(r.payment_account || "—") },
+      { key: "total", label: "Total", align: "right", fmt: (r) => money(r.total) },
+    ], list.map((iv) => ({ ...iv, _href: `#/invoice/${iv.id}` })), {
+      search: true, empty: "No orders match these filters.",
+      initialSort: { key: "invoice_date", dir: -1 },
+      footer: { vendor: `${list.length} orders`, total: `<b>${money(total)}</b>` },
     });
-  } catch (e) { $("#inv-list").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+    box.appendChild(table);
+  } catch (e) { box.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
 }
 
 async function onPhoto(e) {
@@ -310,8 +476,9 @@ async function onPhoto(e) {
   }
 }
 
-function openInvoiceForm(parsed, imagePath, warn) {
-  parsed = parsed || { vendor: "", invoice_date: "", invoice_number: "", category: "other", subtotal: null, tax: null, total: null, line_items: [] };
+async function openInvoiceForm(parsed, imagePath, warn) {
+  parsed = parsed || { vendor: "", invoice_date: "", invoice_number: "", subtotal: null, tax: null, total: null, line_items: [] };
+  await loadCategories();
   const v = view();
   v.innerHTML = "";
   v.appendChild(el(`
@@ -324,9 +491,13 @@ function openInvoiceForm(parsed, imagePath, warn) {
         <label class="fld"><span>Date</span><input type="date" id="f-date" value="${esc(parsed.invoice_date)}"></label>
         <label class="fld"><span>Invoice #</span><input id="f-num" value="${esc(parsed.invoice_number)}"></label>
       </div>
-      <label class="fld"><span>Category</span>
-        <select id="f-cat">${Object.entries(CATS).map(([k, vv]) =>
-          `<option value="${k}" ${k === parsed.category ? "selected" : ""}>${vv}</option>`).join("")}</select></label>
+      <div class="row2">
+        <label class="fld"><span>Status</span><select id="f-status">
+          <option value="closed">Closed</option>
+          <option value="processing">Processing</option>
+          <option value="action_required">Action Required</option></select></label>
+        <label class="fld"><span>Payment Account</span><input id="f-pay" value="${esc(parsed.payment_account || "")}" placeholder="A/P"></label>
+      </div>
       <div class="row3">
         <label class="fld"><span>Subtotal</span><input type="number" step="0.01" id="f-sub" value="${num(parsed.subtotal)}"></label>
         <label class="fld"><span>Tax</span><input type="number" step="0.01" id="f-tax" value="${num(parsed.tax)}"></label>
@@ -347,7 +518,7 @@ function openInvoiceForm(parsed, imagePath, warn) {
   (parsed.line_items || []).forEach((li) => lines.appendChild(lineRow(li)));
   if (!(parsed.line_items || []).length) lines.appendChild(lineRow({}));
   $("#add-line").addEventListener("click", () => lines.appendChild(lineRow({})));
-  $("#cancel-inv").addEventListener("click", () => { location.hash = "#/invoices"; });
+  $("#cancel-inv").addEventListener("click", () => { location.hash = "#/orders"; });
   fillVendorDatalist();
 
   $("#save-inv").addEventListener("click", async () => {
@@ -357,10 +528,12 @@ function openInvoiceForm(parsed, imagePath, warn) {
       unit: r.querySelector(".li-unit").value || null,
       unit_cost: f(r.querySelector(".li-cost").value),
       total: f(r.querySelector(".li-total").value),
+      category: r.querySelector(".li-cat").value || null,
     })).filter((x) => x.name.trim());
     const payload = {
       vendor: $("#f-vendor").value, invoice_date: $("#f-date").value,
-      invoice_number: $("#f-num").value, category: $("#f-cat").value,
+      invoice_number: $("#f-num").value, status: $("#f-status").value,
+      payment_account: $("#f-pay").value,
       subtotal: f($("#f-sub").value), tax: f($("#f-tax").value), total: f($("#f-total").value),
       image_path: imagePath || null, line_items: items,
       raw_json: parsed ? JSON.stringify(parsed) : "",
@@ -368,13 +541,23 @@ function openInvoiceForm(parsed, imagePath, warn) {
     try {
       await api("POST", "/api/invoices", payload);
       toast("Logged to the ledger.");
-      location.hash = "#/invoices";
+      location.hash = "#/orders";
     } catch (e) { toast(e.message); }
   });
 }
 
+// <option> list grouped by category type, for the per-line category picker.
+function catOptionsHTML(selected) {
+  if (!CATEGORIES) return "";
+  const byType = {};
+  CATEGORIES.forEach((c) => (byType[c.category_type] = byType[c.category_type] || []).push(c));
+  return `<option value="">— category —</option>` + Object.entries(byType).map(([t, cs]) =>
+    `<optgroup label="${esc(t)}">` + cs.map((c) =>
+      `<option value="${esc(c.name)}" ${c.name === selected ? "selected" : ""}>${esc(c.name)}</option>`).join("") + `</optgroup>`).join("");
+}
+
 function lineRow(li) {
-  const r = el(`<div class="lrow" style="display:grid;grid-template-columns:1fr auto;gap:.4rem;align-items:start;margin-bottom:.6rem;border-bottom:1px dotted var(--edge);padding-bottom:.5rem">
+  const r = el(`<div class="lrow" style="display:grid;grid-template-columns:1fr auto;gap:.4rem;align-items:start;margin-bottom:.6rem;border-bottom:1px dotted var(--line);padding-bottom:.5rem">
     <input class="li-name" placeholder="Item" value="${esc(li.name || "")}">
     <button class="btn btn-sm btn-ghost li-del" title="remove">&times;</button>
     <div class="row3" style="grid-column:1 / -1">
@@ -382,7 +565,10 @@ function lineRow(li) {
       <input class="li-unit" placeholder="unit" value="${esc(li.unit || "")}">
       <input class="li-cost" type="number" step="0.01" placeholder="unit $" value="${num(li.unit_cost)}">
     </div>
-    <input class="li-total" type="number" step="0.01" placeholder="line total" value="${num(li.total)}" style="grid-column:1 / -1">
+    <div class="row2" style="grid-column:1 / -1">
+      <input class="li-total" type="number" step="0.01" placeholder="line total" value="${num(li.total)}">
+      <select class="li-cat">${catOptionsHTML(li.category)}</select>
+    </div>
   </div>`);
   r.querySelector(".li-del").addEventListener("click", () => r.remove());
   return r;
@@ -392,7 +578,9 @@ async function renderInvoiceDetail(parts) {
   loading();
   const id = parts[0];
   try {
-    const iv = await api("GET", `/api/invoices/${id}`);
+    const [iv, cats] = await Promise.all([api("GET", `/api/invoices/${id}`), loadCategories()]);
+    const catName = {};
+    cats.forEach((c) => { catName[c.id] = c.name; });
     const v = view();
     v.innerHTML = "";
     v.appendChild(el(`
@@ -401,22 +589,23 @@ async function renderInvoiceDetail(parts) {
       <div class="card"><div class="card-body">
         <div class="kv"><span>Date</span><b>${esc(iv.invoice_date || "—")}</b></div>
         <div class="kv"><span>Invoice #</span><b>${esc(iv.invoice_number || "—")}</b></div>
-        <div class="kv"><span>Category</span><span class="pill ${iv.category}">${CATS[iv.category] || iv.category}</span></div>
+        <div class="kv"><span>Status</span>${statusPill(iv.status)}</div>
+        <div class="kv"><span>Payment</span><b>${esc(iv.payment_account || "—")}</b></div>
         <div class="kv"><span>Subtotal</span><b>${money(iv.subtotal)}</b></div>
         <div class="kv"><span>Tax</span><b>${money(iv.tax)}</b></div>
         <div class="kv"><span>Total</span><b>${money(iv.total)}</b></div>
       </div></div>
       ${iv.line_items.length ? `<div class="card"><div class="card-band">Items</div><div class="card-body">
-        ${iv.line_items.map((li) => `<div class="kv"><span>${esc(li.name)}${li.qty ? ` <span class="muted">×${li.qty} ${esc(li.unit || "")}</span>` : ""}</span><b>${money(li.total)}</b></div>`).join("")}
+        ${iv.line_items.map((li) => `<div class="kv"><span>${esc(li.name)}${li.qty ? ` <span class="muted">×${li.qty} ${esc(li.unit || "")}</span>` : ""}${li.category_id ? ` <span class="muted">· ${esc(catName[li.category_id] || "")}</span>` : ""}</span><b>${money(li.total)}</b></div>`).join("")}
       </div></div>` : ""}
       <button class="btn btn-ox btn-block" id="del-inv" style="margin-top:.6rem">Delete Invoice</button>
       <button class="btn btn-ghost btn-block" id="back" style="margin-top:.5rem">Back</button>`));
-    $("#back").addEventListener("click", () => { location.hash = "#/invoices"; });
+    $("#back").addEventListener("click", () => { location.hash = "#/orders"; });
     $("#del-inv").addEventListener("click", async () => {
       if (!confirm("Delete this invoice?")) return;
       await api("DELETE", `/api/invoices/${id}`);
       toast("Removed.");
-      location.hash = "#/invoices";
+      location.hash = "#/orders";
     });
   } catch (e) { view().innerHTML = `<p class="err">${esc(e.message)}</p>`; }
 }
@@ -442,13 +631,13 @@ async function renderInventory() {
 async function loadInventory() {
   const box = $("#inv-box");
   try {
-    const items = await api("GET", "/api/inventory");
+    const items = await api("GET", "/api/products");
     box.innerHTML = "";
     if (!items.length) { box.appendChild(el(`<p class="empty">No items yet.<br>Add your first item to set a par.</p>`)); return; }
     const byCat = {};
-    items.forEach((it) => (byCat[it.category] = byCat[it.category] || []).push(it));
+    items.forEach((it) => (byCat[it.category_name || "Uncategorized"] = byCat[it.category_name || "Uncategorized"] || []).push(it));
     Object.keys(byCat).sort().forEach((cat) => {
-      box.appendChild(el(`<h2 class="section section-head">${CATS[cat] || cat}</h2>`));
+      box.appendChild(el(`<h2 class="section section-head">${esc(cat)}</h2>`));
       byCat[cat].forEach((it) => {
         const under = (it.last_count || 0) <= (it.par_level || 0);
         const row = el(`<div class="row-item">
@@ -466,9 +655,15 @@ async function loadInventory() {
   } catch (e) { box.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
 }
 
-function openItemEditor(it) {
+async function openItemEditor(it) {
   const isNew = !it;
-  it = it || { name: "", category: "liquor", unit: "bottle", par_level: 0, last_count: 0, unit_cost: 0, vendor: "" };
+  it = it || { name: "", category_id: null, unit: "bottle", par_level: 0, last_count: 0, unit_cost: 0, vendor: "" };
+  const cats = await loadCategories();
+  const byType = {};
+  cats.forEach((c) => (byType[c.category_type] = byType[c.category_type] || []).push(c));
+  const catOpts = `<option value="">— category —</option>` + Object.entries(byType).map(([t, cs]) =>
+    `<optgroup label="${esc(t)}">` + cs.map((c) =>
+      `<option value="${c.id}" ${c.id === it.category_id ? "selected" : ""}>${esc(c.name)}</option>`).join("") + `</optgroup>`).join("");
   const v = view();
   v.innerHTML = "";
   v.appendChild(el(`
@@ -476,8 +671,7 @@ function openItemEditor(it) {
     <div class="card"><div class="card-body">
       <label class="fld"><span>Name</span><input id="i-name" value="${esc(it.name)}"></label>
       <div class="row2">
-        <label class="fld"><span>Category</span><select id="i-cat">${Object.entries(CATS).map(([k, vv]) =>
-          `<option value="${k}" ${k === it.category ? "selected" : ""}>${vv}</option>`).join("")}</select></label>
+        <label class="fld"><span>Category</span><select id="i-cat">${catOpts}</select></label>
         <label class="fld"><span>Unit</span><input id="i-unit" value="${esc(it.unit)}" placeholder="bottle, case, keg…"></label>
       </div>
       <div class="row3">
@@ -494,22 +688,25 @@ function openItemEditor(it) {
   $("#cancel-item").addEventListener("click", () => { location.hash = "#/inventory"; });
   fillVendorDatalist();
   $("#save-item").addEventListener("click", async () => {
+    const catId = $("#i-cat").value ? Number($("#i-cat").value) : null;
+    const cat = cats.find((c) => c.id === catId);
     const payload = {
-      name: $("#i-name").value.trim(), category: $("#i-cat").value, unit: $("#i-unit").value.trim(),
+      name: $("#i-name").value.trim(), category_id: catId, category: cat ? cat.name : null,
+      unit: $("#i-unit").value.trim(),
       par_level: f($("#i-par").value, 0), last_count: f($("#i-cnt").value, 0),
       unit_cost: f($("#i-cost").value, 0), vendor: $("#i-vendor").value.trim(),
     };
     if (!payload.name) { toast("Give it a name."); return; }
     try {
-      if (isNew) await api("POST", "/api/inventory", payload);
-      else await api("PUT", `/api/inventory/${it.id}`, payload);
+      if (isNew) await api("POST", "/api/products", payload);
+      else await api("PUT", `/api/products/${it.id}`, payload);
       toast("Saved.");
       location.hash = "#/inventory";
     } catch (e) { toast(e.message); }
   });
   if (!isNew) $("#del-item").addEventListener("click", async () => {
     if (!confirm("Remove this item from inventory?")) return;
-    await api("DELETE", `/api/inventory/${it.id}`);
+    await api("DELETE", `/api/products/${it.id}`);
     toast("Removed.");
     location.hash = "#/inventory";
   });
@@ -544,7 +741,7 @@ async function showOrderList() {
 async function renderCount() {
   loading();
   let items;
-  try { items = await api("GET", "/api/inventory"); }
+  try { items = await api("GET", "/api/products"); }
   catch (e) { view().innerHTML = `<p class="err">${esc(e.message)}</p>`; return; }
 
   const v = view();
@@ -559,10 +756,10 @@ async function renderCount() {
     <p class="muted" style="font-size:.82rem;margin-top:-.3rem">Tap to adjust each count. Starts from your last numbers.</p>`));
 
   const byCat = {};
-  items.forEach((it) => (byCat[it.category] = byCat[it.category] || []).push(it));
+  items.forEach((it) => (byCat[it.category_name || "Uncategorized"] = byCat[it.category_name || "Uncategorized"] || []).push(it));
   const state = {};
   Object.keys(byCat).sort().forEach((cat) => {
-    v.appendChild(el(`<h2 class="section section-head">${CATS[cat] || cat}</h2>`));
+    v.appendChild(el(`<h2 class="section section-head">${esc(cat)}</h2>`));
     byCat[cat].forEach((it) => {
       state[it.id] = Number(it.last_count || 0);
       const under = (it.last_count || 0) <= (it.par_level || 0);
@@ -625,6 +822,16 @@ async function renderSettings() {
       </div>
     </div></div>
 
+    <div class="card"><div class="card-band">Sales Mix &middot; per period</div><div class="card-body">
+      <p class="muted" style="font-size:.82rem;margin-top:0">Your actual sales mix (% of sales by type) for a period. Powers income on the Controllable P&amp;L.</p>
+      <div class="row2">
+        <label class="fld"><span>Period From</span><input type="date" id="mx-start" value="${iso(monthStart())}"></label>
+        <label class="fld"><span>Period To</span><input type="date" id="mx-end" value="${iso(new Date())}"></label>
+      </div>
+      <div id="mx-fields"><div class="spinner"></div></div>
+      <button class="btn btn-grn btn-block" id="save-mix" style="margin-top:.5rem">Save Sales Mix</button>
+    </div></div>
+
     <div class="card"><div class="card-band">Square &middot; Sales &amp; Labor
       <span class="pill">${cfg.square_configured ? "connected" : "off"}</span></div>
       <div class="card-body">
@@ -656,6 +863,34 @@ async function renderSettings() {
     <button class="btn btn-brass btn-block" id="save-settings">Save Settings</button>
     <button class="btn btn-ghost btn-block" id="logout" style="margin-top:.6rem">Sign Out</button>
     <p class="center muted" style="margin-top:1rem;font-size:.75rem">Barkeep&rsquo;s Ledger · self-hosted</p>`));
+
+  // --- Sales mix editor ---
+  async function loadMix() {
+    const box = $("#mx-fields");
+    box.innerHTML = '<div class="spinner"></div>';
+    try {
+      const d = await api("GET", `/api/sales-mix?start=${$("#mx-start").value}&end=${$("#mx-end").value}`);
+      const sum = d.category_types.reduce((s, t) => s + (Number(d.mix[t]) || 0), 0);
+      box.innerHTML = `<div class="row3">${d.category_types.map((t) =>
+        `<label class="fld"><span>${esc(t)}</span><input type="number" step="0.1" class="mx-in" data-t="${esc(t)}" value="${num(d.mix[t])}"></label>`).join("")}</div>
+        <p class="muted" id="mx-sum" style="font-size:.8rem">Total: ${sum.toFixed(1)}%</p>`;
+      box.querySelectorAll(".mx-in").forEach((i) => i.addEventListener("input", () => {
+        const s = [...box.querySelectorAll(".mx-in")].reduce((a, x) => a + (Number(x.value) || 0), 0);
+        $("#mx-sum").textContent = `Total: ${s.toFixed(1)}%` + (Math.abs(s - 100) > 0.1 ? " (should be ~100%)" : "");
+      }));
+    } catch (e) { box.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+  }
+  $("#mx-start").addEventListener("change", loadMix);
+  $("#mx-end").addEventListener("change", loadMix);
+  loadMix();
+  $("#save-mix").addEventListener("click", async () => {
+    const mix = {};
+    $("#mx-fields").querySelectorAll(".mx-in").forEach((i) => { mix[i.dataset.t] = Number(i.value) || 0; });
+    try {
+      await api("PUT", `/api/sales-mix?start=${$("#mx-start").value}&end=${$("#mx-end").value}`, { mix });
+      toast("Sales mix saved.");
+    } catch (e) { toast(e.message); }
+  });
 
   $("#load-locs").addEventListener("click", async (e) => {
     e.target.disabled = true; e.target.textContent = "Loading…";
@@ -712,33 +947,61 @@ async function fillVendorDatalist() {
   } catch (e) { /* autocomplete is a nicety; ignore failures */ }
 }
 
-async function renderVendors() {
+async function renderVendors(parts) {
+  if (parts[0] === "items") return renderVendorItems();
   const v = view();
   v.appendChild(el(`
     <h2 class="section section-head">Vendors</h2>
-    <button class="btn btn-brass btn-block" id="add-vendor">+ New Vendor</button>
+    <div id="v-summary" class="stat-grid"></div>
+    <button class="btn btn-brass btn-block" id="add-vendor" style="margin-top:.8rem">+ New Vendor</button>
     <div id="vlist"><div class="spinner"></div></div>`));
   $("#add-vendor").addEventListener("click", () => openVendorEditor(null));
+
+  api("GET", "/api/vendors/summary").then((s) => {
+    $("#v-summary").innerHTML = `
+      <div class="stat accent-ind"><div class="label">Vendors</div><div class="value">${s.total_vendors}</div></div>
+      <div class="stat accent-grn"><div class="label">Vendor Items</div><div class="value">${s.vendor_items}</div></div>
+      <div class="stat accent-ox"><div class="label">Invoices</div><div class="value">${s.invoices_processed}</div></div>
+      <div class="stat"><div class="label">Total Purchased</div><div class="value" style="font-size:1.7rem">${money(s.total_purchased)}</div></div>`;
+  }).catch(() => {});
+
   try {
     const list = await api("GET", "/api/vendors");
     const box = $("#vlist");
     box.innerHTML = "";
     if (!list.length) { box.appendChild(el(`<p class="empty">No vendors yet.<br>Add your distributors and reps here.</p>`)); return; }
-    list.forEach((vd) => {
-      const sub = [vd.contact_name, vd.phone].filter(Boolean).join(" · ") || (vd.order_days ? "Orders " + vd.order_days : "—");
-      const row = el(`<a class="row-item" href="#/vendor/${vd.id}" style="text-decoration:none;color:inherit">
-        <div class="grow">
-          <div class="ttl">${esc(vd.name)}</div>
-          <div class="meta">${esc(sub)}</div>
-        </div>
-        <div style="text-align:right">
-          <div class="amt">${money(vd.spend)}</div>
-          <div class="meta">${vd.invoice_count} inv</div>
-        </div>
-      </a>`);
-      box.appendChild(row);
-    });
+    box.appendChild(dataTable([
+      { key: "name", label: "Vendor", cls: "strong", fmt: (r) => `<a href="#/vendor/${r.id}" style="color:var(--red);text-decoration:none">${esc(r.name)}</a>` },
+      { key: "item_count", label: "Items", align: "right" },
+      { key: "period_purchases", label: "This Period", align: "right", fmt: (r) => money(r.period_purchases) },
+      { key: "last_period_purchases", label: "Last Period", align: "right", fmt: (r) => money(r.last_period_purchases) },
+      { key: "year_purchases", label: "This Year", align: "right", fmt: (r) => money(r.year_purchases) },
+      { key: "last_order", label: "Last Invoice", align: "right", fmt: (r) => esc(r.last_order || "—") },
+    ], list, { search: true, initialSort: { key: "name", dir: 1 } }));
   } catch (e) { $("#vlist").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+
+async function renderVendorItems() {
+  const v = view();
+  v.appendChild(el(`
+    <h2 class="section section-head">Vendor Items</h2>
+    <div id="vi-list"><div class="spinner"></div></div>`));
+  try {
+    const all = await api("GET", "/api/vendor-items");
+    const box = $("#vi-list");
+    box.innerHTML = "";
+    if (!all.length) { box.appendChild(el(`<p class="empty">No vendor items yet.<br>They appear as you log invoices.</p>`)); return; }
+    box.appendChild(dataTable([
+      { key: "vendor_name", label: "Vendor", fmt: (r) => esc(r.vendor_name || "—") },
+      { key: "vendor_item_name", label: "Item", cls: "strong", fmt: (r) => esc(r.vendor_item_name) },
+      { key: "product_name", label: "Product", fmt: (r) => esc(r.product_name || "—") },
+      { key: "category_name", label: "Category", fmt: (r) => r.category_type ? typePill(r.category_type) + " " + esc(r.category_name || "") : "—" },
+      { key: "item_code", label: "Code", fmt: (r) => esc(r.item_code || "—") },
+      { key: "last_purchase_price", label: "Last $", align: "right", fmt: (r) => money(r.last_purchase_price) },
+      { key: "last_purchase_date", label: "Last Buy", align: "right", fmt: (r) => esc(r.last_purchase_date || "—") },
+      { key: "status", label: "Status", fmt: (r) => statusPill(r.status) },
+    ], all, { search: true, initialSort: { key: "vendor_item_name", dir: 1 } }));
+  } catch (e) { $("#vi-list").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
 }
 
 async function renderVendorDetail(parts) {
@@ -783,7 +1046,7 @@ async function renderVendorDetail(parts) {
   const inv = $("#v-inv");
   if (inv) vd.invoices.forEach((iv) => inv.appendChild(el(
     `<a href="#/invoice/${iv.id}" class="kv" style="text-decoration:none;color:inherit">
-      <span>${esc(iv.invoice_date || "—")} <span class="pill ${iv.category}">${CATS[iv.category] || iv.category}</span></span>
+      <span>${esc(iv.invoice_date || "—")}${iv.invoice_number ? ` <span class="muted">#${esc(iv.invoice_number)}</span>` : ""}</span>
       <b>${money(iv.total)}</b></a>`)));
   const its = $("#v-items");
   if (its) vd.items.forEach((it) => its.appendChild(el(
@@ -844,6 +1107,312 @@ function openVendorEditor(vd) {
     toast("Removed.");
     location.hash = "#/vendors";
   });
+}
+
+/* ============================================================
+   PERFORMANCE REPORTS
+   ============================================================ */
+function dateFilterBar(onChange) {
+  const def = { start: iso(monthStart()), end: iso(new Date()) };
+  const bar = el(`<div class="filters">
+    <label class="fld"><span>From</span><input type="date" class="r-start" value="${def.start}"></label>
+    <label class="fld"><span>To</span><input type="date" class="r-end" value="${def.end}"></label>
+  </div>`);
+  const get = () => ({ start: bar.querySelector(".r-start").value, end: bar.querySelector(".r-end").value });
+  bar.querySelectorAll("input").forEach((i) => i.addEventListener("change", () => onChange(get())));
+  return { bar, get };
+}
+
+function renderPerformance(parts) {
+  const sub = parts[0] || "category";
+  if (sub === "pl") return renderControllablePL();
+  if (sub === "sales") return renderSales();
+  if (sub === "movers") return renderPriceMovers();
+  return renderCategoryReport();
+}
+
+async function renderCategoryReport() {
+  const v = view();
+  v.innerHTML = `<h2 class="section section-head">Category Report</h2>`;
+  const body = el(`<div id="cr-body"><div class="spinner"></div></div>`);
+  const filter = dateFilterBar(load);
+  v.appendChild(filter.bar);
+  v.appendChild(body);
+  async function load() {
+    body.innerHTML = '<div class="spinner"></div>';
+    const { start, end } = filter.get();
+    try {
+      const d = await api("GET", `/api/reports/category?start=${start}&end=${end}`);
+      const cols = d.categories.filter((c) => (d.column_totals[c.id] || 0) !== 0);
+      const columns = [
+        { key: "invoice_date", label: "Date", fmt: (r) => esc(r.invoice_date || "—") },
+        { key: "vendor", label: "Vendor", cls: "strong", fmt: (r) => esc(r.vendor || "—") },
+        ...cols.map((c) => ({
+          key: "c" + c.id, label: c.name, align: "right",
+          fmt: (r) => (r["c" + c.id] ? money(r["c" + c.id]) : ""),
+        })),
+        { key: "total", label: "Total", align: "right", fmt: (r) => money(r.total) },
+      ];
+      const rows = d.rows.map((r) => {
+        const o = { invoice_date: r.invoice_date, vendor: r.vendor, total: r.total, _href: `#/invoice/${r.id}` };
+        cols.forEach((c) => { o["c" + c.id] = r.cells[c.id] || 0; });
+        return o;
+      });
+      const footer = { vendor: `${d.rows.length} orders`, total: `<b>${money(d.grand_total)}</b>` };
+      cols.forEach((c) => { footer["c" + c.id] = money(d.column_totals[c.id]); });
+      body.innerHTML = "";
+      if (!d.rows.length) { body.appendChild(el(`<p class="empty">No invoices in this range.</p>`)); return; }
+      body.appendChild(dataTable(columns, rows, { search: true, footer, initialSort: { key: "invoice_date", dir: -1 } }));
+    } catch (e) { body.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+  }
+  load();
+}
+
+async function renderControllablePL() {
+  const v = view();
+  v.innerHTML = `<h2 class="section section-head">Controllable P&amp;L</h2>`;
+  const body = el(`<div id="pl-body"><div class="spinner"></div></div>`);
+  const filter = dateFilterBar(load);
+  v.appendChild(filter.bar);
+  v.appendChild(body);
+  async function load() {
+    body.innerHTML = '<div class="spinner"></div>';
+    const { start, end } = filter.get();
+    try {
+      const d = await api("GET", `/api/reports/controllable-pl?start=${start}&end=${end}`);
+      const row = (label, amt, pctv, cls = "") =>
+        `<div class="pl-row ${cls}"><span>${esc(label)}</span>
+          <span style="display:flex;gap:.6rem"><span class="pl-amt ${amt < 0 ? "neg" : ""}">${money(amt)}</span>
+          <span class="pl-pct">${pctv == null ? "" : pct(pctv)}</span></span></div>`;
+      let html = `<div class="card"><div class="card-body pl">`;
+      if (!d.square_configured) html += `<div class="note">Square isn’t connected — income &amp; labor read $0. Add it in <a href="#/settings" class="linkbtn">Settings</a>.</div>`;
+      else if (!d.mix_set) html += `<div class="note">No sales mix set for this period. Set your actual mix in <a href="#/settings" class="linkbtn">Settings → Sales Mix</a> to split income by category.</div>`;
+      html += `<div class="pl-row head">Income</div>`;
+      d.income.forEach((i) => { html += row(i.category_type, i.amt, i.pct_of_sales, "sub"); });
+      html += row("Total Income", d.total_income, null, "total");
+      html += `<div class="pl-row head">Cost of Goods Sold</div>`;
+      d.cogs.forEach((t) => {
+        html += row(t.category_type, t.type_total, t.type_pct);
+        t.categories.forEach((c) => { html += row(c.category, c.amt, c.pct, "sub"); });
+      });
+      html += row("Total COGS", d.total_cogs, d.total_cogs_pct, "total");
+      html += row("Gross Profit", d.gross_profit, d.gross_pct, "total grand");
+      html += `<div class="pl-row head">Controllable Expenses</div>`;
+      d.expenses.forEach((e) => { html += row(e.name, e.amt, e.pct, "sub"); });
+      html += row("Controllable Profit", d.controllable_profit, d.controllable_pct, "total grand");
+      html += `</div></div>`;
+      body.innerHTML = html;
+    } catch (e) { body.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+  }
+  load();
+}
+
+async function renderSales() {
+  loading();
+  try {
+    const d = await api("GET", "/api/reports/sales");
+    const v = view();
+    v.innerHTML = `<h2 class="section section-head">Sales</h2>`;
+    if (!d.square_configured) v.appendChild(el(`<div class="note">Square isn’t connected — sales read $0. Add it in <a href="#/settings" class="linkbtn">Settings</a>.</div>`));
+    v.appendChild(el(`<div class="stat-grid">
+      <div class="stat wide accent-ind"><div class="label">Week of ${esc(d.week_of)}</div>
+        <div class="value">${money(d.totals.this_week)}</div><div class="sub">this week to date</div></div>
+      <div class="stat accent-grn"><div class="label">Period to Date</div><div class="value" style="font-size:1.9rem">${money(d.period_to_date)}</div></div>
+      <div class="stat accent-ox"><div class="label">Year to Date</div><div class="value" style="font-size:1.9rem">${money(d.year_to_date)}</div></div>
+    </div>`));
+    v.appendChild(dataTable([
+      { key: "day", label: "Day", sortable: false },
+      { key: "this_week", label: "This Week", align: "right", fmt: (r) => r.this_week == null ? "—" : money(r.this_week) },
+      { key: "last_week", label: "Last Week", align: "right", fmt: (r) => money(r.last_week) },
+      { key: "last_year", label: "Last Year", align: "right", fmt: (r) => money(r.last_year) },
+    ], d.days, {
+      footer: {
+        day: "Total", this_week: `<b>${money(d.totals.this_week)}</b>`,
+        last_week: `<b>${money(d.totals.last_week)}</b>`, last_year: `<b>${money(d.totals.last_year)}</b>`,
+      },
+    }));
+  } catch (e) { view().innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+
+async function renderPriceMovers() {
+  const v = view();
+  v.innerHTML = `<h2 class="section section-head">Price Movers</h2>`;
+  const body = el(`<div id="pm-body"><div class="spinner"></div></div>`);
+  const filter = dateFilterBar(load);
+  v.appendChild(filter.bar);
+  v.appendChild(body);
+  async function load() {
+    body.innerHTML = '<div class="spinner"></div>';
+    const { start, end } = filter.get();
+    try {
+      const d = await api("GET", `/api/reports/price-movers?start=${start}&end=${end}`);
+      body.innerHTML = "";
+      if (!d.movers.length) { body.appendChild(el(`<p class="empty">No price changes in this range.<br>Movers appear once an item is bought at a new price.</p>`)); return; }
+      body.appendChild(dataTable([
+        { key: "category", label: "Category", fmt: (r) => esc(r.category) },
+        { key: "name", label: "Product", cls: "strong", fmt: (r) => esc(r.name) },
+        { key: "old_price", label: "Old", align: "right", fmt: (r) => money(r.old_price) },
+        { key: "new_price", label: "New", align: "right", fmt: (r) => money(r.new_price) },
+        { key: "change_pct", label: "Change", align: "right", fmt: (r) => `<span class="${r.change_pct > 0 ? "neg" : ""}">${r.change_pct > 0 ? "▲" : "▼"} ${pct(Math.abs(r.change_pct))}</span>` },
+        { key: "impact", label: "Impact $", align: "right", fmt: (r) => `<b class="${r.impact > 0 ? "neg" : ""}">${money(r.impact)}</b>` },
+      ], d.movers, { search: true, initialSort: { key: "impact", dir: -1 },
+        footer: { name: `${d.movers.length} items`, impact: `<b>${money(d.total_impact)}</b>` } }));
+    } catch (e) { body.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+  }
+  load();
+}
+
+/* ============================================================
+   PRODUCTS
+   ============================================================ */
+function renderProducts(parts) {
+  const sub = parts[0] || "all";
+  if (sub === "new") return renderNewItems();
+  if (sub === "purchase") return renderPurchaseReport();
+  return renderAllProducts();
+}
+
+async function renderAllProducts() {
+  const v = view();
+  v.appendChild(el(`
+    <h2 class="section section-head">Products</h2>
+    <button class="btn btn-brass btn-block" id="add-product">+ Add Product</button>
+    <div class="filters">
+      <label class="fld"><span>Type</span><select id="p-type"><option value="">All Types</option></select></label>
+      <label class="fld"><span>Category</span><select id="p-cat"><option value="">All Categories</option></select></label>
+    </div>
+    <div id="p-list"><div class="spinner"></div></div>`));
+  $("#add-product").addEventListener("click", () => openItemEditor(null));
+  const cats = await loadCategories();
+  const types = [...new Set(cats.map((c) => c.category_type))];
+  $("#p-type").insertAdjacentHTML("beforeend", types.map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join(""));
+  $("#p-cat").insertAdjacentHTML("beforeend", cats.map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join(""));
+  $("#p-type").addEventListener("change", load);
+  $("#p-cat").addEventListener("change", load);
+  async function load() {
+    const box = $("#p-list");
+    box.innerHTML = '<div class="spinner"></div>';
+    const qs = new URLSearchParams();
+    if ($("#p-type").value) qs.set("category_type", $("#p-type").value);
+    if ($("#p-cat").value) qs.set("category", $("#p-cat").value);
+    try {
+      const list = await api("GET", "/api/products?" + qs.toString());
+      box.innerHTML = "";
+      box.appendChild(dataTable([
+        { key: "name", label: "Name", cls: "strong", fmt: (r) => `<a href="#/product/${r.id}" style="color:var(--red);text-decoration:none">${esc(r.name)}</a>` },
+        { key: "category_name", label: "Category", fmt: (r) => r.category_type ? typePill(r.category_type) + " " + esc(r.category_name || "") : "—" },
+        { key: "report_by_unit", label: "Report By", fmt: (r) => esc(r.report_by_unit || r.unit || "—") },
+        { key: "on_inventory", label: "On Inv", fmt: (r) => (r.on_inventory ? "Yes" : "No") },
+        { key: "tax_exempt", label: "Tax Exempt", fmt: (r) => (r.tax_exempt ? "Yes" : "No") },
+        { key: "unit_cost", label: "Last $", align: "right", fmt: (r) => money(r.unit_cost) },
+      ], list, { search: true, empty: "No products match.", initialSort: { key: "name", dir: 1 } }));
+    } catch (e) { box.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+  }
+  load();
+}
+
+async function renderNewItems() {
+  const v = view();
+  v.appendChild(el(`
+    <h2 class="section section-head">New Item Review</h2>
+    <p class="muted" style="font-size:.85rem;margin-top:-.3rem">New vendor items from recent invoices. Confirm a category, then approve.</p>
+    <div id="ni-list"><div class="spinner"></div></div>`));
+  const cats = await loadCategories();
+  const opts = (sel) => `<option value="">— category —</option>` + cats.map((c) =>
+    `<option value="${c.id}" ${c.id === sel ? "selected" : ""}>${esc(c.category_type)} · ${esc(c.name)}</option>`).join("");
+  async function load() {
+    const box = $("#ni-list");
+    box.innerHTML = '<div class="spinner"></div>';
+    try {
+      const list = await api("GET", "/api/products/new-items");
+      box.innerHTML = "";
+      if (!list.length) { box.appendChild(el(`<p class="empty">Nothing to review.<br>New vendor items show up here as you log invoices.</p>`)); return; }
+      list.forEach((vi) => {
+        const row = el(`<div class="row-item" style="flex-wrap:wrap">
+          <div class="grow">
+            <div class="ttl">${esc(vi.vendor_item_name)}</div>
+            <div class="meta">${esc(vi.vendor_name || "—")}${vi.last_purchase_price != null ? " · " + money(vi.last_purchase_price) : ""}</div>
+          </div>
+          <select class="ni-cat" style="flex:1 1 180px">${opts(vi.category_id)}</select>
+          <button class="btn btn-sm btn-grn ni-ok">Approve</button>
+        </div>`);
+        row.querySelector(".ni-ok").addEventListener("click", async () => {
+          const cid = row.querySelector(".ni-cat").value;
+          try {
+            await api("POST", `/api/products/new-items/${vi.id}/accept`, cid ? { category_id: Number(cid) } : {});
+            toast("Approved.");
+            load();
+          } catch (e) { toast(e.message); }
+        });
+        box.appendChild(row);
+      });
+    } catch (e) { box.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+  }
+  load();
+}
+
+async function renderPurchaseReport() {
+  const v = view();
+  v.innerHTML = `<h2 class="section section-head">Purchase Report</h2>`;
+  const body = el(`<div id="pr-body"><div class="spinner"></div></div>`);
+  const filter = dateFilterBar(load);
+  v.appendChild(filter.bar);
+  v.appendChild(body);
+  async function load() {
+    body.innerHTML = '<div class="spinner"></div>';
+    const { start, end } = filter.get();
+    try {
+      const d = await api("GET", `/api/products/purchase-report?start=${start}&end=${end}`);
+      body.innerHTML = "";
+      if (!d.rows.length) { body.appendChild(el(`<p class="empty">No purchases in this range.</p>`)); return; }
+      const total = d.rows.reduce((s, r) => s + (r.spend || 0), 0);
+      body.appendChild(dataTable([
+        { key: "product", label: "Product", cls: "strong", fmt: (r) => esc(r.product) },
+        { key: "category_type", label: "Type", fmt: (r) => r.category_type ? typePill(r.category_type) : "—" },
+        { key: "category", label: "Category", fmt: (r) => esc(r.category || "—") },
+        { key: "report_by", label: "Report By", fmt: (r) => esc(r.report_by || "—") },
+        { key: "units", label: "Units", align: "right", fmt: (r) => fmtQty(r.units) },
+        { key: "spend", label: "Spend", align: "right", fmt: (r) => money(r.spend) },
+      ], d.rows, { search: true, initialSort: { key: "spend", dir: -1 },
+        footer: { product: `${d.rows.length} products`, spend: `<b>${money(total)}</b>` } }));
+    } catch (e) { body.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+  }
+  load();
+}
+
+async function renderProductDetail(parts) {
+  loading();
+  try {
+    const p = await api("GET", `/api/products/${parts[0]}`);
+    const v = view();
+    v.innerHTML = "";
+    v.appendChild(el(`
+      <h2 class="section section-head">${esc(p.name)}</h2>
+      <div class="card"><div class="card-body">
+        <div class="kv"><span>Category</span><span>${p.category_type ? typePill(p.category_type) + " " + esc(p.category_name || "") : "—"}</span></div>
+        <div class="kv"><span>Report By</span><b>${esc(p.report_by_unit || p.unit || "—")}</b></div>
+        <div class="kv"><span>Accounting Code</span><b>${esc(p.accounting_code || "—")}</b></div>
+        <div class="kv"><span>On Inventory</span><b>${p.on_inventory ? "Yes" : "No"}</b></div>
+        <div class="kv"><span>Tax Exempt</span><b>${p.tax_exempt ? "Yes" : "No"}</b></div>
+        <div class="kv"><span>Last Unit Cost</span><b>${money(p.unit_cost)}</b></div>
+        <div class="kv"><span>Vendor</span><b>${esc(p.vendor || "—")}</b></div>
+      </div></div>`));
+    if (p.purchase_history && p.purchase_history.length) {
+      const card = el(`<div class="card"><div class="card-band">Purchase History</div><div class="card-body" id="ph"></div></div>`);
+      card.querySelector("#ph").appendChild(dataTable([
+        { key: "invoice_date", label: "Date", fmt: (r) => esc(r.invoice_date || "—") },
+        { key: "vendor", label: "Vendor", fmt: (r) => esc(r.vendor || "—") },
+        { key: "qty", label: "Qty", align: "right", fmt: (r) => fmtQty(r.qty) },
+        { key: "unit_cost", label: "Unit $", align: "right", fmt: (r) => money(r.unit_cost) },
+        { key: "total", label: "Total", align: "right", fmt: (r) => money(r.total) },
+      ], p.purchase_history, {}));
+      v.appendChild(card);
+    }
+    v.appendChild(el(`<button class="btn btn-brass btn-block" id="edit-p" style="margin-top:.6rem">Edit</button>
+      <button class="btn btn-ghost btn-block" id="back-p" style="margin-top:.5rem">Back to Products</button>`));
+    $("#edit-p").addEventListener("click", () => openItemEditor(p));
+    $("#back-p").addEventListener("click", () => { location.hash = "#/products"; });
+  } catch (e) { view().innerHTML = `<p class="err">${esc(e.message)}</p>`; }
 }
 
 /* ---------- small format helpers ---------- */

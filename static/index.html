@@ -34,22 +34,20 @@
   <div id="app" class="app hidden">
     <header class="topbar">
       <div class="topbar-inner">
+        <button id="navtoggle" class="hamburger" aria-label="Menu">&#x2630;</button>
         <span class="crest sm">&#x2615;</span>
         <h1 class="brand">Barkeep&rsquo;s Ledger</h1>
       </div>
       <div class="rule-double"></div>
     </header>
 
-    <main id="view" class="view"></main>
-
-    <nav class="tabbar">
-      <a href="#/dashboard" data-tab="dashboard"><span class="ic">&#x1F4CA;</span><b>Numbers</b></a>
-      <a href="#/invoices"  data-tab="invoices"><span class="ic">&#x1F9FE;</span><b>Invoices</b></a>
-      <a href="#/inventory" data-tab="inventory"><span class="ic">&#x1F4E6;</span><b>Stock</b></a>
-      <a href="#/vendors"   data-tab="vendors"><span class="ic">&#x1F69A;</span><b>Vendors</b></a>
-      <a href="#/count"     data-tab="count"><span class="ic">&#x1F522;</span><b>Count</b></a>
-      <a href="#/settings"  data-tab="settings"><span class="ic">&#x2699;</span><b>Settings</b></a>
-    </nav>
+    <div class="shell">
+      <aside id="sidebar" class="sidebar">
+        <nav id="nav"></nav>
+      </aside>
+      <div id="scrim" class="scrim hidden"></div>
+      <main id="view" class="view"></main>
+    </div>
   </div>
 
   <div id="toast" class="toast hidden"></div>
