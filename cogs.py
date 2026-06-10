@@ -7,7 +7,7 @@ Two ways to read COGS are offered:
 """
 import datetime as dt
 
-from db import get_db, get_setting
+from db import get_db, get_setting, active_location_id
 import square_client
 
 
@@ -17,19 +17,20 @@ def purchases(start, end):
     The total comes from invoice grand totals; the breakdown comes from
     categorized line items (so it reflects the two-level taxonomy)."""
     db = get_db()
+    loc = active_location_id()
     total_row = db.execute(
         "SELECT COALESCE(SUM(total),0) AS amt, COUNT(*) AS n FROM invoices "
-        "WHERE invoice_date >= ? AND invoice_date <= ?",
-        (start.isoformat(), end.isoformat()),
+        "WHERE location_id IS ? AND invoice_date >= ? AND invoice_date <= ?",
+        (loc, start.isoformat(), end.isoformat()),
     ).fetchone()
     rows = db.execute(
         "SELECT COALESCE(c.category_type,'Uncategorized') AS ctype, "
         "       COALESCE(SUM(ii.total),0) AS amt "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN categories c ON c.id = ii.category_id "
-        "WHERE inv.invoice_date >= ? AND inv.invoice_date <= ? "
+        "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ? "
         "GROUP BY c.category_type",
-        (start.isoformat(), end.isoformat()),
+        (loc, start.isoformat(), end.isoformat()),
     ).fetchall()
     by_cat = {r["ctype"]: round(r["amt"], 2) for r in rows if r["amt"]}
     return {"by_category": by_cat, "total": round(total_row["amt"], 2), "count": total_row["n"]}
@@ -42,17 +43,18 @@ def _inventory_value_near(target, prefer_before=True):
     prefer_before=False -> the earliest count on/after target (ending value)
     """
     db = get_db()
+    loc = active_location_id()
     if prefer_before:
         row = db.execute(
-            "SELECT id, value, taken_at FROM counts WHERE date(taken_at) <= ? "
+            "SELECT id, value, taken_at FROM counts WHERE location_id IS ? AND date(taken_at) <= ? "
             "ORDER BY taken_at DESC LIMIT 1",
-            (target.isoformat(),),
+            (loc, target.isoformat()),
         ).fetchone()
     else:
         row = db.execute(
-            "SELECT id, value, taken_at FROM counts WHERE date(taken_at) >= ? "
+            "SELECT id, value, taken_at FROM counts WHERE location_id IS ? AND date(taken_at) >= ? "
             "ORDER BY taken_at ASC LIMIT 1",
-            (target.isoformat(),),
+            (loc, target.isoformat()),
         ).fetchone()
     if not row:
         return None

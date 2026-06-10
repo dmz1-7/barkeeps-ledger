@@ -13,7 +13,7 @@ Sales report depend on Square; without it they fail soft to zeros + an error.
 """
 import datetime as dt
 
-from db import get_db, TAXONOMY
+from db import get_db, TAXONOMY, active_location_id
 import square_client
 
 CATEGORY_TYPES = list(TAXONOMY.keys())  # Food, Beer, Wine, Liquor, N/A Bev, Other
@@ -33,8 +33,8 @@ def category_report(start, end, vendor=None, status=None, search=None):
         "WHERE archived=0 ORDER BY sort_order"
     ).fetchall()
 
-    where = ["invoice_date >= ?", "invoice_date <= ?"]
-    params = [start.isoformat(), end.isoformat()]
+    where = ["location_id IS ?", "invoice_date >= ?", "invoice_date <= ?"]
+    params = [active_location_id(), start.isoformat(), end.isoformat()]
     if vendor:
         where.append("lower(vendor) = lower(?)")
         params.append(vendor)
@@ -90,12 +90,13 @@ def controllable_pl(start, end):
     sales = sales_info["sales"]
     labor = labor_info["labor"]
 
+    loc = active_location_id()
     mix = {
         r["category_type"]: r["pct"]
         for r in db.execute(
             "SELECT category_type, pct FROM sales_mix "
-            "WHERE period_start=? AND period_end=?",
-            (start.isoformat(), end.isoformat()),
+            "WHERE location_id=? AND period_start=? AND period_end=?",
+            (loc, start.isoformat(), end.isoformat()),
         )
     }
 
@@ -118,9 +119,9 @@ def controllable_pl(start, end):
         "       COALESCE(SUM(ii.total),0) AS amt "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN categories c ON c.id = ii.category_id "
-        "WHERE inv.invoice_date >= ? AND inv.invoice_date <= ? "
+        "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ? "
         "GROUP BY c.category_type, c.name",
-        (start.isoformat(), end.isoformat()),
+        (loc, start.isoformat(), end.isoformat()),
     ).fetchall()
 
     by_type = {}
@@ -237,18 +238,20 @@ def price_movers(start, end):
     """Items whose unit cost moved between the prior price and the latest price
     in the window, ranked by dollar impact (delta x qty bought in window)."""
     db = get_db()
+    loc = active_location_id()
     # Latest price + qty within the window, per item name.
     in_window = db.execute(
         "SELECT ii.name AS name, ii.category_id AS category_id, "
         "       SUM(ii.qty) AS qty, "
         "       (SELECT unit_cost FROM invoice_items x JOIN invoices xi ON xi.id=x.invoice_id "
-        "        WHERE x.name = ii.name AND xi.invoice_date >= ? AND xi.invoice_date <= ? "
+        "        WHERE x.name = ii.name AND xi.location_id IS ? "
+        "          AND xi.invoice_date >= ? AND xi.invoice_date <= ? "
         "        ORDER BY xi.invoice_date DESC, x.id DESC LIMIT 1) AS new_price "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
-        "WHERE inv.invoice_date >= ? AND inv.invoice_date <= ? "
+        "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ? "
         "  AND ii.name IS NOT NULL AND TRIM(ii.name) <> '' "
         "GROUP BY ii.name",
-        (start.isoformat(), end.isoformat(), start.isoformat(), end.isoformat()),
+        (loc, start.isoformat(), end.isoformat(), loc, start.isoformat(), end.isoformat()),
     ).fetchall()
 
     cat_names = {r["id"]: r["name"] for r in db.execute("SELECT id, name FROM categories")}
@@ -256,9 +259,9 @@ def price_movers(start, end):
     for r in in_window:
         prior = db.execute(
             "SELECT unit_cost FROM invoice_items x JOIN invoices xi ON xi.id=x.invoice_id "
-            "WHERE x.name=? AND xi.invoice_date < ? AND x.unit_cost IS NOT NULL "
+            "WHERE x.name=? AND xi.location_id IS ? AND xi.invoice_date < ? AND x.unit_cost IS NOT NULL "
             "ORDER BY xi.invoice_date DESC, x.id DESC LIMIT 1",
-            (r["name"], start.isoformat()),
+            (r["name"], loc, start.isoformat()),
         ).fetchone()
         old_price = prior["unit_cost"] if prior else None
         new_price = r["new_price"]

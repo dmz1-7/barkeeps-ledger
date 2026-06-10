@@ -133,9 +133,39 @@ def save_settings():
     return jsonify({"ok": True})
 
 
-@app.get("/api/locations")
-def locations():
+@app.get("/api/square-locations")
+def square_locations():
     return jsonify(square_client.list_locations())
+
+
+# --- stores / active location ----------------------------------------------
+
+@app.get("/api/locations")
+def location_list():
+    rows = db.get_db().execute(
+        "SELECT id, name, square_location_id FROM locations WHERE archived=0 ORDER BY id"
+    ).fetchall()
+    return jsonify({"locations": [dict(r) for r in rows], "active": db.active_location_id()})
+
+
+@app.get("/api/active-location")
+def active_location_get():
+    return jsonify({"active": db.active_location_id()})
+
+
+@app.put("/api/active-location")
+def active_location_set():
+    loc_id = (request.json or {}).get("location_id")
+    database = db.get_db()
+    row = database.execute(
+        "SELECT id, square_location_id FROM locations WHERE id=?", (loc_id,)
+    ).fetchone()
+    if not row:
+        return jsonify({"error": "Unknown location."}), 400
+    db.set_setting("active_location_id", row["id"])
+    # Mirror the store's Square id so sales/labor follow the active location.
+    db.set_setting("square_location_id", row["square_location_id"] or "")
+    return jsonify({"ok": True, "active": row["id"]})
 
 
 # --- dashboard --------------------------------------------------------------
@@ -180,12 +210,13 @@ def invoice_create():
     vendor = d.get("vendor", "")
     inv_date = d.get("invoice_date", "")
     database = db.get_db()
+    loc = db.active_location_id()
     cur = database.execute(
-        "INSERT INTO invoices(vendor, invoice_date, invoice_number, category, "
+        "INSERT INTO invoices(location_id, vendor, invoice_date, invoice_number, category, "
         "subtotal, tax, total, image_path, notes, raw_json, status, payment_account) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
-            vendor, inv_date, d.get("invoice_number", ""),
+            loc, vendor, inv_date, d.get("invoice_number", ""),
             d.get("category"), _f(d.get("subtotal")), _f(d.get("tax")),
             _f(d.get("total")), d.get("image_path"), d.get("notes", ""),
             d.get("raw_json", ""), d.get("status", "closed"), d.get("payment_account"),
@@ -193,7 +224,7 @@ def invoice_create():
     )
     inv_id = cur.lastrowid
     for it in items:
-        vi_id, cat_id = _resolve_vendor_item(database, vendor, inv_date, it)
+        vi_id, cat_id = _resolve_vendor_item(database, vendor, inv_date, it, loc)
         database.execute(
             "INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, "
             "vendor_item_id, category_id) VALUES(?,?,?,?,?,?,?,?)",
@@ -207,7 +238,7 @@ def invoice_create():
 @app.get("/api/invoices")
 def invoice_list():
     """The Orders view. Optional filters: start, end, vendor, status, q (search)."""
-    where, params = [], []
+    where, params = ["location_id IS ?"], [db.active_location_id()]
     if request.args.get("start"):
         where.append("invoice_date >= ?"); params.append(request.args["start"])
     if request.args.get("end"):
@@ -262,8 +293,8 @@ def invoice_delete(inv_id):
 @app.get("/api/inventory")
 def inventory_list():
     rows = db.get_db().execute(
-        "SELECT * FROM inventory_items WHERE archived=0 "
-        "ORDER BY category, sort_order, name"
+        "SELECT * FROM inventory_items WHERE archived=0 AND location_id IS ? "
+        "ORDER BY category, sort_order, name", (db.active_location_id(),)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -272,9 +303,9 @@ def inventory_list():
 def inventory_create():
     d = request.json or {}
     cur = db.get_db().execute(
-        "INSERT INTO inventory_items(name, category, unit, par_level, last_count, "
-        "unit_cost, vendor, sort_order) VALUES(?,?,?,?,?,?,?,?)",
-        (d.get("name", "").strip(), d.get("category", "other"), d.get("unit", ""),
+        "INSERT INTO inventory_items(location_id, name, category, unit, par_level, last_count, "
+        "unit_cost, vendor, sort_order) VALUES(?,?,?,?,?,?,?,?,?)",
+        (db.active_location_id(), d.get("name", "").strip(), d.get("category", "other"), d.get("unit", ""),
          _f(d.get("par_level"), 0), _f(d.get("last_count"), 0),
          _f(d.get("unit_cost"), 0), d.get("vendor", ""), _i(d.get("sort_order"), 0)),
     )
@@ -311,8 +342,8 @@ def inventory_delete(item_id):
 def order_list():
     """Items at or below par, with how many units to bring back up to par."""
     rows = db.get_db().execute(
-        "SELECT * FROM inventory_items WHERE archived=0 AND last_count <= par_level "
-        "ORDER BY category, name"
+        "SELECT * FROM inventory_items WHERE archived=0 AND location_id IS ? "
+        "AND last_count <= par_level ORDER BY category, name", (db.active_location_id(),)
     ).fetchall()
     out = []
     for r in rows:
@@ -330,7 +361,8 @@ def count_save():
     lines = d.get("lines") or []
     database = db.get_db()
     cur = database.execute(
-        "INSERT INTO counts(note, value) VALUES(?, 0)", (d.get("note", ""),)
+        "INSERT INTO counts(location_id, note, value) VALUES(?, ?, 0)",
+        (db.active_location_id(), d.get("note", "")),
     )
     count_id = cur.lastrowid
     total_value = 0.0
@@ -356,7 +388,8 @@ def count_save():
 @app.get("/api/counts")
 def count_list():
     rows = db.get_db().execute(
-        "SELECT id, taken_at, note, value FROM counts ORDER BY taken_at DESC LIMIT 100"
+        "SELECT id, taken_at, note, value FROM counts WHERE location_id IS ? "
+        "ORDER BY taken_at DESC LIMIT 100", (db.active_location_id(),)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -387,7 +420,8 @@ def vendor_list():
     rows = db.get_db().execute(
         "SELECT v.*, "
         "  (SELECT COUNT(*) FROM vendor_items vi "
-        "     WHERE vi.archived=0 AND lower(COALESCE(vi.vendor_name,'')) = lower(v.name)) AS item_count, "
+        "     WHERE vi.archived=0 AND vi.location_id IS v.location_id "
+        "       AND lower(COALESCE(vi.vendor_name,'')) = lower(v.name)) AS item_count, "
         "  COALESCE(s.total,0) AS spend, COALESCE(s.cnt,0) AS invoice_count, s.last_date AS last_order, "
         "  COALESCE(s.tp_total,0) AS period_purchases, COALESCE(s.tp_cnt,0) AS period_invoices, "
         "  COALESCE(s.lp_total,0) AS last_period_purchases, COALESCE(s.lp_cnt,0) AS last_period_invoices, "
@@ -401,11 +435,11 @@ def vendor_list():
         "    SUM(CASE WHEN invoice_date >= :lms AND invoice_date <= :lme THEN 1 ELSE 0 END) AS lp_cnt, "
         "    SUM(CASE WHEN invoice_date >= :ys THEN total ELSE 0 END) AS yr_total, "
         "    SUM(CASE WHEN invoice_date >= :ys THEN 1 ELSE 0 END) AS yr_cnt "
-        "  FROM invoices GROUP BY lower(vendor)"
+        "  FROM invoices WHERE location_id IS :loc GROUP BY lower(vendor)"
         ") s ON s.vn = lower(v.name) "
-        "WHERE v.archived = 0 ORDER BY v.name COLLATE NOCASE",
+        "WHERE v.archived = 0 AND v.location_id IS :loc ORDER BY v.name COLLATE NOCASE",
         {"ms": p["month_start"], "lms": p["last_month_start"],
-         "lme": p["last_month_end"], "ys": p["year_start"]},
+         "lme": p["last_month_end"], "ys": p["year_start"], "loc": db.active_location_id()},
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -413,11 +447,12 @@ def vendor_list():
 @app.get("/api/vendors/summary")
 def vendor_summary():
     d = db.get_db()
+    loc = db.active_location_id()
     return jsonify({
-        "total_vendors": d.execute("SELECT COUNT(*) c FROM vendors WHERE archived=0").fetchone()["c"],
-        "vendor_items": d.execute("SELECT COUNT(*) c FROM vendor_items WHERE archived=0").fetchone()["c"],
-        "invoices_processed": d.execute("SELECT COUNT(*) c FROM invoices").fetchone()["c"],
-        "total_purchased": round(d.execute("SELECT COALESCE(SUM(total),0) t FROM invoices").fetchone()["t"], 2),
+        "total_vendors": d.execute("SELECT COUNT(*) c FROM vendors WHERE archived=0 AND location_id IS ?", (loc,)).fetchone()["c"],
+        "vendor_items": d.execute("SELECT COUNT(*) c FROM vendor_items WHERE archived=0 AND location_id IS ?", (loc,)).fetchone()["c"],
+        "invoices_processed": d.execute("SELECT COUNT(*) c FROM invoices WHERE location_id IS ?", (loc,)).fetchone()["c"],
+        "total_purchased": round(d.execute("SELECT COALESCE(SUM(total),0) t FROM invoices WHERE location_id IS ?", (loc,)).fetchone()["t"], 2),
     })
 
 
@@ -428,10 +463,10 @@ def vendor_create():
     if not name:
         return jsonify({"error": "Vendor needs a name."}), 400
     cur = db.get_db().execute(
-        "INSERT INTO vendors(name, contact_name, phone, email, account_number, "
-        "order_days, notes) VALUES(?,?,?,?,?,?,?)",
-        (name, d.get("contact_name", ""), d.get("phone", ""), d.get("email", ""),
-         d.get("account_number", ""), d.get("order_days", ""), d.get("notes", "")),
+        "INSERT INTO vendors(location_id, name, contact_name, phone, email, account_number, "
+        "order_days, notes) VALUES(?,?,?,?,?,?,?,?)",
+        (db.active_location_id(), name, d.get("contact_name", ""), d.get("phone", ""),
+         d.get("email", ""), d.get("account_number", ""), d.get("order_days", ""), d.get("notes", "")),
     )
     db.get_db().commit()
     return jsonify({"id": cur.lastrowid})
@@ -446,13 +481,13 @@ def vendor_get(vid):
     out = dict(v)
     invoices = db_.execute(
         "SELECT id, invoice_date, invoice_number, category, total FROM invoices "
-        "WHERE lower(vendor) = lower(?) ORDER BY invoice_date DESC, id DESC LIMIT 50",
-        (v["name"],),
+        "WHERE location_id IS ? AND lower(vendor) = lower(?) ORDER BY invoice_date DESC, id DESC LIMIT 50",
+        (v["location_id"], v["name"]),
     ).fetchall()
     items = db_.execute(
         "SELECT id, name, category, unit, par_level, last_count, unit_cost FROM inventory_items "
-        "WHERE archived = 0 AND lower(vendor) = lower(?) ORDER BY name COLLATE NOCASE",
-        (v["name"],),
+        "WHERE archived = 0 AND location_id IS ? AND lower(vendor) = lower(?) ORDER BY name COLLATE NOCASE",
+        (v["location_id"], v["name"]),
     ).fetchall()
     out["invoices"] = [dict(r) for r in invoices]
     out["items"] = [dict(r) for r in items]
@@ -545,8 +580,8 @@ _PRODUCT_COLS = ("name", "category", "category_id", "unit", "report_by_unit",
 
 @app.get("/api/products")
 def product_list():
-    where = ["p.archived = 0"]
-    params = []
+    where = ["p.archived = 0", "p.location_id IS ?"]
+    params = [db.active_location_id()]
     if request.args.get("category_type"):
         where.append("c.category_type = ?"); params.append(request.args["category_type"])
     if request.args.get("category"):
@@ -569,10 +604,11 @@ def product_create():
     if not name:
         return jsonify({"error": "Product needs a name."}), 400
     cols = [k for k in _PRODUCT_COLS if k in d]
-    cols = cols or ["name"]
     if "name" not in cols:
         cols.append("name")
-    vals = [name if k == "name" else d.get(k) for k in cols]
+    cols.append("location_id")
+    vals = [name if k == "name" else (db.active_location_id() if k == "location_id" else d.get(k))
+            for k in cols]
     placeholders = ",".join("?" * len(cols))
     cur = db.get_db().execute(
         f"INSERT INTO inventory_items({','.join(cols)}) VALUES({placeholders})", vals
@@ -590,10 +626,10 @@ def product_purchase_report():
         "       COALESCE(SUM(ii.total),0) AS spend "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN categories c ON c.id = ii.category_id "
-        "WHERE inv.invoice_date >= ? AND inv.invoice_date <= ? "
+        "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ? "
         "  AND ii.name IS NOT NULL AND TRIM(ii.name) <> '' "
         "GROUP BY ii.name, ii.category_id ORDER BY spend DESC",
-        (start.isoformat(), end.isoformat()),
+        (db.active_location_id(), start.isoformat(), end.isoformat()),
     ).fetchall()
     out = [{**dict(r), "units": round(r["units"], 2), "spend": round(r["spend"], 2)}
            for r in rows]
@@ -607,7 +643,8 @@ def product_new_items():
         "SELECT vi.*, c.name AS category_name, c.category_type, p.name AS product_name "
         "FROM vendor_items vi LEFT JOIN categories c ON c.id = vi.category_id "
         "LEFT JOIN inventory_items p ON p.id = vi.product_id "
-        "WHERE vi.archived=0 AND vi.status='new' ORDER BY vi.created_at DESC, vi.id DESC"
+        "WHERE vi.archived=0 AND vi.status='new' AND vi.location_id IS ? "
+        "ORDER BY vi.created_at DESC, vi.id DESC", (db.active_location_id(),)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -641,9 +678,9 @@ def product_get(pid):
     out["purchase_history"] = [dict(r) for r in d.execute(
         "SELECT inv.invoice_date, inv.vendor, ii.qty, ii.unit, ii.unit_cost, ii.total "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
-        "WHERE ii.inventory_item_id=? OR lower(ii.name)=lower(?) "
+        "WHERE inv.location_id IS ? AND (ii.inventory_item_id=? OR lower(ii.name)=lower(?)) "
         "ORDER BY inv.invoice_date DESC, ii.id DESC LIMIT 50",
-        (pid, row["name"]),
+        (row["location_id"], pid, row["name"]),
     ).fetchall()]
     return jsonify(out)
 
@@ -673,8 +710,8 @@ def product_delete(pid):
 
 @app.get("/api/vendor-items")
 def vendor_item_list():
-    where = ["vi.archived = 0"]
-    params = []
+    where = ["vi.archived = 0", "vi.location_id IS ?"]
+    params = [db.active_location_id()]
     if request.args.get("status"):
         where.append("vi.status = ?"); params.append(request.args["status"])
     if request.args.get("category"):
@@ -701,10 +738,10 @@ def vendor_item_create():
     if not name:
         return jsonify({"error": "Vendor item needs a name."}), 400
     cur = db.get_db().execute(
-        "INSERT INTO vendor_items(vendor_id, vendor_name, vendor_item_name, product_id, "
-        "category_id, item_code, order_guide, status) VALUES(?,?,?,?,?,?,?, 'reviewed')",
-        (_i(d.get("vendor_id")), d.get("vendor_name", ""), name, _i(d.get("product_id")),
-         _i(d.get("category_id")), d.get("item_code", ""), _i(d.get("order_guide"), 0)),
+        "INSERT INTO vendor_items(location_id, vendor_id, vendor_name, vendor_item_name, product_id, "
+        "category_id, item_code, order_guide, status) VALUES(?,?,?,?,?,?,?,?, 'reviewed')",
+        (db.active_location_id(), _i(d.get("vendor_id")), d.get("vendor_name", ""), name,
+         _i(d.get("product_id")), _i(d.get("category_id")), d.get("item_code", ""), _i(d.get("order_guide"), 0)),
     )
     db.get_db().commit()
     return jsonify({"id": cur.lastrowid})
@@ -738,8 +775,9 @@ def vendor_item_delete(vid):
 def sales_mix_get():
     start, end = cogs.parse_range(request.args.get("start"), request.args.get("end"))
     rows = db.get_db().execute(
-        "SELECT category_type, pct FROM sales_mix WHERE period_start=? AND period_end=?",
-        (start.isoformat(), end.isoformat()),
+        "SELECT category_type, pct FROM sales_mix "
+        "WHERE location_id=? AND period_start=? AND period_end=?",
+        (db.active_location_id(), start.isoformat(), end.isoformat()),
     ).fetchall()
     mix = {r["category_type"]: r["pct"] for r in rows}
     return jsonify({
@@ -754,13 +792,14 @@ def sales_mix_put():
     start, end = cogs.parse_range(request.args.get("start"), request.args.get("end"))
     mix = (request.json or {}).get("mix") or {}
     database = db.get_db()
+    loc = db.active_location_id()
     for ctype in reports.CATEGORY_TYPES:
         if ctype in mix:
             database.execute(
-                "INSERT INTO sales_mix(period_start, period_end, category_type, pct) "
-                "VALUES(?,?,?,?) ON CONFLICT(period_start,period_end,category_type) "
+                "INSERT INTO sales_mix(location_id, period_start, period_end, category_type, pct) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(location_id,period_start,period_end,category_type) "
                 "DO UPDATE SET pct=excluded.pct",
-                (start.isoformat(), end.isoformat(), ctype, _f(mix[ctype], 0)),
+                (loc, start.isoformat(), end.isoformat(), ctype, _f(mix[ctype], 0)),
             )
     database.commit()
     return jsonify({"ok": True})
@@ -807,9 +846,9 @@ def _category_id_by_name(database, name):
     return r["id"] if r else None
 
 
-def _resolve_vendor_item(database, vendor, inv_date, line):
-    """Match an invoice line to a vendor_item (creating a 'new' one if unseen),
-    refresh its last price/date, and return (vendor_item_id, category_id)."""
+def _resolve_vendor_item(database, vendor, inv_date, line, loc):
+    """Match an invoice line to a vendor_item within this location (creating a
+    'new' one if unseen), refresh its last price/date, return (vi_id, cat_id)."""
     name = (line.get("name") or "").strip()
     cat_id = _category_id_by_name(database, line.get("category"))
     price = _f(line.get("unit_cost"))
@@ -817,9 +856,9 @@ def _resolve_vendor_item(database, vendor, inv_date, line):
         return None, cat_id
     row = database.execute(
         "SELECT id, category_id FROM vendor_items "
-        "WHERE lower(COALESCE(vendor_name,'')) = lower(?) "
+        "WHERE location_id IS ? AND lower(COALESCE(vendor_name,'')) = lower(?) "
         "  AND lower(vendor_item_name) = lower(?)",
-        (vendor or "", name),
+        (loc, vendor or "", name),
     ).fetchone()
     if row:
         database.execute(
@@ -829,13 +868,14 @@ def _resolve_vendor_item(database, vendor, inv_date, line):
         )
         return row["id"], (row["category_id"] or cat_id)
     vrow = database.execute(
-        "SELECT id FROM vendors WHERE lower(name)=lower(?)", (vendor or "",)
+        "SELECT id FROM vendors WHERE location_id IS ? AND lower(name)=lower(?)",
+        (loc, vendor or ""),
     ).fetchone()
     cur = database.execute(
-        "INSERT INTO vendor_items(vendor_id, vendor_name, vendor_item_name, "
+        "INSERT INTO vendor_items(location_id, vendor_id, vendor_name, vendor_item_name, "
         "category_id, last_purchase_date, last_purchase_price, status) "
-        "VALUES(?,?,?,?,?,?, 'new')",
-        (vrow["id"] if vrow else None, vendor, name, cat_id, inv_date, price),
+        "VALUES(?,?,?,?,?,?,?, 'new')",
+        (loc, vrow["id"] if vrow else None, vendor, name, cat_id, inv_date, price),
     )
     return cur.lastrowid, cat_id
 

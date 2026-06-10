@@ -412,6 +412,16 @@ def get_setting(key, default=None):
     return row["value"] if row else default
 
 
+def active_location_id():
+    """The store currently being viewed. Falls back to the lowest location id."""
+    v = get_setting("active_location_id")
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        row = get_db().execute("SELECT MIN(id) AS id FROM locations").fetchone()
+        return row["id"] if row else None
+
+
 def set_setting(key, value):
     db = get_db()
     db.execute(
