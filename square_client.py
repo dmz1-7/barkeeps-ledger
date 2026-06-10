@@ -121,6 +121,61 @@ def get_sales(start, end):
         return {"sales": 0.0, "orders": 0, "error": _err(e)}
 
 
+def get_daily_sales(start, end):
+    """Net sales bucketed by calendar date (local-ish, by closed_at date).
+
+    Returns {iso_date: dollars}. Empty dict if Square isn't configured or errors
+    — callers treat missing days as zero.
+    """
+    c = _cfg()
+    if not is_configured():
+        return {}
+    body = {
+        "location_ids": [c["location_id"]],
+        "query": {
+            "filter": {
+                "date_time_filter": {
+                    "closed_at": {
+                        "start_at": _iso(start),
+                        "end_at": _iso(end + dt.timedelta(days=1)),
+                    }
+                },
+                "state_filter": {"states": ["COMPLETED"]},
+            },
+            "sort": {"sort_field": "CLOSED_AT", "sort_order": "DESC"},
+        },
+        "limit": 500,
+    }
+    by_day = {}
+    cursor = None
+    try:
+        while True:
+            if cursor:
+                body["cursor"] = cursor
+            r = requests.post(
+                f"{_base(c['env'])}/v2/orders/search",
+                headers=_headers(c),
+                json=body,
+                timeout=30,
+            )
+            r.raise_for_status()
+            data = r.json()
+            for o in data.get("orders", []):
+                ts = _parse_ts(o.get("closed_at"))
+                if not ts:
+                    continue
+                day = ts.date().isoformat()
+                net = o.get("net_amounts", {}).get("total_money")
+                money = net or o.get("total_money") or {}
+                by_day[day] = by_day.get(day, 0.0) + money.get("amount", 0) / 100.0
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+        return {d: round(v, 2) for d, v in by_day.items()}
+    except requests.RequestException:
+        return {}
+
+
 def get_labor(start, end):
     """Sum labor cost from Square shifts between start and end (inclusive dates).
 

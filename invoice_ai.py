@@ -10,7 +10,7 @@ import io
 import json
 import os
 
-from db import get_setting
+from db import get_setting, TAXONOMY
 
 # Pillow is used only to downscale/normalize the image before upload, which
 # keeps token cost and latency down. If it's missing we send the raw bytes.
@@ -20,7 +20,12 @@ try:
 except Exception:  # pragma: no cover
     HAVE_PIL = False
 
-CATEGORIES = ["food", "liquor", "beer", "wine", "na_beverage", "supplies", "other"]
+# Leaf category names from the seeded taxonomy; each line item is tagged with one.
+CATEGORY_NAMES = [name for names in TAXONOMY.values() for name in names]
+LINE_CATEGORIES = CATEGORY_NAMES + ["Uncategorized"]
+
+# Hint the model toward the right bucket without hard-coding every example.
+_TAXONOMY_HINT = "; ".join(f"{t}: {', '.join(cs)}" for t, cs in TAXONOMY.items())
 
 INVOICE_SCHEMA = {
     "type": "object",
@@ -29,8 +34,6 @@ INVOICE_SCHEMA = {
         "vendor": {"type": "string", "description": "Supplier / distributor name"},
         "invoice_date": {"type": "string", "description": "ISO date yyyy-mm-dd, or empty string if not visible"},
         "invoice_number": {"type": "string"},
-        "category": {"type": "string", "enum": CATEGORIES,
-                     "description": "Best single category for the whole invoice"},
         "subtotal": {"type": ["number", "null"]},
         "tax": {"type": ["number", "null"]},
         "total": {"type": ["number", "null"], "description": "Invoice grand total in dollars"},
@@ -45,12 +48,14 @@ INVOICE_SCHEMA = {
                     "unit": {"type": ["string", "null"], "description": "e.g. case, bottle, keg, lb, each"},
                     "unit_cost": {"type": ["number", "null"]},
                     "total": {"type": ["number", "null"]},
+                    "category": {"type": "string", "enum": LINE_CATEGORIES,
+                                 "description": "Best category for THIS line item"},
                 },
-                "required": ["name", "qty", "unit", "unit_cost", "total"],
+                "required": ["name", "qty", "unit", "unit_cost", "total", "category"],
             },
         },
     },
-    "required": ["vendor", "invoice_date", "invoice_number", "category",
+    "required": ["vendor", "invoice_date", "invoice_number",
                  "subtotal", "tax", "total", "line_items"],
 }
 
@@ -59,8 +64,9 @@ PROMPT = (
     "vendor invoice and extract its contents. Rules:\n"
     "- Money values are plain dollars (e.g. 42.50), no currency symbols.\n"
     "- invoice_date must be ISO yyyy-mm-dd; if you cannot read it, use an empty string.\n"
-    "- Pick the single best category for the invoice as a whole.\n"
     "- List every line item you can read. If a field is illegible, use null.\n"
+    "- Categorize EACH line item into exactly one category. Available categories "
+    f"(grouped by type) — {_TAXONOMY_HINT}. Use 'Uncategorized' only if nothing fits.\n"
     "- Do not invent values you cannot see."
 )
 
@@ -166,23 +172,23 @@ def _num(v):
 
 
 def _normalize(data):
-    cat = data.get("category")
-    if cat not in CATEGORIES:
-        cat = "other"
     items = []
     for it in data.get("line_items") or []:
+        cat = it.get("category")
+        if cat not in LINE_CATEGORIES:
+            cat = "Uncategorized"
         items.append({
             "name": (it.get("name") or "").strip(),
             "qty": _num(it.get("qty")),
             "unit": (it.get("unit") or None),
             "unit_cost": _num(it.get("unit_cost")),
             "total": _num(it.get("total")),
+            "category": cat,
         })
     return {
         "vendor": (data.get("vendor") or "").strip(),
         "invoice_date": (data.get("invoice_date") or "").strip(),
         "invoice_number": (data.get("invoice_number") or "").strip(),
-        "category": cat,
         "subtotal": _num(data.get("subtotal")),
         "tax": _num(data.get("tax")),
         "total": _num(data.get("total")),
