@@ -89,6 +89,8 @@ const ROUTES = {
   invoices: renderInvoices,
   invoice: renderInvoiceDetail,
   inventory: renderInventory,
+  vendors: renderVendors,
+  vendor: renderVendorDetail,
   count: renderCount,
   settings: renderSettings,
 };
@@ -317,7 +319,7 @@ function openInvoiceForm(parsed, imagePath, warn) {
     ${warn ? `<div class="note">${esc(warn)} — enter the details by hand.</div>` : ""}
     ${imagePath ? `<img class="thumb-lg" src="/uploads/${esc(imagePath)}" alt="invoice">` : ""}
     <div class="card"><div class="card-body">
-      <label class="fld"><span>Vendor</span><input id="f-vendor" value="${esc(parsed.vendor)}"></label>
+      <label class="fld"><span>Vendor</span><input id="f-vendor" list="vendor-list" value="${esc(parsed.vendor)}"><datalist id="vendor-list"></datalist></label>
       <div class="row2">
         <label class="fld"><span>Date</span><input type="date" id="f-date" value="${esc(parsed.invoice_date)}"></label>
         <label class="fld"><span>Invoice #</span><input id="f-num" value="${esc(parsed.invoice_number)}"></label>
@@ -346,6 +348,7 @@ function openInvoiceForm(parsed, imagePath, warn) {
   if (!(parsed.line_items || []).length) lines.appendChild(lineRow({}));
   $("#add-line").addEventListener("click", () => lines.appendChild(lineRow({})));
   $("#cancel-inv").addEventListener("click", () => { location.hash = "#/invoices"; });
+  fillVendorDatalist();
 
   $("#save-inv").addEventListener("click", async () => {
     const items = [...lines.querySelectorAll(".lrow")].map((r) => ({
@@ -482,13 +485,14 @@ function openItemEditor(it) {
         <label class="fld"><span>On Hand</span><input type="number" step="0.5" id="i-cnt" value="${num(it.last_count)}"></label>
         <label class="fld"><span>Unit $</span><input type="number" step="0.01" id="i-cost" value="${num(it.unit_cost)}"></label>
       </div>
-      <label class="fld"><span>Vendor</span><input id="i-vendor" value="${esc(it.vendor || "")}"></label>
+      <label class="fld"><span>Vendor</span><input id="i-vendor" list="vendor-list" value="${esc(it.vendor || "")}"><datalist id="vendor-list"></datalist></label>
     </div></div>
     <button class="btn btn-grn btn-block" id="save-item">Save</button>
     ${isNew ? "" : `<button class="btn btn-ox btn-block" id="del-item" style="margin-top:.5rem">Delete Item</button>`}
     <button class="btn btn-ghost btn-block" id="cancel-item" style="margin-top:.5rem">Cancel</button>`));
 
   $("#cancel-item").addEventListener("click", () => { location.hash = "#/inventory"; });
+  fillVendorDatalist();
   $("#save-item").addEventListener("click", async () => {
     const payload = {
       name: $("#i-name").value.trim(), category: $("#i-cat").value, unit: $("#i-unit").value.trim(),
@@ -692,6 +696,154 @@ async function renderSettings() {
   });
 
   $("#logout").addEventListener("click", () => { localStorage.removeItem(TOKEN_KEY); location.reload(); });
+}
+
+/* ============================================================
+   VENDORS
+   ============================================================ */
+let VENDOR_NAMES = null;  // cache for the autocomplete datalist
+
+async function fillVendorDatalist() {
+  const dl = $("#vendor-list");
+  if (!dl) return;
+  try {
+    if (!VENDOR_NAMES) VENDOR_NAMES = (await api("GET", "/api/vendors")).map((v) => v.name);
+    dl.innerHTML = VENDOR_NAMES.map((n) => `<option value="${esc(n)}"></option>`).join("");
+  } catch (e) { /* autocomplete is a nicety; ignore failures */ }
+}
+
+async function renderVendors() {
+  const v = view();
+  v.appendChild(el(`
+    <h2 class="section section-head">Vendors</h2>
+    <button class="btn btn-brass btn-block" id="add-vendor">+ New Vendor</button>
+    <div id="vlist"><div class="spinner"></div></div>`));
+  $("#add-vendor").addEventListener("click", () => openVendorEditor(null));
+  try {
+    const list = await api("GET", "/api/vendors");
+    const box = $("#vlist");
+    box.innerHTML = "";
+    if (!list.length) { box.appendChild(el(`<p class="empty">No vendors yet.<br>Add your distributors and reps here.</p>`)); return; }
+    list.forEach((vd) => {
+      const sub = [vd.contact_name, vd.phone].filter(Boolean).join(" · ") || (vd.order_days ? "Orders " + vd.order_days : "—");
+      const row = el(`<a class="row-item" href="#/vendor/${vd.id}" style="text-decoration:none;color:inherit">
+        <div class="grow">
+          <div class="ttl">${esc(vd.name)}</div>
+          <div class="meta">${esc(sub)}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="amt">${money(vd.spend)}</div>
+          <div class="meta">${vd.invoice_count} inv</div>
+        </div>
+      </a>`);
+      box.appendChild(row);
+    });
+  } catch (e) { $("#vlist").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+
+async function renderVendorDetail(parts) {
+  loading();
+  const id = parts[0];
+  let vd;
+  try { vd = await api("GET", `/api/vendors/${id}`); }
+  catch (e) { view().innerHTML = `<p class="err">${esc(e.message)}</p>`; return; }
+
+  const v = view();
+  v.innerHTML = "";
+  const contactBtns = [];
+  if (vd.phone) contactBtns.push(`<a class="btn btn-grn" href="tel:${esc(vd.phone)}" style="text-decoration:none;text-align:center">&#x1F4DE; Call</a>`);
+  if (vd.email) contactBtns.push(`<a class="btn btn-ghost" href="mailto:${esc(vd.email)}" style="text-decoration:none;text-align:center">&#x2709; Email</a>`);
+
+  v.appendChild(el(`
+    <h2 class="section section-head">${esc(vd.name)}</h2>
+    ${contactBtns.length ? `<div class="btn-row">${contactBtns.join("")}</div>` : ""}
+
+    <div class="card"><div class="card-band">Details</div><div class="card-body">
+      ${row("Contact", vd.contact_name)}
+      ${row("Phone", vd.phone)}
+      ${row("Email", vd.email)}
+      ${row("Account #", vd.account_number)}
+      ${row("Order days", vd.order_days)}
+      ${vd.notes ? `<div style="margin-top:.5rem" class="muted">${esc(vd.notes)}</div>` : ""}
+    </div></div>
+
+    <div class="stat-grid">
+      <div class="stat accent-ind"><div class="label">Total Spend</div>
+        <div class="value">${money(vd.spend)}</div><div class="sub">${vd.invoices.length} invoice(s)</div></div>
+      <div class="stat accent-grn"><div class="label">Items Supplied</div>
+        <div class="value">${vd.items.length}</div><div class="sub">in your cellar</div></div>
+    </div>
+
+    ${vd.invoices.length ? `<div class="card"><div class="card-band">Recent Invoices</div><div class="card-body" id="v-inv"></div></div>` : ""}
+    ${vd.items.length ? `<div class="card"><div class="card-band">Items From This Vendor</div><div class="card-body" id="v-items"></div></div>` : ""}
+
+    <button class="btn btn-brass btn-block" id="edit-vendor">Edit Vendor</button>
+    <button class="btn btn-ghost btn-block" id="back-vendors" style="margin-top:.5rem">Back to Vendors</button>`));
+
+  const inv = $("#v-inv");
+  if (inv) vd.invoices.forEach((iv) => inv.appendChild(el(
+    `<a href="#/invoice/${iv.id}" class="kv" style="text-decoration:none;color:inherit">
+      <span>${esc(iv.invoice_date || "—")} <span class="pill ${iv.category}">${CATS[iv.category] || iv.category}</span></span>
+      <b>${money(iv.total)}</b></a>`)));
+  const its = $("#v-items");
+  if (its) vd.items.forEach((it) => its.appendChild(el(
+    `<div class="kv"><span>${esc(it.name)} <span class="muted">par ${fmtQty(it.par_level)} ${esc(it.unit || "")}</span></span><b>${money(it.unit_cost)}</b></div>`)));
+
+  $("#edit-vendor").addEventListener("click", () => openVendorEditor(vd));
+  $("#back-vendors").addEventListener("click", () => { location.hash = "#/vendors"; });
+
+  function row(label, val) {
+    return `<div class="kv"><span>${label}</span><b style="font-family:var(--f-body);font-weight:600">${esc(val || "—")}</b></div>`;
+  }
+}
+
+function openVendorEditor(vd) {
+  const isNew = !vd;
+  vd = vd || { name: "", contact_name: "", phone: "", email: "", account_number: "", order_days: "", notes: "" };
+  const v = view();
+  v.innerHTML = "";
+  v.appendChild(el(`
+    <h2 class="section section-head">${isNew ? "New Vendor" : "Edit Vendor"}</h2>
+    <div class="card"><div class="card-body">
+      <label class="fld"><span>Name</span><input id="v-name" value="${esc(vd.name)}" placeholder="e.g. Southern Glazer's"></label>
+      <label class="fld"><span>Contact / Rep</span><input id="v-contact" value="${esc(vd.contact_name)}"></label>
+      <div class="row2">
+        <label class="fld"><span>Phone</span><input id="v-phone" type="tel" value="${esc(vd.phone)}"></label>
+        <label class="fld"><span>Email</span><input id="v-email" type="email" value="${esc(vd.email)}"></label>
+      </div>
+      <div class="row2">
+        <label class="fld"><span>Account #</span><input id="v-acct" value="${esc(vd.account_number)}"></label>
+        <label class="fld"><span>Order Days</span><input id="v-days" value="${esc(vd.order_days)}" placeholder="Tue / Fri"></label>
+      </div>
+      <label class="fld"><span>Notes</span><textarea id="v-notes" rows="3">${esc(vd.notes || "")}</textarea></label>
+    </div></div>
+    <button class="btn btn-grn btn-block" id="save-vendor">Save</button>
+    ${isNew ? "" : `<button class="btn btn-ox btn-block" id="del-vendor" style="margin-top:.5rem">Delete Vendor</button>`}
+    <button class="btn btn-ghost btn-block" id="cancel-vendor" style="margin-top:.5rem">Cancel</button>`));
+
+  $("#cancel-vendor").addEventListener("click", () => { location.hash = isNew ? "#/vendors" : `#/vendor/${vd.id}`; });
+  $("#save-vendor").addEventListener("click", async () => {
+    const payload = {
+      name: $("#v-name").value.trim(), contact_name: $("#v-contact").value.trim(),
+      phone: $("#v-phone").value.trim(), email: $("#v-email").value.trim(),
+      account_number: $("#v-acct").value.trim(), order_days: $("#v-days").value.trim(),
+      notes: $("#v-notes").value.trim(),
+    };
+    if (!payload.name) { toast("Give the vendor a name."); return; }
+    try {
+      VENDOR_NAMES = null;  // bust autocomplete cache
+      if (isNew) { await api("POST", "/api/vendors", payload); location.hash = "#/vendors"; }
+      else { await api("PUT", `/api/vendors/${vd.id}`, payload); location.hash = `#/vendor/${vd.id}`; }
+      toast("Saved.");
+    } catch (e) { toast(e.message); }
+  });
+  if (!isNew) $("#del-vendor").addEventListener("click", async () => {
+    if (!confirm("Remove this vendor?")) return;
+    VENDOR_NAMES = null;
+    await api("DELETE", `/api/vendors/${vd.id}`);
+    toast("Removed.");
+    location.hash = "#/vendors";
+  });
 }
 
 /* ---------- small format helpers ---------- */

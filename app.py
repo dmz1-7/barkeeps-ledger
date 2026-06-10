@@ -341,6 +341,93 @@ def count_list():
     return jsonify([dict(r) for r in rows])
 
 
+# --- vendors ----------------------------------------------------------------
+# Invoices and inventory items reference a vendor by name (free text), so spend
+# and links are matched case-insensitively on the vendor's name.
+
+@app.get("/api/vendors")
+def vendor_list():
+    rows = db.get_db().execute(
+        "SELECT v.*, "
+        "  COALESCE(s.total, 0) AS spend, "
+        "  COALESCE(s.cnt, 0)   AS invoice_count, "
+        "  s.last_date AS last_order "
+        "FROM vendors v "
+        "LEFT JOIN ("
+        "  SELECT lower(vendor) AS vn, SUM(total) AS total, COUNT(*) AS cnt, "
+        "         MAX(invoice_date) AS last_date "
+        "  FROM invoices GROUP BY lower(vendor)"
+        ") s ON s.vn = lower(v.name) "
+        "WHERE v.archived = 0 "
+        "ORDER BY v.name COLLATE NOCASE"
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/vendors")
+def vendor_create():
+    d = request.json or {}
+    name = (d.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Vendor needs a name."}), 400
+    cur = db.get_db().execute(
+        "INSERT INTO vendors(name, contact_name, phone, email, account_number, "
+        "order_days, notes) VALUES(?,?,?,?,?,?,?)",
+        (name, d.get("contact_name", ""), d.get("phone", ""), d.get("email", ""),
+         d.get("account_number", ""), d.get("order_days", ""), d.get("notes", "")),
+    )
+    db.get_db().commit()
+    return jsonify({"id": cur.lastrowid})
+
+
+@app.get("/api/vendors/<int:vid>")
+def vendor_get(vid):
+    db_ = db.get_db()
+    v = db_.execute("SELECT * FROM vendors WHERE id=?", (vid,)).fetchone()
+    if not v:
+        abort(404)
+    out = dict(v)
+    invoices = db_.execute(
+        "SELECT id, invoice_date, invoice_number, category, total FROM invoices "
+        "WHERE lower(vendor) = lower(?) ORDER BY invoice_date DESC, id DESC LIMIT 50",
+        (v["name"],),
+    ).fetchall()
+    items = db_.execute(
+        "SELECT id, name, category, unit, par_level, last_count, unit_cost FROM inventory_items "
+        "WHERE archived = 0 AND lower(vendor) = lower(?) ORDER BY name COLLATE NOCASE",
+        (v["name"],),
+    ).fetchall()
+    out["invoices"] = [dict(r) for r in invoices]
+    out["items"] = [dict(r) for r in items]
+    out["spend"] = round(sum((r["total"] or 0) for r in invoices), 2)
+    return jsonify(out)
+
+
+@app.put("/api/vendors/<int:vid>")
+def vendor_update(vid):
+    d = request.json or {}
+    fields = ["name", "contact_name", "phone", "email", "account_number",
+              "order_days", "notes", "archived"]
+    sets, vals = [], []
+    for key in fields:
+        if key in d:
+            sets.append(f"{key}=?")
+            vals.append(d[key])
+    if not sets:
+        return jsonify({"ok": True})
+    vals.append(vid)
+    db.get_db().execute(f"UPDATE vendors SET {','.join(sets)} WHERE id=?", vals)
+    db.get_db().commit()
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/vendors/<int:vid>")
+def vendor_delete(vid):
+    db.get_db().execute("UPDATE vendors SET archived=1 WHERE id=?", (vid,))
+    db.get_db().commit()
+    return jsonify({"ok": True})
+
+
 # --- helpers ----------------------------------------------------------------
 
 def _f(v, default=None):

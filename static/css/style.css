@@ -138,12 +138,13 @@ h2.section, .section-head {
   box-shadow: 0 -4px 14px rgba(0,0,0,.08);
 }
 .tabbar a {
-  flex: 1; text-decoration: none; text-align: center;
+  flex: 1; min-width: 0; text-decoration: none; text-align: center;
   color: var(--ink-soft); font-family: var(--f-body); font-weight: 700;
-  font-size: .72rem; letter-spacing: .2px; padding: .3rem 0; border-radius: 10px;
+  font-size: .64rem; letter-spacing: .1px; padding: .3rem .05rem; border-radius: 10px;
   display: flex; flex-direction: column; align-items: center; gap: 2px;
 }
-.tabbar a .ic { font-size: 1.5rem; }
+.tabbar a b { white-space: nowrap; }
+.tabbar a .ic { font-size: 1.35rem; }
 .tabbar a.active { color: var(--red); background: var(--mint); }
 .tabbar a.active .ic { transform: translateY(-1px); }
 

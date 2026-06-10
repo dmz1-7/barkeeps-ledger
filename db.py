@@ -45,6 +45,19 @@ CREATE TABLE IF NOT EXISTS invoice_items (
     inventory_item_id INTEGER REFERENCES inventory_items(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS vendors (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL,
+    contact_name   TEXT,
+    phone          TEXT,
+    email          TEXT,
+    account_number TEXT,
+    order_days     TEXT,             -- e.g. "Tue / Fri"
+    notes          TEXT,
+    archived       INTEGER DEFAULT 0,
+    created_at     TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS inventory_items (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,
