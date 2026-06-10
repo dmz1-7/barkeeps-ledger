@@ -84,8 +84,26 @@ function showGate() {
 function showApp() {
   $("#gate").classList.add("hidden");
   $("#app").classList.remove("hidden");
+  initLocationSwitch();
   if (!location.hash) location.hash = "#/dashboard";
   else route();
+}
+
+/* ---------- location switcher (topbar) ---------- */
+async function initLocationSwitch() {
+  const sel = $("#loc-switch");
+  try {
+    const d = await api("GET", "/api/locations");
+    sel.innerHTML = d.locations.map((l) =>
+      `<option value="${l.id}" ${l.id === d.active ? "selected" : ""}>${esc(l.name)}</option>`).join("");
+    sel.onchange = async () => {
+      try {
+        await api("PUT", "/api/active-location", { location_id: Number(sel.value) });
+        CONFIG = await api("GET", "/api/config").catch(() => CONFIG);
+        route();  // re-render the current screen against the new active store
+      } catch (e) { toast(e.message); }
+    };
+  } catch (e) { sel.style.display = "none"; }
 }
 $("#gate-form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -903,7 +921,7 @@ async function renderSettings() {
       }).catch(() => {});
     }
     try {
-      const r = await api("GET", "/api/locations");
+      const r = await api("GET", "/api/square-locations");
       const sel = $("#s-loc");
       if (r.error) { toast(r.error); }
       else { toast(`Connected — ${(r.locations || []).length} location(s).`); }

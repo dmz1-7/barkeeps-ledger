@@ -335,6 +335,14 @@ input:focus, select:focus, textarea:focus { outline: 3px solid var(--teal); outl
    ============================================================ */
 .hamburger { display: none; background: none; border: none; color: #fff;
   font-size: 1.5rem; cursor: pointer; padding: .1rem .45rem; margin-right: .1rem; line-height: 1; }
+.loc-switch {
+  margin-left: auto; width: auto; max-width: 11rem;
+  font-family: var(--f-display); font-size: .8rem; text-transform: uppercase;
+  color: #fff; background: rgba(0,0,0,.18); border: 2px solid rgba(255,255,255,.55);
+  border-radius: 10px; padding: .35rem 1.6rem .35rem .6rem; cursor: pointer;
+}
+.loc-switch:focus { outline: 2px solid var(--mustard); }
+.loc-switch option { color: var(--ink); }
 .shell { display: block; }
 .scrim { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 44; }
 
