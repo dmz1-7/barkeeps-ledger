@@ -63,7 +63,9 @@ def _authed():
 @app.before_request
 def _guard():
     p = request.path
-    if p == "/" or p.startswith("/static/") or p == "/api/login" or p == "/api/health":
+    # /api/config is readable pre-login so the SPA can learn whether auth is on.
+    if (p == "/" or p.startswith("/static/") or p == "/api/login"
+            or p == "/api/health" or p == "/api/config"):
         return
     if p.startswith("/api/") or p.startswith("/uploads/"):
         if not _authed():
