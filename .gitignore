@@ -5,3 +5,4 @@ __pycache__/
 data/
 uploads/
 get-pip.py
+cloudflared
