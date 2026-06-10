@@ -1,0 +1,14 @@
+{
+  "name": "Barkeep's Ledger",
+  "short_name": "Ledger",
+  "description": "A lightweight bar back-office: sales, labor, COGS, invoices and inventory.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#2a1f17",
+  "theme_color": "#2a1f17",
+  "icons": [
+    { "src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
