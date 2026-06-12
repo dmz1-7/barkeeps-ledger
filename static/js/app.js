@@ -75,6 +75,26 @@ async function api(method, path, body, isForm) {
   return data;
 }
 
+// Fetch a file with the same auth + active-store headers as api() (a plain
+// <a download> link would carry neither), then save it via a Blob URL.
+async function download(path, filename) {
+  const headers = {};
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (token) headers.Authorization = "Bearer " + token;
+  if (ACTIVE_LOC) headers["X-Location-Id"] = String(ACTIVE_LOC);
+  const res = await fetch(path, { headers });
+  if (res.status === 401) { localStorage.removeItem(TOKEN_KEY); showGate(); throw new Error("unauthorized"); }
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const url = URL.createObjectURL(await res.blob());
+  try {
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+  } finally {
+    URL.revokeObjectURL(url);   // always release, even if the click path throws
+  }
+}
+
 /* ---------- date helpers ---------- */
 const iso = (d) => d.toISOString().slice(0, 10);
 function weekStart(d = new Date()) { const x = new Date(d); const day = (x.getDay() + 6) % 7; x.setDate(x.getDate() - day); return x; }
@@ -384,6 +404,27 @@ async function loadDash() {
   } else if (d.sales_error || d.labor_error) {
     body.appendChild(el(`<div class="note">Square says: ${esc(d.sales_error || d.labor_error)}</div>`));
   }
+  if (d.labor_warning) {
+    body.appendChild(el(`<div class="note">${esc(d.labor_warning)}</div>`));
+  }
+
+  // Proactive price-increase alerts, fetched separately so a hiccup here never
+  // breaks the dashboard. Only shown when there's something to flag.
+  try {
+    const pa = await api("GET", "/api/alerts/price-increases");
+    if (pa.count) {
+      const ac = el(`<div class="card"><div class="card-band">⚠ Price Increases
+        <span>${pa.count}</span></div><div class="card-body" id="pa"></div></div>`);
+      const box = ac.querySelector("#pa");
+      box.appendChild(el(`<p class="muted" style="font-size:.82rem;margin:0 0 .4rem">Vendor items up
+        ${pct(pa.min_pct)}+ vs their prior price, purchased in the last ${pa.lookback_days} days.</p>`));
+      pa.alerts.forEach((a) => box.appendChild(el(
+        `<div class="kv"><span>${esc(a.name)} <span class="muted">&middot; ${esc(a.vendor)}</span></span>
+          <b class="bad">${money(a.old_price)} &rarr; ${money(a.new_price)}
+          <span class="muted">(+${pct(a.change_pct)})</span></b></div>`)));
+      body.appendChild(ac);
+    }
+  } catch (e) { /* best-effort: alerts never block the dashboard */ }
 
   body.appendChild(el(`
     <div class="stat-grid">
@@ -599,27 +640,31 @@ async function openInvoiceForm(parsed, imagePath, warn, existing) {
   // Live reconciliation: do the line items add up to the invoice? Lines may be
   // tax-exclusive (sum to subtotal) or tax-inclusive (sum to total), so match
   // EITHER. Mirrors the backend _reconcile.
-  const round2 = (x) => Math.round(x * 100) / 100;
+  // Work in integer cents (like the backend _reconcile) so the line sum and the
+  // comparison are exact and don't drift below the penny in float.
+  const cents = (x) => Math.round((Number(x) || 0) * 100);
   const reconRead = () => {
     // Mirror the server: reconcile only the named rows that will actually be
     // saved, and gate on whether any exist (not on the sum being zero).
     const named = [...lines.querySelectorAll(".lrow")]
       .filter((r) => r.querySelector(".li-name").value.trim());
-    const lineSum = round2(named.reduce((s, r) => s + (f(r.querySelector(".li-total").value) || 0), 0));
+    const lineC = named.reduce((s, r) => s + cents(f(r.querySelector(".li-total").value)), 0);
     const sub = f($("#f-sub").value), tax = f($("#f-tax").value) || 0, tot = f($("#f-total").value);
     const targets = [];
-    if (sub != null) targets.push(sub);
-    if (tot != null) { targets.push(tot); if (tax) targets.push(round2(tot - tax)); }
+    if (sub != null) targets.push(cents(sub));
+    if (tot != null) { targets.push(cents(tot)); if (tax) targets.push(cents(tot) - cents(tax)); }
     const box = $("#recon");
     if (!targets.length || !named.length) { box.innerHTML = ""; box.className = "recon"; return; }
-    let expected = targets[0];
-    targets.forEach((t) => { if (Math.abs(lineSum - t) < Math.abs(lineSum - expected)) expected = t; });
-    const delta = round2(lineSum - expected);
-    const ok = Math.abs(delta) <= Math.max(0.02, Math.abs(expected) * 0.005);
+    let expectedC = targets[0];
+    targets.forEach((t) => { if (Math.abs(lineC - t) < Math.abs(lineC - expectedC)) expectedC = t; });
+    const deltaC = lineC - expectedC;
+    // Exact-integer tolerance (>=2c or 0.5%), x1000 so it matches the backend
+    // _reconcile bit-for-bit (no Math.round vs Python round half-even drift).
+    const ok = Math.abs(deltaC) * 1000 <= Math.max(2000, Math.abs(expectedC) * 5);
     box.className = "recon " + (ok ? "recon-ok" : "recon-warn");
     box.innerHTML = ok
-      ? `✓ Line items add up (${money(lineSum)})`
-      : `⚠ Line items total ${money(lineSum)}, invoice is ${money(expected)} — off by ${money(Math.abs(delta))}`;
+      ? `✓ Line items add up (${money(lineC / 100)})`
+      : `⚠ Line items total ${money(lineC / 100)}, invoice is ${money(expectedC / 100)} — off by ${money(Math.abs(deltaC) / 100)}`;
   };
 
   $("#add-line").addEventListener("click", () => { lines.appendChild(lineRow({})); reconRead(); });
@@ -852,20 +897,31 @@ async function openItemEditor(it) {
 async function showOrderList() {
   loading();
   try {
-    const items = await api("GET", "/api/inventory/order-list");
+    const g = await api("GET", "/api/inventory/order-guide");
     const v = view();
-    v.innerHTML = `<h2 class="section section-head">Order List</h2>`;
-    if (!items.length) { v.appendChild(el(`<p class="empty">Everything&rsquo;s at or above par. Nothing to order.</p>`)); }
-    else {
-      let total = 0;
-      const card = el(`<div class="card"><div class="card-band">Below Par <span id="ord-total"></span></div><div class="card-body" id="ord"></div></div>`);
-      const ord = card.querySelector("#ord");
-      items.forEach((it) => {
-        total += it.order_cost;
-        ord.appendChild(el(`<div class="kv"><span>${esc(it.name)} <span class="muted">need ${fmtQty(it.order_qty)} ${esc(it.unit || "")}</span></span><b>${money(it.order_cost)}</b></div>`));
+    v.innerHTML = `<h2 class="section section-head">Order Guide</h2>`;
+    if (!g.item_count) {
+      v.appendChild(el(`<p class="empty">Everything&rsquo;s at or above par. Nothing to order.</p>`));
+    } else {
+      v.appendChild(el(`<div class="btn-row">
+        <button class="btn btn-ghost btn-sm" id="exp-order">&#x2B07; Order Guide (CSV)</button>
+      </div>`));
+      $("#exp-order").addEventListener("click", () =>
+        download("/api/export/order-guide.csv", "order-guide.csv")
+          .catch((e) => toast("Export failed: " + e.message)));
+      // One card per vendor, so each is a ready-to-send order.
+      g.vendors.forEach((vd) => {
+        const card = el(`<div class="card"><div class="card-band">${esc(vd.vendor)}
+          <span>${money(vd.subtotal)}</span></div><div class="card-body" id="ord"></div></div>`);
+        const ord = card.querySelector("#ord");
+        vd.items.forEach((it) => ord.appendChild(el(
+          `<div class="kv"><span>${esc(it.name)} <span class="muted">need ${fmtQty(it.order_qty)} ${esc(it.unit || "")}
+            &middot; on hand ${fmtQty(it.on_hand)}/${fmtQty(it.par)}</span></span>
+            <b>${money(it.line_cost)}</b></div>`)));
+        v.appendChild(card);
       });
-      card.querySelector("#ord-total").textContent = money(total);
-      v.appendChild(card);
+      v.appendChild(el(`<div class="kv total-row" style="margin-top:.4rem"><span><b>Total</b></span>
+        <b>${money(g.grand_total)}</b></div>`));
     }
     v.appendChild(el(`<button class="btn btn-ghost btn-block" id="back" style="margin-top:.6rem">Back to Stock</button>`));
     $("#back").addEventListener("click", () => { location.hash = "#/inventory"; });
@@ -957,6 +1013,11 @@ async function renderSettings() {
         <label class="fld"><span>Target COGS %</span><input type="number" id="s-cogs" value="${esc(cfg.target_cogs_pct)}"></label>
         <label class="fld"><span>Target Labor %</span><input type="number" id="s-labor" value="${esc(cfg.target_labor_pct)}"></label>
       </div>
+      <div class="row2">
+        <label class="fld"><span>Default Hourly Wage $</span><input type="number" step="0.01" id="s-wage" value="${esc(cfg.default_hourly_wage)}"></label>
+        <label class="fld"><span>Price Alert Threshold %</span><input type="number" step="0.5" id="s-palert" value="${esc(cfg.price_alert_pct)}"></label>
+      </div>
+      <p class="muted" style="font-size:.82rem;margin:.3rem 0 0">Wage is applied to Square shifts with no wage recorded (e.g. tipped staff) so Labor% isn&rsquo;t understated (0 = leave at $0). The alert threshold flags a vendor item on the dashboard when its price jumps that much.</p>
     </div></div>
 
     <div class="card"><div class="card-band">Sales Mix &middot; per period</div><div class="card-body">
@@ -1058,6 +1119,7 @@ async function renderSettings() {
   $("#save-settings").addEventListener("click", async () => {
     const payload = {
       target_cogs_pct: $("#s-cogs").value, target_labor_pct: $("#s-labor").value,
+      default_hourly_wage: $("#s-wage").value, price_alert_pct: $("#s-palert").value,
       square_env: $("#s-env").value, square_version: $("#s-ver").value,
       square_location_id: $("#s-loc").value, ai_model: $("#s-model").value,
     };
@@ -1286,6 +1348,18 @@ async function renderCategoryReport() {
   const body = el(`<div id="cr-body"><div class="spinner"></div></div>`);
   const filter = dateFilterBar(load);
   v.appendChild(filter.bar);
+  const expBar = el(`<div class="btn-row">
+    <button class="btn btn-ghost btn-sm" id="exp-lines">&#x2B07; Line items (CSV)</button>
+    <button class="btn btn-ghost btn-sm" id="exp-sum">&#x2B07; Summary (CSV)</button>
+  </div>`);
+  v.appendChild(expBar);
+  const dl = (endpoint, prefix) => {
+    const { start, end } = filter.get();
+    download(`/api/export/${endpoint}?start=${start}&end=${end}`, `${prefix}_${start}_${end}.csv`)
+      .catch((e) => toast("Export failed: " + e.message));
+  };
+  expBar.querySelector("#exp-lines").addEventListener("click", () => dl("purchases.csv", "purchases"));
+  expBar.querySelector("#exp-sum").addEventListener("click", () => dl("category-summary.csv", "category-summary"));
   v.appendChild(body);
   async function load() {
     body.innerHTML = '<div class="spinner"></div>';

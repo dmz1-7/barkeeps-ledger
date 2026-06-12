@@ -130,6 +130,9 @@ def summary(start, end):
         "labor_hours": labor_info.get("hours", 0),
         "labor_pct": pct(labor),
         "labor_error": labor_info.get("error"),
+        "labor_warning": labor_info.get("warning"),
+        "unwaged_hours": labor_info.get("unwaged_hours", 0),
+        "unwaged_shifts": labor_info.get("unwaged_shifts", 0),
         "purchases": purch["total"],
         "purchases_by_category": purch["by_category"],
         "invoice_count": purch["count"],
@@ -158,7 +161,7 @@ def _num(v, default):
 
 def parse_range(start_s, end_s):
     """Parse ISO date strings; default to the current week (Mon-today)."""
-    today = dt.date.today()
+    today = square_client.business_today()
     if start_s:
         start = dt.date.fromisoformat(start_s)
     else:

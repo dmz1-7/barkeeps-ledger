@@ -10,8 +10,10 @@ Pure stdlib unittest — no pytest needed:
 
     .venv/bin/python -m unittest discover -s tests
 """
+import csv
 import datetime as dt
 import glob
+import io
 import os
 import shutil
 import sqlite3
@@ -29,6 +31,7 @@ os.environ["APP_SECRET"] = ""
 import db                       # noqa: E402
 import square_client            # noqa: E402
 import cogs                     # noqa: E402
+import money                    # noqa: E402
 import reports                  # noqa: E402
 from db import get_db           # noqa: E402
 import app as app_module        # noqa: E402
@@ -587,6 +590,496 @@ class LocationHeader(Base):
             r2 = get_db().execute("SELECT square_location_id FROM locations WHERE id=2").fetchone()[0]
         self.assertEqual(r2, "NEWNYC")            # active store updated
         self.assertEqual(r1, "LNKNR2A7MBB4K")     # other store untouched (no global mirror)
+
+
+class TippedLaborWage(Base):
+    """Shifts Square records with no wage (typical for tipped staff) must not
+    silently count as $0 labor: they're billed at default_hourly_wage when set
+    and always reported back as unwaged so Labor% stays trustworthy."""
+
+    def _shift(self, hours, amount_cents=None):
+        start = dt.datetime(2026, 6, 1, 18, 0, 0, tzinfo=dt.timezone.utc)
+        end = start + dt.timedelta(hours=hours)
+        s = {"start_at": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "end_at": end.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        if amount_cents is not None:
+            s["wage"] = {"hourly_rate": {"amount": amount_cents, "currency": "USD"}}
+        return s
+
+    def test_recorded_wage_priced_and_not_unwaged(self):
+        cost, hours, unwaged = square_client._shift_cost(self._shift(4, 1500), 0.0)
+        self.assertEqual((cost, hours, unwaged), (60.0, 4.0, 0.0))
+
+    def test_missing_wage_no_fallback_is_unwaged(self):
+        cost, hours, unwaged = square_client._shift_cost(self._shift(5), 0.0)
+        self.assertEqual((cost, hours, unwaged), (0.0, 5.0, 5.0))
+
+    def test_missing_wage_uses_fallback(self):
+        cost, hours, unwaged = square_client._shift_cost(self._shift(5), 12.0)
+        self.assertEqual((cost, hours, unwaged), (60.0, 5.0, 5.0))
+
+    def test_zero_amount_treated_as_unwaged(self):
+        cost, hours, unwaged = square_client._shift_cost(self._shift(3, 0), 10.0)
+        self.assertEqual((cost, hours, unwaged), (30.0, 3.0, 3.0))
+
+    def test_default_wage_setting_read(self):
+        with flask_app.app_context():
+            db.set_setting("default_hourly_wage", "15.50")
+            self.assertEqual(square_client._default_wage(), 15.5)
+            db.set_setting("default_hourly_wage", "")        # blank => off
+            self.assertEqual(square_client._default_wage(), 0.0)
+            db.set_setting("default_hourly_wage", "junk")    # unparseable => off
+            self.assertEqual(square_client._default_wage(), 0.0)
+
+    def test_default_wage_exposed_in_settings_api(self):
+        with flask_app.app_context():
+            db.set_setting("default_hourly_wage", "13")
+        cfg = self.client.get("/api/config").get_json()
+        self.assertEqual(cfg["default_hourly_wage"], "13")
+        self.client.post("/api/settings", json={"default_hourly_wage": "14.25"})
+        with flask_app.app_context():
+            self.assertEqual(db.get_setting("default_hourly_wage"), "14.25")
+
+    def _run_get_labor(self, shifts):
+        """get_labor over a stubbed Square response (DC store is seeded with a
+        square_location_id; setting a token makes is_configured() true)."""
+        from unittest import mock
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return {"shifts": shifts, "cursor": None}
+
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post",
+                                   return_value=FakeResp()):
+                return square_client.get_labor(dt.date(2026, 6, 1), dt.date(2026, 6, 1))
+
+    def test_get_labor_no_fallback_warns_and_understates_visibly(self):
+        info = self._run_get_labor([self._shift(4, 1500), self._shift(5)])
+        self.assertEqual(info["labor"], 60.0)           # only the waged shift priced
+        self.assertEqual(info["hours"], 9.0)
+        self.assertEqual(info["unwaged_hours"], 5.0)
+        self.assertEqual(info["unwaged_shifts"], 1)
+        self.assertIn("$0 labor", info["warning"])
+
+    def test_get_labor_fallback_prices_unwaged_and_still_discloses(self):
+        with flask_app.app_context():
+            db.set_setting("default_hourly_wage", "10")
+        info = self._run_get_labor([self._shift(4, 1500), self._shift(5)])
+        self.assertEqual(info["labor"], 110.0)          # 60 waged + 5h * $10 fallback
+        self.assertEqual(info["unwaged_shifts"], 1)
+        self.assertIn("estimated", info["warning"])
+
+    def test_get_labor_all_waged_has_no_warning(self):
+        info = self._run_get_labor([self._shift(4, 1500)])
+        self.assertEqual(info["unwaged_shifts"], 0)
+        self.assertIsNone(info["warning"])
+
+    def test_summary_payload_carries_labor_warning_keys(self):
+        with flask_app.app_context():
+            self.assertIn("labor_warning", cogs.summary(dt.date(2026, 6, 1),
+                                                        dt.date(2026, 6, 1)))
+            r = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 1))
+            self.assertIn("labor_warning", r)
+            self.assertIn("unwaged_hours", r)
+
+
+class BusinessToday(Base):
+    """Default date ranges resolve via the business day in the configured tz, so
+    they line up with how sales/labor are bucketed regardless of server tz."""
+
+    def test_after_midnight_before_5am_is_prior_day(self):
+        # 2026-06-12 03:00 America/New_York == 07:00 UTC; still 06-11's bar night.
+        now = dt.datetime(2026, 6, 12, 7, 0, tzinfo=dt.timezone.utc)
+        with flask_app.app_context():
+            self.assertEqual(square_client.business_today(now), dt.date(2026, 6, 11))
+
+    def test_after_5am_is_same_day(self):
+        # 2026-06-12 06:00 ET == 10:00 UTC; the new business day has rolled over.
+        now = dt.datetime(2026, 6, 12, 10, 0, tzinfo=dt.timezone.utc)
+        with flask_app.app_context():
+            self.assertEqual(square_client.business_today(now), dt.date(2026, 6, 12))
+
+    def test_independent_of_server_local_date(self):
+        # 23:30 ET on 06-12 is 03:30 UTC on 06-13: a UTC server's date.today()
+        # would say 06-13, but the bar night is still 06-12.
+        now = dt.datetime(2026, 6, 13, 3, 30, tzinfo=dt.timezone.utc)
+        with flask_app.app_context():
+            self.assertEqual(square_client.business_today(now), dt.date(2026, 6, 12))
+
+
+class MoneyHelpers(unittest.TestCase):
+    """money.py routes settled amounts through integer cents so sums and
+    comparisons are exact and writes are clean to the penny."""
+
+    def test_to_cents_and_back(self):
+        self.assertEqual(money.to_cents("42.50"), 4250)
+        self.assertEqual(money.to_cents(None), 0)
+        self.assertEqual(money.to_cents("", default=0), 0)
+        self.assertEqual(money.to_cents("junk", default=0), 0)
+        self.assertEqual(money.to_dollars(4250), 42.5)
+        # The classic float trap, made exact.
+        self.assertEqual(money.to_cents(0.1) + money.to_cents(0.2), money.to_cents(0.3))
+
+    def test_cents_or_none_keeps_zero_distinct(self):
+        self.assertIsNone(money.cents_or_none(None))
+        self.assertIsNone(money.cents_or_none(""))
+        self.assertIsNone(money.cents_or_none("abc"))
+        self.assertEqual(money.cents_or_none(0), 0)       # $0.00 is a real amount
+
+    def test_normalize_cleans_noise_and_preserves_none(self):
+        self.assertIsNone(money.normalize(None))
+        self.assertIsNone(money.normalize(""))
+        self.assertEqual(money.normalize(0.1 + 0.2), 0.3)  # 0.30000000000000004 -> 0.3
+        self.assertEqual(money.normalize(12.344), 12.34)
+        self.assertEqual(money.normalize(12.346), 12.35)
+
+    def test_half_cent_uses_bankers_rounding(self):
+        # 0.125 is exactly representable, so this is deterministic: round() is
+        # half-even (consistent with every other round(x, 2) in the app), so
+        # 0.125 -> 0.12 not 0.13. Pinned so a switch to half-up is a conscious choice.
+        self.assertEqual(money.normalize(0.125), 0.12)
+        self.assertEqual(money.to_cents(0.125), 12)
+
+    def test_sum_dollars_is_exact(self):
+        self.assertNotEqual(sum([0.1, 0.2]), 0.3)          # the naive way drifts
+        self.assertEqual(money.sum_dollars([0.1, 0.2]), 0.3)
+        self.assertEqual(money.sum_dollars([0.10] * 10), 1.0)
+        self.assertEqual(money.sum_dollars([None, "5.00", 2.5]), 7.5)
+
+    def test_same_money(self):
+        self.assertTrue(money.same_money(10.00, 10.004))   # same to the penny
+        self.assertFalse(money.same_money(10.00, 10.01))
+        self.assertTrue(money.same_money(10.00, 10.01, tol_cents=1))
+
+
+class ReconcileExact(unittest.TestCase):
+    """_reconcile compares in integer cents, so many small lines reconcile
+    exactly instead of relying on a final float round to hide drift."""
+
+    def test_many_small_lines_reconcile_exactly(self):
+        r = app_module._reconcile(1.00, None, 1.00, [{"total": 0.10}] * 10)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["line_sum"], 1.0)
+        self.assertEqual(r["delta"], 0.0)
+
+    def test_real_gap_still_flagged(self):
+        r = app_module._reconcile(1.00, None, 1.00, [{"total": 0.10}] * 9)  # $0.90
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["delta"], -0.1)
+
+    def test_tolerance_boundary_at_exact_dollar(self):
+        # expected $5.00 -> 0.5% = 2.5c; a 2c gap reconciles, 3c does not. (This
+        # is the half-even edge that bit the old round()-based tolerance.)
+        self.assertTrue(app_module._reconcile(5.00, None, 5.00, [{"total": 5.02}])["ok"])
+        self.assertFalse(app_module._reconcile(5.00, None, 5.00, [{"total": 5.03}])["ok"])
+
+    def test_tax_exclusive_and_inclusive_both_reconcile(self):
+        excl = app_module._reconcile(100.0, 8.0, 108.0, [{"total": 100.0}])
+        self.assertTrue(excl["ok"])
+        self.assertEqual(excl["expected"], 100.0)
+        incl = app_module._reconcile(100.0, 8.0, 108.0, [{"total": 108.0}])
+        self.assertTrue(incl["ok"])
+        self.assertEqual(incl["expected"], 108.0)
+
+
+class DuplicateCentPrecision(Base):
+    """The no-invoice-number fallback dup check matches to the exact penny."""
+
+    def _post(self, total):
+        return self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_number": "", "invoice_date": "2026-06-01",
+            "total": total, "line_items": []})
+
+    def test_same_penny_is_duplicate(self):
+        self.assertEqual(self._post(10.00).status_code, 200)
+        self.assertEqual(self._post(10.004).status_code, 409)   # rounds to 10.00
+
+    def test_off_by_a_penny_is_not_duplicate(self):
+        self.assertEqual(self._post(10.00).status_code, 200)
+        self.assertEqual(self._post(10.01).status_code, 200)
+
+
+class MoneyWriteNormalization(Base):
+    """Settled amounts land in the DB clean to the penny, so they sum exactly."""
+
+    def test_invoice_total_stored_to_the_penny_and_sums_exactly(self):
+        for _ in range(10):
+            self.client.post("/api/invoices", json={
+                "vendor": "Drip", "invoice_number": "", "invoice_date": "2026-06-02",
+                "total": 0.10, "line_items": [], "confirm_duplicate": True})
+        with flask_app.app_context():
+            stored = [r["total"] for r in get_db().execute(
+                "SELECT total FROM invoices WHERE lower(vendor)='drip'")]
+        self.assertEqual(len(stored), 10)
+        self.assertTrue(all(t == 0.1 for t in stored))      # clean, not 0.099999…
+        self.assertEqual(money.sum_dollars(stored), 1.0)
+
+    def test_line_total_normalized_on_save(self):
+        r = self.client.post("/api/invoices", json={
+            "vendor": "Drip", "invoice_number": "L1", "invoice_date": "2026-06-03",
+            "total": 0.30, "line_items": [{"name": "x", "total": 0.1 + 0.2}]})
+        self.assertEqual(r.status_code, 200)
+        with flask_app.app_context():
+            t = get_db().execute(
+                "SELECT total FROM invoice_items WHERE name='x'").fetchone()["total"]
+        self.assertEqual(t, 0.3)                            # 0.30000000000000004 cleaned
+
+
+class PriceAlerts(Base):
+    """Proactive price-increase alerts: the latest price jumped >= threshold over
+    the prior price, and that purchase is recent. Built on the same stable
+    (vendor, item) SKU keying as price_movers."""
+
+    def _d(self, days_ago):
+        with flask_app.app_context():
+            return (square_client.business_today() - dt.timedelta(days=days_ago)).isoformat()
+
+    def _inv(self, vendor, date, lines):
+        """lines: [(name, unit_cost, qty)] at location 1 (the test default)."""
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute(
+                "INSERT INTO invoices(location_id, vendor, invoice_date, status) "
+                "VALUES(1, ?, ?, 'closed')", (vendor, date)).lastrowid
+            for name, price, qty in lines:
+                d.execute("INSERT INTO invoice_items(invoice_id, name, unit_cost, qty, total) "
+                          "VALUES(?,?,?,?,?)", (iid, name, price, qty, (price or 0) * (qty or 0)))
+            d.commit()
+
+    def _alerts(self, **kw):
+        with flask_app.app_context():
+            return reports.price_alerts(**kw)
+
+    def test_increase_above_threshold_alerts_with_impact(self):
+        self._inv("Acme", self._d(10), [("Gin", 20.00, 2)])
+        self._inv("Acme", self._d(2), [("Gin", 24.00, 3)])      # +20%
+        res = self._alerts(min_pct=10)
+        self.assertEqual(res["count"], 1)
+        a = res["alerts"][0]
+        self.assertEqual((a["old_price"], a["new_price"], a["change_pct"]), (20.0, 24.0, 20.0))
+        self.assertEqual(a["qty"], 3.0)
+        self.assertEqual(a["impact"], 12.0)                     # (24-20) * 3
+
+    def test_increase_below_threshold_ignored(self):
+        self._inv("Acme", self._d(10), [("Gin", 20.0, 1)])
+        self._inv("Acme", self._d(2), [("Gin", 21.0, 1)])      # +5%
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_price_drop_not_alerted(self):
+        self._inv("Acme", self._d(10), [("Gin", 24.0, 1)])
+        self._inv("Acme", self._d(2), [("Gin", 20.0, 1)])
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_recent_jump_but_latest_purchase_stale_ignored(self):
+        self._inv("Acme", self._d(80), [("Gin", 20.0, 1)])
+        self._inv("Acme", self._d(60), [("Gin", 24.0, 1)])     # jump, but newest is 60d ago
+        self.assertEqual(self._alerts(min_pct=10, lookback_days=30)["count"], 0)
+
+    def test_same_item_different_vendor_not_merged(self):
+        # Each vendor has only one purchase -> no prior price -> no false alert,
+        # proving the (vendor, item) key doesn't merge a hike across vendors.
+        self._inv("Acme", self._d(10), [("Gin", 20.0, 1)])
+        self._inv("Beta", self._d(2), [("Gin", 24.0, 1)])
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_same_day_correction_is_not_a_price_change(self):
+        # Two differently-priced lines for the same SKU on the SAME day (an
+        # intra-day correction / split) must NOT look like a hike over time.
+        self._inv("Acme", self._d(2), [("Gin", 20.00, 1), ("Gin", 24.00, 3)])
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_mixed_prices_on_latest_date_suppressed_as_ambiguous(self):
+        # Latest date carries two different prices for the SKU -> the current
+        # price is undeterminable, so we suppress rather than risk a wrong alert
+        # (conservative: never alert on an ambiguous current price).
+        self._inv("Acme", self._d(20), [("Gin", 20.00, 1)])
+        self._inv("Acme", self._d(2), [("Gin", 24.00, 2), ("Gin", 20.00, 1)])
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_oscillation_back_to_baseline_not_alerted(self):
+        # $20 -> $24 -> $20: newest is a return to baseline, not an increase.
+        self._inv("Acme", self._d(20), [("Gin", 20.0, 1)])
+        self._inv("Acme", self._d(10), [("Gin", 24.0, 1)])
+        self._inv("Acme", self._d(2), [("Gin", 20.0, 1)])
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_endpoint_uses_configured_threshold(self):
+        self._inv("Acme", self._d(10), [("Gin", 20.0, 1)])
+        self._inv("Acme", self._d(2), [("Gin", 23.0, 1)])      # +15%
+        with flask_app.app_context():
+            db.set_setting("price_alert_pct", "20")
+        self.assertEqual(self.client.get("/api/alerts/price-increases").get_json()["count"], 0)
+        with flask_app.app_context():
+            db.set_setting("price_alert_pct", "10")
+        self.assertEqual(self.client.get("/api/alerts/price-increases").get_json()["count"], 1)
+
+    def test_threshold_exposed_in_config(self):
+        self.assertEqual(self.client.get("/api/config").get_json()["price_alert_pct"], "10")
+
+
+class CsvExports(Base):
+    """Bookkeeping CSV exports: location-scoped, date-filtered, properly quoted,
+    and summed exactly."""
+
+    def _inv(self, loc, vendor, date, num, lines):
+        # lines: [(item, qty, unit, unit_cost, total, category_name)]
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute(
+                "INSERT INTO invoices(location_id, vendor, invoice_date, invoice_number, status) "
+                "VALUES(?,?,?,?, 'closed')", (loc, vendor, date, num)).lastrowid
+            for item, qty, unit, uc, total, cat in lines:
+                row = d.execute("SELECT id FROM categories WHERE name=?", (cat,)).fetchone()
+                d.execute("INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, category_id) "
+                          "VALUES(?,?,?,?,?,?,?)",
+                          (iid, item, qty, unit, uc, total, row["id"] if row else None))
+            d.commit()
+
+    def _csv(self, path, loc=1):
+        r = self.client.get(path, headers={"X-Location-Id": str(loc)})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/csv", r.headers["Content-Type"])
+        self.assertIn("attachment", r.headers["Content-Disposition"])
+        return list(csv.reader(io.StringIO(r.get_data(as_text=True))))
+
+    def test_purchases_csv_header_and_quoted_fields(self):
+        self._inv(1, "Acme, Inc.", "2026-06-05", "INV9",
+                  [("Gin", 2, "btl", 20.0, 40.0, "Beer Keg")])
+        rows = self._csv("/api/export/purchases.csv?start=2026-06-01&end=2026-06-30")
+        self.assertEqual(rows[0], ["Invoice Date", "Vendor", "Invoice #", "Status",
+                                   "Category Type", "Category", "Item", "Qty", "Unit",
+                                   "Unit Cost", "Total"])
+        body = rows[1]
+        self.assertEqual(body[1], "Acme, Inc.")      # comma stays one field (quoted)
+        self.assertEqual(body[4], "Beer")            # category_type
+        self.assertEqual(body[5], "Beer Keg")        # category
+        self.assertEqual(body[6], "Gin")
+        self.assertEqual(body[10], "40.0")
+
+    def test_purchases_csv_scoped_by_range_and_location(self):
+        self._inv(1, "InRange", "2026-06-05", "A", [("X", 1, "ea", 10.0, 10.0, "Wine")])
+        self._inv(1, "OutOfRange", "2026-05-05", "B", [("Y", 1, "ea", 5.0, 5.0, "Wine")])
+        self._inv(2, "OtherStore", "2026-06-06", "C", [("Z", 1, "ea", 9.0, 9.0, "Wine")])
+        rows = self._csv("/api/export/purchases.csv?start=2026-06-01&end=2026-06-30", loc=1)
+        vendors = [r[1] for r in rows[1:]]
+        self.assertIn("InRange", vendors)
+        self.assertNotIn("OutOfRange", vendors)      # before the range
+        self.assertNotIn("OtherStore", vendors)      # different store
+
+    def test_category_summary_sums_exactly_with_grand_total(self):
+        self._inv(1, "V", "2026-06-05", "A",
+                  [("a", 1, "ea", 0.1, 0.1, "Wine"), ("b", 1, "ea", 0.1, 0.1, "Wine"),
+                   ("c", 1, "ea", 0.1, 0.1, "Wine")])
+        rows = self._csv("/api/export/category-summary.csv?start=2026-06-01&end=2026-06-30")
+        self.assertEqual(rows[0], ["Category Type", "Category", "Total"])
+        wine = [r for r in rows if len(r) >= 2 and r[1] == "Wine"][0]
+        self.assertEqual(wine[2], "0.3")             # 0.1*3 summed exactly, not 0.30000000000000004
+        total = [r for r in rows if len(r) >= 2 and r[1] == "TOTAL"][0]
+        self.assertEqual(total[2], "0.3")
+
+    def test_empty_range_returns_header_only(self):
+        purch = self._csv("/api/export/purchases.csv?start=2030-01-01&end=2030-01-31")
+        self.assertEqual(len(purch), 1)              # header, no data rows
+        summary = self._csv("/api/export/category-summary.csv?start=2030-01-01&end=2030-01-31")
+        self.assertEqual(summary[0], ["Category Type", "Category", "Total"])
+        self.assertEqual(summary[-1], ["", "TOTAL", "0.0"])   # grand total of nothing
+
+    def test_export_requires_auth(self):
+        # The Base harness runs with auth OFF; turn it on and confirm a tokenless
+        # request to an export is rejected (these return raw business data).
+        os.environ["APP_PASSWORD"] = "secret"
+        try:
+            for path in ("/api/export/purchases.csv", "/api/export/category-summary.csv",
+                         "/api/export/order-guide.csv"):
+                self.assertEqual(self.client.get(path).status_code, 401)
+        finally:
+            os.environ["APP_PASSWORD"] = ""
+
+
+class OrderGuide(Base):
+    """Below-par products grouped by vendor, with suggested order qty (to par)
+    and exact per-vendor subtotals — one order sheet per distributor."""
+
+    def _item(self, loc, name, vendor, par, on_hand, unit_cost, unit="ea"):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute(
+                "INSERT INTO inventory_items(location_id, name, vendor, unit, par_level, "
+                "last_count, unit_cost) VALUES(?,?,?,?,?,?,?)",
+                (loc, name, vendor, unit, par, on_hand, unit_cost))
+            d.commit()
+
+    def _guide(self):
+        with flask_app.app_context():
+            return reports.order_guide()
+
+    def test_groups_below_par_by_vendor_with_exact_totals(self):
+        self._item(1, "Gin", "Acme", 10, 3, 20.0)     # need 7  -> $140
+        self._item(1, "Rum", "Acme", 5, 5, 15.0)      # at par  -> excluded
+        self._item(1, "Wine", "Beta", 4, 1, 12.5)     # need 3  -> $37.50
+        g = self._guide()
+        self.assertEqual(g["item_count"], 2)
+        vendors = {v["vendor"]: v for v in g["vendors"]}
+        self.assertEqual(set(vendors), {"Acme", "Beta"})
+        gin = vendors["Acme"]["items"][0]
+        self.assertEqual((gin["order_qty"], gin["line_cost"]), (7.0, 140.0))
+        self.assertEqual(vendors["Acme"]["subtotal"], 140.0)
+        self.assertEqual(vendors["Beta"]["subtotal"], 37.5)
+        self.assertEqual(g["grand_total"], 177.5)
+
+    def test_zero_par_and_at_par_excluded(self):
+        self._item(1, "Soda", "Acme", 0, 0, 1.0)      # no par set
+        self._item(1, "Tonic", "Acme", 6, 6, 1.0)     # exactly at par
+        self.assertEqual(self._guide()["item_count"], 0)
+
+    def test_blank_vendor_bucketed_unassigned(self):
+        self._item(1, "Mystery", "", 3, 0, 2.0)
+        self.assertEqual(self._guide()["vendors"][0]["vendor"], "Unassigned")
+
+    def test_case_variant_vendors_group_together(self):
+        # The app keys vendors case-insensitively everywhere; one distributor
+        # must not split into two order sheets over casing.
+        self._item(1, "Gin", "Acme", 5, 0, 10.0)
+        self._item(1, "Vodka", "acme", 5, 0, 8.0)
+        g = self._guide()
+        self.assertEqual(len(g["vendors"]), 1)
+        self.assertEqual(len(g["vendors"][0]["items"]), 2)
+        self.assertEqual(g["vendors"][0]["subtotal"], 90.0)   # 5*10 + 5*8
+
+    def test_par_set_but_never_counted_is_ordered(self):
+        # last_count NULL (par set, no count yet) -> still needs ordering.
+        with flask_app.app_context():
+            get_db().execute(
+                "INSERT INTO inventory_items(location_id, name, vendor, par_level, last_count, "
+                "unit_cost) VALUES(1, 'NewSku', 'Acme', 4, NULL, 5.0)")
+            get_db().commit()
+        g = self._guide()
+        self.assertEqual(g["item_count"], 1)
+        self.assertEqual(g["vendors"][0]["items"][0]["order_qty"], 4.0)
+
+    def test_endpoint_scoped_by_location_header(self):
+        self._item(1, "DC-only", "Acme", 5, 0, 1.0)
+        self._item(2, "NYC-only", "Acme", 5, 0, 1.0)
+        g1 = self.client.get("/api/inventory/order-guide", headers={"X-Location-Id": "1"}).get_json()
+        g2 = self.client.get("/api/inventory/order-guide", headers={"X-Location-Id": "2"}).get_json()
+        self.assertEqual([i["name"] for v in g1["vendors"] for i in v["items"]], ["DC-only"])
+        self.assertEqual([i["name"] for v in g2["vendors"] for i in v["items"]], ["NYC-only"])
+
+    def test_csv_has_item_subtotal_and_total_rows(self):
+        self._item(1, "Gin", "Acme", 10, 3, 20.0)     # 7 * $20 = $140
+        r = self.client.get("/api/export/order-guide.csv", headers={"X-Location-Id": "1"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/csv", r.headers["Content-Type"])
+        rows = list(csv.reader(io.StringIO(r.get_data(as_text=True))))
+        self.assertEqual(rows[0], ["Vendor", "Item", "Unit", "Par", "On Hand",
+                                   "Order Qty", "Unit Cost", "Line Cost"])
+        self.assertEqual((rows[1][1], rows[1][7]), ("Gin", "140.0"))
+        sub = [x for x in rows if len(x) > 1 and x[1] == "SUBTOTAL"][0]
+        self.assertEqual(sub[7], "140.0")
+        total = [x for x in rows if x[0] == "TOTAL"][0]
+        self.assertEqual(total[7], "140.0")
 
 
 if __name__ == "__main__":

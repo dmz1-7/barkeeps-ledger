@@ -24,11 +24,13 @@ except ImportError:
     pass
 
 from flask import (
-    Flask, g, jsonify, request, send_from_directory, abort,
+    Flask, g, jsonify, request, send_from_directory, abort, Response,
 )
 
 import db
 import cogs
+import exports
+import money
 import reports
 import square_client
 from invoice_ai import parse_invoice, InvoiceError
@@ -206,14 +208,16 @@ def config():
         "ai_key_present": bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()),
         "target_cogs_pct": s.get("target_cogs_pct", "30"),
         "target_labor_pct": s.get("target_labor_pct", "25"),
+        "default_hourly_wage": s.get("default_hourly_wage", "0"),
+        "price_alert_pct": s.get("price_alert_pct", "10"),
     })
 
 
 @app.post("/api/settings")
 def save_settings():
     data = request.json or {}
-    for key in ("square_env", "square_version", "ai_model",
-                "target_cogs_pct", "target_labor_pct"):
+    for key in ("square_env", "square_version", "ai_model", "target_cogs_pct",
+                "target_labor_pct", "default_hourly_wage", "price_alert_pct"):
         if key in data:
             db.set_setting(key, data[key])
     # The Square location is per-store now: write it onto the active store's row,
@@ -331,8 +335,8 @@ def invoice_create():
         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             loc, vendor, inv_date, d.get("invoice_number", ""),
-            d.get("category"), _f(d.get("subtotal")), _f(d.get("tax")),
-            _f(d.get("total")), d.get("image_path"), d.get("notes", ""),
+            d.get("category"), money.normalize(d.get("subtotal")), money.normalize(d.get("tax")),
+            money.normalize(d.get("total")), d.get("image_path"), d.get("notes", ""),
             d.get("raw_json", ""), d.get("status", "closed"), d.get("payment_account"),
         ),
     )
@@ -343,7 +347,7 @@ def invoice_create():
             "INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, "
             "vendor_item_id, category_id) VALUES(?,?,?,?,?,?,?,?)",
             (inv_id, it.get("name", ""), _f(it.get("qty")), it.get("unit"),
-             _f(it.get("unit_cost")), _f(it.get("total")), vi_id, cat_id),
+             _f(it.get("unit_cost")), money.normalize(it.get("total")), vi_id, cat_id),
         )
     database.commit()
     return jsonify({"id": inv_id})
@@ -428,7 +432,7 @@ def invoice_update(inv_id):
         "subtotal=?, tax=?, total=?, notes=?, status=?, payment_account=? "
         "WHERE id=? AND location_id IS ?",
         (vendor, inv_date, d.get("invoice_number", ""), d.get("category"),
-         _f(d.get("subtotal")), _f(d.get("tax")), _f(d.get("total")),
+         money.normalize(d.get("subtotal")), money.normalize(d.get("tax")), money.normalize(d.get("total")),
          d.get("notes", ""), d.get("status", "closed"), d.get("payment_account"),
          inv_id, loc),
     )
@@ -440,7 +444,7 @@ def invoice_update(inv_id):
             "INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, "
             "vendor_item_id, category_id) VALUES(?,?,?,?,?,?,?,?)",
             (inv_id, it.get("name", ""), _f(it.get("qty")), it.get("unit"),
-             _f(it.get("unit_cost")), _f(it.get("total")), vi_id, cat_id),
+             _f(it.get("unit_cost")), money.normalize(it.get("total")), vi_id, cat_id),
         )
     database.commit()
     return jsonify({"id": inv_id,
@@ -520,6 +524,12 @@ def order_list():
     return jsonify(out)
 
 
+@app.get("/api/inventory/order-guide")
+def order_guide():
+    """Below-par products grouped by vendor (one order per distributor)."""
+    return jsonify(reports.order_guide())
+
+
 @app.post("/api/counts")
 def count_save():
     """Record a walk-around count. lines: [{item_id, qty}]. Updates last_count
@@ -552,9 +562,10 @@ def count_save():
             "UPDATE inventory_items SET last_count=? WHERE id=? AND location_id IS ?",
             (qty, ln.get("item_id"), loc),
         )
-    database.execute("UPDATE counts SET value=? WHERE id=?", (round(total_value, 2), count_id))
+    value = money.normalize(total_value)
+    database.execute("UPDATE counts SET value=? WHERE id=?", (value, count_id))
     database.commit()
-    return jsonify({"id": count_id, "value": round(total_value, 2)})
+    return jsonify({"id": count_id, "value": value})
 
 
 @app.get("/api/counts")
@@ -572,7 +583,7 @@ def count_list():
 
 def _period_bounds(today=None):
     import datetime as _dt
-    today = today or _dt.date.today()
+    today = today or square_client.business_today()
     month_start = today.replace(day=1)
     last_month_end = month_start - _dt.timedelta(days=1)
     last_month_start = last_month_end.replace(day=1)
@@ -664,7 +675,7 @@ def vendor_get(vid):
     ).fetchall()
     out["invoices"] = [dict(r) for r in invoices]
     out["items"] = [dict(r) for r in items]
-    out["spend"] = round(sum((r["total"] or 0) for r in invoices), 2)
+    out["spend"] = money.sum_dollars(r["total"] for r in invoices)
     return jsonify(out)
 
 
@@ -1032,6 +1043,48 @@ def report_price_movers():
     return jsonify(reports.price_movers(start, end))
 
 
+def _csv_response(text, filename):
+    return Response(
+        text, mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/export/purchases.csv")
+def export_purchases():
+    start, end = cogs.parse_range(request.args.get("start"), request.args.get("end"))
+    return _csv_response(exports.purchases_csv(start, end),
+                         f"purchases_{start}_{end}.csv")
+
+
+@app.get("/api/export/category-summary.csv")
+def export_category_summary():
+    start, end = cogs.parse_range(request.args.get("start"), request.args.get("end"))
+    return _csv_response(exports.category_summary_csv(start, end),
+                         f"category-summary_{start}_{end}.csv")
+
+
+@app.get("/api/export/order-guide.csv")
+def export_order_guide():
+    return _csv_response(exports.order_guide_csv(), "order-guide.csv")
+
+
+@app.get("/api/alerts/price-increases")
+def alerts_price_increases():
+    """Proactive: vendor items whose latest price recently jumped >= the
+    configured threshold. Surfaced on the dashboard so the owner sees a silent
+    price hike without opening the Price Movers report."""
+    try:
+        min_pct = float(db.get_setting("price_alert_pct") or 10)
+    except (TypeError, ValueError):
+        min_pct = 10.0
+    try:
+        days = int(request.args.get("days", 30))
+    except (TypeError, ValueError):
+        days = 30
+    return jsonify(reports.price_alerts(lookback_days=days, min_pct=min_pct))
+
+
 # --- helpers ----------------------------------------------------------------
 
 def _category_id_by_name(database, name):
@@ -1053,23 +1106,29 @@ def _reconcile(subtotal, tax, total, line_items):
     as reconciled. Returns {line_sum, expected, delta, ok}; ok is None when
     there's nothing to compare (no amounts, or a header-only invoice with no
     line items)."""
+    # Work in integer cents so the line sum and the comparison are exact (float
+    # summation of many line totals otherwise drifts below the penny).
     items = line_items or []
-    line_sum = round(sum((_f(li.get("total"), 0) or 0) for li in items), 2)
-    sub, tot, tx = _f(subtotal), _f(total), (_f(tax) or 0)
+    line_c = sum(money.to_cents(li.get("total"), 0) for li in items)
+    sub_c, tot_c, tx_c = money.cents_or_none(subtotal), money.cents_or_none(total), money.to_cents(tax, 0)
     targets = []
-    if sub is not None:
-        targets.append(round(sub, 2))
-    if tot is not None:
-        targets.append(round(tot, 2))
-        if tx:
-            targets.append(round(tot - tx, 2))   # pre-tax base when lines exclude tax
+    if sub_c is not None:
+        targets.append(sub_c)
+    if tot_c is not None:
+        targets.append(tot_c)
+        if tx_c:
+            targets.append(tot_c - tx_c)   # pre-tax base when lines exclude tax
     if not targets or not items:
-        return {"line_sum": line_sum, "expected": (targets[0] if targets else None),
-                "delta": None, "ok": None}
-    expected = min(targets, key=lambda t: abs(line_sum - t))   # whichever convention fits
-    delta = round(line_sum - expected, 2)
-    tol = max(0.02, abs(expected) * 0.005)   # tolerate penny rounding; flag a real gap
-    return {"line_sum": line_sum, "expected": expected, "delta": delta, "ok": abs(delta) <= tol}
+        exp = targets[0] / 100.0 if targets else None
+        return {"line_sum": line_c / 100.0, "expected": exp, "delta": None, "ok": None}
+    expected_c = min(targets, key=lambda t: abs(line_c - t))   # whichever convention fits
+    delta_c = line_c - expected_c
+    # Tolerate sub-cent rounding: >=2c, or 0.5% of the invoice. Compared as exact
+    # integers (x1000, no rounding) so this verdict is bit-identical to the JS
+    # preview in reconRead — no half-even/half-up drift between the two.
+    ok = abs(delta_c) * 1000 <= max(2000, abs(expected_c) * 5)
+    return {"line_sum": line_c / 100.0, "expected": expected_c / 100.0,
+            "delta": delta_c / 100.0, "ok": ok}
 
 
 def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, total):
@@ -1090,9 +1149,11 @@ def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, tot
         if row:
             return dict(row)
     if vendor and inv_date and total is not None:
+        # Compare to the penny exactly (CAST avoids float fuzz from REAL storage).
         row = database.execute(
             f"SELECT {cols} FROM invoices WHERE location_id IS ? AND lower(vendor)=lower(?) "
-            "AND invoice_date=? AND total IS NOT NULL AND ABS(total - ?) < 0.01 "
+            "AND invoice_date=? AND total IS NOT NULL "
+            "AND CAST(ROUND(total*100) AS INTEGER) = CAST(ROUND(?*100) AS INTEGER) "
             "ORDER BY id DESC LIMIT 1",
             (loc, vendor, inv_date, total),
         ).fetchone()

@@ -83,13 +83,31 @@ def _window(start, end):
     return fmt(s), fmt(e)
 
 
+def _business_date(ts):
+    """The business-day date for a tz-aware datetime, honoring day_start_hour.
+    Compares the local wall-clock hour rather than doing timedelta arithmetic so
+    the boundary can't slip across a DST gap (e.g. a pre-dawn day_start_hour)."""
+    local = ts.astimezone(_tz())
+    d = local.date()
+    if local.hour < _day_start_hour():
+        d -= dt.timedelta(days=1)
+    return d
+
+
 def _business_day(closed_at):
     """The business-day date (ISO) an order's closed_at falls into."""
     ts = _parse_ts(closed_at)
     if not ts:
         return None
-    local = ts.astimezone(_tz())
-    return (local - dt.timedelta(hours=_day_start_hour())).date().isoformat()
+    return _business_date(ts).isoformat()
+
+
+def business_today(now=None):
+    """Today's business day as a date, in the configured tz and honoring the
+    day_start_hour boundary: between midnight and day_start it is still the
+    PRIOR calendar day. Default date ranges use this so "today"/"this week"
+    line up with how sales and labor are bucketed, regardless of server tz."""
+    return _business_date(now or dt.datetime.now(dt.timezone.utc))
 
 
 def list_locations():
@@ -255,7 +273,7 @@ def daily_sales_cached(start, end):
             (sqid, start.isoformat(), end.isoformat()),
         )
     }
-    today = dt.date.today()
+    today = business_today()
     stale_from = (today - dt.timedelta(days=1)).isoformat()  # refresh today + yesterday
     need = []
     d = start
@@ -289,15 +307,33 @@ def daily_sales_cached(start, end):
     return cached
 
 
+def _default_wage():
+    """Fallback hourly wage (dollars) applied to shifts Square records with no
+    rate — typically tipped staff whose base wage isn't set on the shift. 0
+    means "no fallback" (and those hours are reported as unwaged)."""
+    try:
+        return max(float(get_setting("default_hourly_wage") or 0), 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def get_labor(start, end):
     """Sum labor cost from Square shifts between start and end (inclusive dates).
 
     Cost = paid hours * hourly wage, summed across shifts. Unpaid breaks are
     subtracted. Returns dollars plus hours.
+
+    Shifts Square records with no wage (common for tipped staff) would otherwise
+    contribute 0 cost and silently understate Labor%. Such hours are billed at
+    the `default_hourly_wage` setting when set, and always reported back as
+    `unwaged_hours`/`unwaged_shifts` (+ a `warning` when they aren't priced) so
+    the figure is transparent rather than quietly low.
     """
     c = _cfg()
     if not is_configured():
-        return {"labor": 0.0, "hours": 0.0, "shifts": 0, "error": "Square not configured."}
+        return {"labor": 0.0, "hours": 0.0, "shifts": 0, "unwaged_hours": 0.0,
+                "unwaged_shifts": 0, "warning": None, "error": "Square not configured."}
+    fallback = _default_wage()
     body = {
         "query": {
             "filter": {
@@ -310,6 +346,8 @@ def get_labor(start, end):
     total_cost = 0.0
     total_hours = 0.0
     shift_count = 0
+    unwaged_hours = 0.0
+    unwaged_shifts = 0
     cursor = None
     try:
         while True:
@@ -324,21 +362,42 @@ def get_labor(start, end):
             r.raise_for_status()
             data = r.json()
             for s in data.get("shifts", []):
-                cost, hours = _shift_cost(s)
+                cost, hours, unwaged = _shift_cost(s, fallback)
                 total_cost += cost
                 total_hours += hours
                 shift_count += 1
+                if unwaged > 0:
+                    unwaged_hours += unwaged
+                    unwaged_shifts += 1
             cursor = data.get("cursor")
             if not cursor:
                 break
+        # Always disclose unwaged hours: counted as $0 (actionable) when there's
+        # no fallback, or estimated at the default wage (informational) when set —
+        # either way the labor figure leans on data Square didn't record.
+        warning = None
+        if unwaged_shifts:
+            hrs = round(unwaged_hours, 1)
+            if fallback > 0:
+                warning = (f"{unwaged_shifts} shift(s) ({hrs} hrs) had no wage in "
+                           f"Square and were estimated at the Default Hourly Wage "
+                           f"(${fallback:.2f}/hr).")
+            else:
+                warning = (f"{unwaged_shifts} shift(s) ({hrs} hrs) had no wage in "
+                           "Square and counted as $0 labor — set a Default Hourly "
+                           "Wage in Settings so Labor% isn't understated.")
         return {
             "labor": round(total_cost, 2),
             "hours": round(total_hours, 2),
             "shifts": shift_count,
+            "unwaged_hours": round(unwaged_hours, 2),
+            "unwaged_shifts": unwaged_shifts,
+            "warning": warning,
             "error": None,
         }
     except requests.RequestException as e:
-        return {"labor": 0.0, "hours": 0.0, "shifts": 0, "error": _err(e)}
+        return {"labor": 0.0, "hours": 0.0, "shifts": 0, "unwaged_hours": 0.0,
+                "unwaged_shifts": 0, "warning": None, "error": _err(e)}
 
 
 def _parse_ts(s):
@@ -350,11 +409,14 @@ def _parse_ts(s):
         return None
 
 
-def _shift_cost(shift):
+def _shift_cost(shift, fallback_rate=0.0):
+    """Return (cost, hours, unwaged_hours) for a shift. A shift with no recorded
+    wage is billed at fallback_rate and its hours reported as unwaged so the
+    caller can flag the gap (see get_labor)."""
     start = _parse_ts(shift.get("start_at"))
     end = _parse_ts(shift.get("end_at"))
     if not start or not end:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     seconds = (end - start).total_seconds()
     # Subtract unpaid breaks.
     for br in shift.get("breaks", []) or []:
@@ -366,8 +428,10 @@ def _shift_cost(shift):
             seconds -= (b_end - b_start).total_seconds()
     hours = max(seconds, 0) / 3600.0
     wage = (shift.get("wage") or {}).get("hourly_rate") or {}
-    rate = wage.get("amount", 0) / 100.0  # cents -> dollars
-    return hours * rate, hours
+    amount = wage.get("amount") or 0  # cents; missing/None/0 => no recorded wage
+    if amount > 0:
+        return hours * amount / 100.0, hours, 0.0
+    return hours * fallback_rate, hours, hours
 
 
 def _err(e):

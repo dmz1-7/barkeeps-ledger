@@ -14,6 +14,7 @@ Sales report depend on Square; without it they fail soft to zeros + an error.
 import datetime as dt
 
 from db import get_db, TAXONOMY, active_location_id
+import money
 import square_client
 
 CATEGORY_TYPES = list(TAXONOMY.keys())  # Food, Beer, Wine, Liquor, N/A Bev, Other
@@ -178,6 +179,9 @@ def controllable_pl(start, end):
         "square_configured": square_client.is_configured(),
         "sales_error": sales_info.get("error"),
         "labor_error": labor_info.get("error"),
+        "labor_warning": labor_info.get("warning"),
+        "unwaged_hours": labor_info.get("unwaged_hours", 0),
+        "unwaged_shifts": labor_info.get("unwaged_shifts", 0),
     }
 
 
@@ -188,7 +192,7 @@ def _week_start(d):
 
 
 def sales_report(today=None):
-    today = today or dt.date.today()
+    today = today or square_client.business_today()
     configured = square_client.is_configured()
     this_mon = _week_start(today)
     last_mon = this_mon - dt.timedelta(days=7)
@@ -319,5 +323,153 @@ def price_movers(start, end):
     return {
         "period": {"start": start.isoformat(), "end": end.isoformat()},
         "movers": movers,
-        "total_impact": _r(sum(m["impact"] for m in movers)),
+        "total_impact": money.sum_dollars(m["impact"] for m in movers),
+    }
+
+
+def price_alerts(lookback_days=30, min_pct=10.0):
+    """PROACTIVE price-increase alerts: vendor items whose MOST RECENT purchase
+    price jumped at least `min_pct` above the prior (different) price, where that
+    latest purchase happened within `lookback_days`. This is the push counterpart
+    to price_movers (which is window/pull driven): it answers "what am I quietly
+    paying more for right now?" without the user picking a date range.
+
+    Keyed on the same stable (vendor, vendor-item name) SKU identity as
+    price_movers, so it survives the importer's vendor_item wipe and never merges
+    across vendors or packs. Increases only — drops aren't an alert."""
+    db = get_db()
+    loc = active_location_id()
+    cutoff = (square_client.business_today() - dt.timedelta(days=lookback_days)).isoformat()
+    vkey = _PM_VENDOR.format(vi="vi", inv="inv")
+    nkey = _PM_NAME.format(vi="vi", ii="ii")
+    rows = db.execute(
+        f"SELECT {vkey} AS vkey, {nkey} AS nkey, "
+        "       COALESCE(vi.vendor_name, inv.vendor) AS vendor, "
+        "       COALESCE(vi.vendor_item_name, ii.name) AS name, "
+        "       ii.unit_cost AS price, ii.qty AS qty, ii.category_id AS cat, "
+        "       inv.invoice_date AS d "
+        "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
+        "LEFT JOIN vendor_items vi ON vi.id = ii.vendor_item_id "
+        "WHERE inv.location_id IS ? AND ii.unit_cost IS NOT NULL "
+        "  AND inv.invoice_date IS NOT NULL AND TRIM(inv.invoice_date) <> '' "
+        "  AND TRIM(COALESCE(vi.vendor_item_name, ii.name, '')) <> '' "
+        "ORDER BY inv.invoice_date DESC, ii.id DESC",   # newest first
+        (loc,),
+    ).fetchall()
+
+    # Per SKU, walk newest-first: the first row is the latest price; accumulate
+    # the qty bought at that latest price/date; the first OLDER row at a different
+    # price is the prior price (the most recent actual change). Once we've found
+    # that prior price the group is resolved and older rows are ignored.
+    groups = {}
+    for r in rows:
+        key = (r["vkey"], r["nkey"])
+        g = groups.get(key)
+        if g is None:
+            groups[key] = g = {
+                "vendor": r["vendor"], "name": r["name"], "cat": r["cat"],
+                "new_price": r["price"], "new_date": r["d"], "new_qty": 0.0,
+                "old_price": None, "ambiguous": False, "done": False,
+            }
+        if g["done"]:
+            continue
+        if r["d"] == g["new_date"]:
+            # Still on the latest purchase date (rows are date-desc, so the
+            # latest-date rows are contiguous and come first). A second line on
+            # that same date at a DIFFERENT price is an intra-day correction or a
+            # second SKU collapsing onto this key, so the current price is
+            # ambiguous — suppress rather than risk a phantom hike.
+            if r["price"] == g["new_price"]:
+                g["new_qty"] += (r["qty"] or 0)
+            else:
+                g["ambiguous"] = True
+        elif r["price"] != g["new_price"]:
+            g["old_price"] = r["price"]   # most recent EARLIER-dated price that differs
+            g["done"] = True
+        # else: earlier date at the same price -> no change yet, keep scanning.
+
+    cat_names = {r["id"]: r["name"] for r in db.execute("SELECT id, name FROM categories")}
+    alerts = []
+    for g in groups.values():
+        if g["ambiguous"]:                    # mixed prices on the latest date
+            continue
+        new, old = g["new_price"], g["old_price"]
+        if old is None or new is None or old <= 0:
+            continue
+        if g["new_date"] < cutoff:            # latest purchase isn't recent -> stale
+            continue
+        if new <= old:                        # increases only
+            continue
+        pct = (new - old) / old * 100
+        if pct < min_pct:                     # below the alert threshold
+            continue
+        alerts.append({
+            "name": g["name"],
+            "vendor": g["vendor"],
+            "category": cat_names.get(g["cat"], "Uncategorized"),
+            "old_price": _r(old),
+            "new_price": _r(new),
+            "change_pct": _r(pct),
+            "last_date": g["new_date"],
+            "qty": _r(g["new_qty"]),
+            "impact": _r((new - old) * (g["new_qty"] or 0)),
+        })
+
+    alerts.sort(key=lambda a: -a["change_pct"])
+    return {
+        "lookback_days": lookback_days,
+        "min_pct": min_pct,
+        "count": len(alerts),
+        "alerts": alerts,
+    }
+
+
+# --- Order guide ------------------------------------------------------------
+
+def order_guide():
+    """Products strictly below par for the active store, GROUPED BY VENDOR with a
+    suggested order quantity (par - on hand) and line cost — so the owner places
+    one order per distributor instead of reading a flat list. Vendors keep their
+    first-seen order (the query sorts by vendor, then name); a blank vendor is
+    bucketed as 'Unassigned'. Subtotals/total are summed exactly via money."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT name, COALESCE(NULLIF(TRIM(vendor), ''), 'Unassigned') AS vendor, "
+        "       unit, par_level, last_count, unit_cost "
+        "FROM inventory_items "
+        "WHERE archived = 0 AND location_id IS ? AND par_level > 0 "
+        "  AND COALESCE(last_count, 0) < par_level "   # par set but never counted -> still order
+        "ORDER BY vendor COLLATE NOCASE, name COLLATE NOCASE",
+        (active_location_id(),),
+    ).fetchall()
+
+    groups = {}
+    ordered = []
+    for r in rows:
+        need = _r((r["par_level"] or 0) - (r["last_count"] or 0))
+        if need <= 0:
+            continue
+        item = {
+            "name": r["name"], "unit": r["unit"],
+            "par": _r(r["par_level"]), "on_hand": _r(r["last_count"]),
+            "order_qty": need, "unit_cost": _r(r["unit_cost"]),
+            "line_cost": money.normalize(need * (r["unit_cost"] or 0)) or 0.0,
+        }
+        # Group case-insensitively (the rest of the app keys vendors on
+        # lower(name)), keeping the first-seen casing for display, so one
+        # distributor never splits into two order sheets.
+        key = (r["vendor"] or "").casefold()
+        g = groups.get(key)
+        if g is None:
+            groups[key] = g = {"vendor": r["vendor"], "items": [], "subtotal": 0.0}
+            ordered.append(g)
+        g["items"].append(item)
+
+    for g in ordered:
+        g["subtotal"] = money.sum_dollars(i["line_cost"] for i in g["items"])
+    return {
+        "vendors": ordered,
+        "item_count": sum(len(g["items"]) for g in ordered),
+        "grand_total": money.sum_dollars(
+            i["line_cost"] for g in ordered for i in g["items"]),
     }
