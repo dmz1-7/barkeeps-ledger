@@ -136,6 +136,10 @@ def _resolve_location():
     Left unset when the header is absent/invalid, so db.active_location_id() falls
     back to the persisted default. Runs after _guard, so it never fires on a
     request that failed auth."""
+    # Gate behind auth: don't run a DB query for an unauthenticated caller (the
+    # pre-login allowlisted routes don't need a store anyway).
+    if not _authed():
+        return
     h = request.headers.get("X-Location-Id")
     if not h:
         return
@@ -162,6 +166,7 @@ def _resolve_location():
 _LOGIN_FAILS = []          # recent wrong-guess timestamps (monotonic)
 _LOGIN_MAX = 10            # wrong guesses per window before requests are 429'd
 _LOGIN_WINDOW = 60         # seconds (short, so a throttle self-heals quickly)
+_LOGIN_LOCK = threading.Lock()   # the threaded dev server can race the budget check
 
 
 def _login_recent_fails():
@@ -175,13 +180,16 @@ def login():
     expected = _expected_token()
     if expected is None:
         return jsonify({"token": "", "auth_required": False})
-    if _login_recent_fails() >= _LOGIN_MAX:   # rate limit: refuse BEFORE evaluating the guess
-        return jsonify({"error": "Too many attempts. Wait a minute and try again."}), 429
     pw = body().get("password", "")
-    if hmac.compare_digest(_token_for(pw), expected):
-        _LOGIN_FAILS.clear()
-        return jsonify({"token": _token_for(pw), "auth_required": True})
-    _LOGIN_FAILS.append(time.monotonic())
+    # Hold the lock across the budget check AND the mutation so concurrent
+    # requests can't both slip past the threshold or corrupt the list.
+    with _LOGIN_LOCK:
+        if _login_recent_fails() >= _LOGIN_MAX:   # refuse BEFORE evaluating the guess
+            return jsonify({"error": "Too many attempts. Wait a minute and try again."}), 429
+        if hmac.compare_digest(_token_for(pw), expected):
+            _LOGIN_FAILS.clear()
+            return jsonify({"token": _token_for(pw), "auth_required": True})
+        _LOGIN_FAILS.append(time.monotonic())
     return jsonify({"error": "Wrong passcode."}), 401
 
 
@@ -194,6 +202,13 @@ def index():
 
 @app.get("/uploads/<path:name>")
 def uploaded(name):
+    # Only serve an image that belongs to an invoice in the active store, so a
+    # guessed/scraped filename can't pull another store's invoice photo.
+    if not db.get_db().execute(
+        "SELECT 1 FROM invoices WHERE image_path=? AND location_id IS ?",
+        (name, db.active_location_id()),
+    ).fetchone():
+        abort(404)
     return send_from_directory(UPLOAD_DIR, name)
 
 
@@ -241,7 +256,7 @@ def save_settings():
     # not a shared global setting.
     if "square_location_id" in data:
         db.get_db().execute("UPDATE locations SET square_location_id=? WHERE id=?",
-                            (data["square_location_id"], db.active_location_id()))
+                            (_s(data["square_location_id"]), db.active_location_id()))
         db.get_db().commit()
     # Only persist a Square token if a non-blank one is supplied (so the UI can
     # show "set" without round-tripping the secret).
@@ -367,7 +382,7 @@ def invoice_create():
         database.execute(
             "INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, "
             "vendor_item_id, category_id) VALUES(?,?,?,?,?,?,?,?)",
-            (inv_id, it.get("name", ""), _f(it.get("qty")), it.get("unit"),
+            (inv_id, _s(it.get("name")), _f(it.get("qty")), _s(it.get("unit")) or None,
              _f(it.get("unit_cost")), money.normalize(it.get("total")), vi_id, cat_id),
         )
     database.commit()
@@ -431,20 +446,7 @@ def invoice_delete(inv_id):
         "SELECT DISTINCT vendor_item_id FROM invoice_items "
         "WHERE invoice_id=? AND vendor_item_id IS NOT NULL", (inv_id,))]
     db_.execute("DELETE FROM invoices WHERE id=? AND location_id IS ?", (inv_id, loc))
-    for vi_id in affected:
-        # Re-point last price/date at the most recent remaining positive-priced
-        # line for this SKU, or NULL it if nothing is left.
-        db_.execute(
-            "UPDATE vendor_items SET "
-            "  last_purchase_date=(SELECT inv.invoice_date FROM invoice_items ii "
-            "    JOIN invoices inv ON inv.id=ii.invoice_id "
-            "    WHERE ii.vendor_item_id=vendor_items.id AND ii.unit_cost>0 "
-            "    ORDER BY inv.invoice_date DESC, ii.id DESC LIMIT 1), "
-            "  last_purchase_price=(SELECT ii.unit_cost FROM invoice_items ii "
-            "    JOIN invoices inv ON inv.id=ii.invoice_id "
-            "    WHERE ii.vendor_item_id=vendor_items.id AND ii.unit_cost>0 "
-            "    ORDER BY inv.invoice_date DESC, ii.id DESC LIMIT 1) "
-            "WHERE id=?", (vi_id,))
+    _recompute_last_price(db_, affected)
     db_.commit()
     if row["image_path"]:
         try:
@@ -478,18 +480,24 @@ def invoice_update(inv_id):
          inv_id, loc),
     )
     items = d.get("line_items")
-    items = items if isinstance(items, list) else []
+    items = [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
+    # SKUs whose lines are being replaced — recompute their last price after, so a
+    # line edited OUT can't strand a stale price (mirrors invoice_delete).
+    old_vis = {r["vendor_item_id"] for r in database.execute(
+        "SELECT DISTINCT vendor_item_id FROM invoice_items "
+        "WHERE invoice_id=? AND vendor_item_id IS NOT NULL", (inv_id,))}
     database.execute("DELETE FROM invoice_items WHERE invoice_id=?", (inv_id,))
+    new_vis = set()
     for it in items:
-        if not isinstance(it, dict):
-            continue
         vi_id, cat_id = _resolve_vendor_item(database, vendor, inv_date, it, loc)
+        new_vis.add(vi_id)
         database.execute(
             "INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, "
             "vendor_item_id, category_id) VALUES(?,?,?,?,?,?,?,?)",
-            (inv_id, it.get("name", ""), _f(it.get("qty")), it.get("unit"),
+            (inv_id, _s(it.get("name")), _f(it.get("qty")), _s(it.get("unit")) or None,
              _f(it.get("unit_cost")), money.normalize(it.get("total")), vi_id, cat_id),
         )
+    _recompute_last_price(database, old_vis - new_vis)   # only the orphaned SKUs
     database.commit()
     return jsonify({"id": inv_id,
                     "reconciliation": _reconcile(d.get("subtotal"), d.get("tax"),
@@ -513,9 +521,9 @@ def inventory_create():
     cur = db.get_db().execute(
         "INSERT INTO inventory_items(location_id, name, category, unit, par_level, last_count, "
         "unit_cost, vendor, sort_order) VALUES(?,?,?,?,?,?,?,?,?)",
-        (db.active_location_id(), _s(d.get("name")), d.get("category", "other"), d.get("unit", ""),
+        (db.active_location_id(), _s(d.get("name")), _s(d.get("category")) or "other", _s(d.get("unit")),
          _f(d.get("par_level"), 0), _f(d.get("last_count"), 0),
-         _f(d.get("unit_cost"), 0), d.get("vendor", ""), _i(d.get("sort_order"), 0)),
+         _f(d.get("unit_cost"), 0), _s(d.get("vendor")), _i(d.get("sort_order"), 0)),
     )
     db.get_db().commit()
     return jsonify({"id": cur.lastrowid})
@@ -1323,7 +1331,7 @@ def _resolve_vendor_item(database, vendor, inv_date, line, loc):
     """Match an invoice line to a vendor_item within this location (creating a
     'new' one if unseen), refresh its last price/date, return (vi_id, cat_id)."""
     name = _s(line.get("name"))
-    cat_id = _category_id_by_name(database, line.get("category"))
+    cat_id = _category_id_by_name(database, _s(line.get("category")) or None)
     price = _f(line.get("unit_cost"))
     if not name:
         return None, cat_id
@@ -1391,6 +1399,26 @@ def _scalar(v):
     return not isinstance(v, (list, dict))
 
 
+def _recompute_last_price(database, vi_ids):
+    """Re-point each vendor_item's last price/date at its newest remaining
+    positive-priced line (or NULL if none), so removing/editing-out a delivery
+    can't strand a stale 'last price'."""
+    for vi_id in vi_ids:
+        if vi_id is None:
+            continue
+        database.execute(
+            "UPDATE vendor_items SET "
+            "  last_purchase_date=(SELECT inv.invoice_date FROM invoice_items ii "
+            "    JOIN invoices inv ON inv.id=ii.invoice_id "
+            "    WHERE ii.vendor_item_id=vendor_items.id AND ii.unit_cost>0 "
+            "    ORDER BY inv.invoice_date DESC, ii.id DESC LIMIT 1), "
+            "  last_purchase_price=(SELECT ii.unit_cost FROM invoice_items ii "
+            "    JOIN invoices inv ON inv.id=ii.invoice_id "
+            "    WHERE ii.vendor_item_id=vendor_items.id AND ii.unit_cost>0 "
+            "    ORDER BY inv.invoice_date DESC, ii.id DESC LIMIT 1) "
+            "WHERE id=?", (vi_id,))
+
+
 def _own_product_id(database, v):
     """A product_id coerced to int and validated to belong to the active store,
     else None — so a vendor item can't reference (and surface the name of)
@@ -1424,7 +1452,11 @@ if __name__ == "__main__":
     if not os.environ.get("APP_PASSWORD"):
         print("\n  [!] APP_PASSWORD is not set — the ledger is open to anyone on "
               "your network.\n      Set it before exposing this beyond localhost.\n")
-    debug = bool(os.environ.get("DEBUG"))
+    # Only enable the Werkzeug debugger (an RCE surface via its console) when
+    # bound to loopback — never expose it on a public 0.0.0.0 bind.
+    debug = bool(os.environ.get("DEBUG")) and host in ("127.0.0.1", "localhost", "::1")
+    if os.environ.get("DEBUG") and not debug:
+        print("  [!] DEBUG ignored: refusing the interactive debugger on a non-loopback bind.")
     # In debug Werkzeug's reloader runs this block in both parent and child; do
     # the backup work only in the worker (or always, when the reloader is off).
     if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":

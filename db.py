@@ -207,6 +207,7 @@ CREATE INDEX IF NOT EXISTS idx_items_category ON invoice_items(category_id);
 -- date-only / single-column index forced a scan to filter the store.
 CREATE INDEX IF NOT EXISTS idx_invoices_loc_date ON invoices(location_id, invoice_date);
 CREATE INDEX IF NOT EXISTS idx_inv_loc_arch ON inventory_items(location_id, archived);
+CREATE INDEX IF NOT EXISTS idx_counts_loc_taken ON counts(location_id, taken_at);
 """
 
 # The seeded two-level taxonomy: {Category Type: [Category, ...]}. Order within
@@ -253,12 +254,24 @@ DEFAULT_SETTINGS = {
 }
 
 
+_SCHEMA_READY = set()   # DB_PATHs whose columns this process has ensured
+
+
 def get_db():
     if "db" not in g:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        # Self-heal once per process: a server started before a migration must
+        # not 500 on reads of a column init_db would have added. Cheap + idempotent.
+        if DB_PATH not in _SCHEMA_READY:
+            try:
+                _ensure_columns(conn)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass   # table not created yet (first boot) — init_db handles it
+            _SCHEMA_READY.add(DB_PATH)
         g.db = conn
     return g.db
 
@@ -373,6 +386,18 @@ def _migrate_locations(conn):
     conn.execute("INSERT INTO settings(key, value) VALUES('migrated_locations','1')")
 
 
+def _backfill_location_ids(conn):
+    """Idempotent: tag any row still missing a location_id with the default store.
+    Schema-driven (every _ADDED_COLUMNS table that has a location_id), so a table
+    that becomes location-scoped later is handled without a new one-shot flag."""
+    row = conn.execute("SELECT MIN(id) AS id FROM locations").fetchone()
+    if not row or row["id"] is None:
+        return
+    for tbl, cols in _ADDED_COLUMNS.items():
+        if "location_id" in cols:
+            conn.execute(f"UPDATE {tbl} SET location_id=? WHERE location_id IS NULL", (row["id"],))
+
+
 def _category_ids(conn):
     return {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM categories")}
 
@@ -470,6 +495,7 @@ def init_db():
             (env_sq,))
     _migrate_legacy_data(conn)
     _migrate_locations(conn)
+    _backfill_location_ids(conn)   # idempotent, schema-driven safety net
     # Idempotent: re-home any sales_mix row stranded on the legacy location_id=0
     # default (e.g. from an old DB) onto the default store so it's not invisible.
     conn.execute(
