@@ -156,6 +156,28 @@ CREATE TABLE IF NOT EXISTS count_lines (
     unit_cost REAL                  -- unit cost captured at count time
 );
 
+-- Recipes / plate costing. A recipe (menu item) costs the sum of its ingredient
+-- lines, each = qty * the linked product's unit_cost. menu_price + yield_qty
+-- give cost%, per-serving cost, and margin.
+CREATE TABLE IF NOT EXISTS recipes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    location_id INTEGER REFERENCES locations(id),
+    name        TEXT NOT NULL,
+    menu_price  REAL DEFAULT 0,     -- selling price of ONE serving
+    yield_qty   REAL DEFAULT 1,     -- servings the recipe yields
+    notes       TEXT,
+    archived    INTEGER DEFAULT 0,
+    created_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS recipe_items (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipe_id  INTEGER NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+    product_id INTEGER REFERENCES inventory_items(id) ON DELETE SET NULL,
+    qty        REAL DEFAULT 0,      -- in the product's costing unit
+    note       TEXT
+);
+
 -- Per-day net sales cache (keyed by Square location) so the Sales report only
 -- calls Square for days it hasn't seen or that are still changing (today/yesterday).
 CREATE TABLE IF NOT EXISTS daily_sales (
@@ -169,6 +191,7 @@ CREATE TABLE IF NOT EXISTS daily_sales (
 CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date);
 CREATE INDEX IF NOT EXISTS idx_items_invoice ON invoice_items(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_countlines_count ON count_lines(count_id);
+CREATE INDEX IF NOT EXISTS idx_recipeitems_recipe ON recipe_items(recipe_id);
 CREATE INDEX IF NOT EXISTS idx_vendoritems_vendor ON vendor_items(vendor_id);
 CREATE INDEX IF NOT EXISTS idx_vendoritems_name ON vendor_items(vendor_name, vendor_item_name);
 """

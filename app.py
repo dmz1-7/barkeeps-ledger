@@ -31,6 +31,7 @@ import db
 import cogs
 import exports
 import money
+import recipes
 import reports
 import square_client
 from invoice_ai import parse_invoice, InvoiceError
@@ -1067,6 +1068,96 @@ def export_category_summary():
 @app.get("/api/export/order-guide.csv")
 def export_order_guide():
     return _csv_response(exports.order_guide_csv(), "order-guide.csv")
+
+
+@app.get("/api/export/recipes.csv")
+def export_recipes():
+    return _csv_response(exports.recipes_csv(), "recipe-costing.csv")
+
+
+# --- recipes / plate costing ------------------------------------------------
+
+def _save_recipe_items(database, rid, items):
+    loc = db.active_location_id()
+    for it in (items if isinstance(items, list) else []):
+        if not isinstance(it, dict):
+            continue
+        pid = _i(it.get("product_id"))
+        # Never let a recipe reference another store's product (the API accepts
+        # any id; the editor only offers active-store ones). Foreign -> drop to
+        # an unlinked line rather than cost against a different store's price.
+        if pid is not None and not database.execute(
+            "SELECT 1 FROM inventory_items WHERE id=? AND location_id IS ?", (pid, loc)
+        ).fetchone():
+            pid = None
+        database.execute(
+            "INSERT INTO recipe_items(recipe_id, product_id, qty, note) VALUES(?,?,?,?)",
+            (rid, pid, _f(it.get("qty"), 0) or 0, (it.get("note") or "").strip()),
+        )
+
+
+@app.get("/api/recipes")
+def recipe_list():
+    return jsonify(recipes.list_costed())
+
+
+@app.post("/api/recipes")
+def recipe_create():
+    d = request.json or {}
+    database = db.get_db()
+    cur = database.execute(
+        "INSERT INTO recipes(location_id, name, menu_price, yield_qty, notes) "
+        "VALUES(?,?,?,?,?)",
+        (db.active_location_id(), (d.get("name") or "").strip(),
+         money.normalize(d.get("menu_price")) or 0, _f(d.get("yield_qty"), 1) or 1,
+         d.get("notes", "")),
+    )
+    rid = cur.lastrowid
+    _save_recipe_items(database, rid, d.get("items"))
+    database.commit()
+    return jsonify(recipes.cost(rid))
+
+
+@app.get("/api/recipes/<int:rid>")
+def recipe_get(rid):
+    r = recipes.cost(rid)          # location-scoped; None when foreign/missing
+    if r is None:
+        abort(404)
+    return jsonify(r)
+
+
+@app.put("/api/recipes/<int:rid>")
+def recipe_update(rid):
+    d = request.json or {}
+    database = db.get_db()
+    loc = db.active_location_id()
+    if not database.execute(
+        "SELECT 1 FROM recipes WHERE id=? AND location_id IS ?", (rid, loc)
+    ).fetchone():
+        abort(404)
+    database.execute(
+        "UPDATE recipes SET name=?, menu_price=?, yield_qty=?, notes=? "
+        "WHERE id=? AND location_id IS ?",
+        ((d.get("name") or "").strip(), money.normalize(d.get("menu_price")) or 0,
+         _f(d.get("yield_qty"), 1) or 1, d.get("notes", ""), rid, loc),
+    )
+    database.execute("DELETE FROM recipe_items WHERE recipe_id=?", (rid,))
+    _save_recipe_items(database, rid, d.get("items"))
+    database.commit()
+    return jsonify(recipes.cost(rid))
+
+
+@app.delete("/api/recipes/<int:rid>")
+def recipe_delete(rid):
+    database = db.get_db()
+    cur = database.execute(
+        "DELETE FROM recipes WHERE id=? AND location_id IS ?",
+        (rid, db.active_location_id()),
+    )
+    if cur.rowcount == 0:
+        abort(404)
+    database.commit()
+    return jsonify({"ok": True})
 
 
 @app.get("/api/alerts/price-increases")
