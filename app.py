@@ -1507,8 +1507,15 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8088"))
     host = os.environ.get("HOST", "0.0.0.0")
     if not os.environ.get("APP_PASSWORD"):
-        print("\n  [!] APP_PASSWORD is not set — the ledger is open to anyone on "
-              "your network.\n      Set it before exposing this beyond localhost.\n")
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            # Fail closed: don't serve an unauthenticated app on a non-loopback
+            # bind. Force loopback so "open" mode can only be reached on LAN/local.
+            print("\n  [!] APP_PASSWORD is not set — forcing HOST=127.0.0.1 so the "
+                  "open app isn't exposed on the network.\n      Set APP_PASSWORD to "
+                  "bind elsewhere.\n")
+            host = "127.0.0.1"
+        else:
+            print("\n  [!] APP_PASSWORD is not set — the ledger is open on localhost.\n")
     # Only enable the Werkzeug debugger (an RCE surface via its console) when
     # bound to loopback — never expose it on a public 0.0.0.0 bind.
     debug = bool(os.environ.get("DEBUG")) and host in ("127.0.0.1", "localhost", "::1")
