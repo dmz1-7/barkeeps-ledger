@@ -126,7 +126,9 @@ CREATE TABLE IF NOT EXISTS inventory_items (
     name           TEXT NOT NULL,
     category       TEXT,            -- legacy flat tag; superseded by category_id
     category_id    INTEGER REFERENCES categories(id) ON DELETE SET NULL,
-    unit           TEXT,            -- bottle | case | keg | lb | each ...
+    unit           TEXT,            -- purchase/costing unit: bottle | case | keg | lb | each ...
+    size_qty       REAL,            -- content of one purchase unit (e.g. 750), for recipe costing
+    size_unit      TEXT,            -- unit of size_qty (e.g. "ml", "oz", "each")
     report_by_unit TEXT,            -- reporting unit, e.g. "Each", "Bottle", "Keg (1/2BBL)"
     accounting_code TEXT,
     on_inventory   INTEGER DEFAULT 1,
@@ -174,7 +176,8 @@ CREATE TABLE IF NOT EXISTS recipe_items (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     recipe_id  INTEGER NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
     product_id INTEGER REFERENCES inventory_items(id) ON DELETE SET NULL,
-    qty        REAL DEFAULT 0,      -- in the product's costing unit
+    qty        REAL DEFAULT 0,      -- amount used, in `unit`
+    unit       TEXT,                -- recipe unit (oz, ml, each, ...); blank = product's costing unit
     note       TEXT
 );
 
@@ -282,10 +285,13 @@ _ADDED_COLUMNS = {
         "on_inventory": "INTEGER DEFAULT 1",
         "tax_exempt": "INTEGER DEFAULT 0",
         "location_id": "INTEGER",
+        "size_qty": "REAL",
+        "size_unit": "TEXT",
     },
     "vendor_items": {"location_id": "INTEGER"},
     "vendors": {"location_id": "INTEGER"},
     "counts": {"location_id": "INTEGER"},
+    "recipe_items": {"unit": "TEXT"},
 }
 
 

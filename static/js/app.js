@@ -37,6 +37,25 @@ const money = (n) => (n == null ? "—" : "$" + Number(n).toLocaleString(undefin
 const pct = (n) => (n == null ? "—" : Number(n).toFixed(1) + "%");
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+/* ---------- recipe unit conversion (mirrors units.py) ---------- */
+const RECIPE_UNITS = ["oz", "ml", "L", "tsp", "tbsp", "cup", "pt", "qt", "gal", "shot", "dash", "each", "g", "kg", "lb"];
+// Keep these in lockstep with units.py (a parity test asserts the alias sets match).
+const _UNIT_VOL = { ml: 1, milliliter: 1, millilitre: 1, cc: 1, l: 1000, liter: 1000, litre: 1000, oz: 29.5735, floz: 29.5735, "fl oz": 29.5735, ounce: 29.5735, tsp: 4.92892, tbsp: 14.7868, dash: 0.92, cup: 236.588, pt: 473.176, pint: 473.176, qt: 946.353, quart: 946.353, gal: 3785.41, gallon: 3785.41, shot: 44.3603, jigger: 44.3603 };
+const _UNIT_WT = { g: 1, gram: 1, gm: 1, kg: 1000, kilo: 1000, kilogram: 1000, lb: 453.592, lbs: 453.592, pound: 453.592 };
+const _UNIT_CT = { each: 1, ea: 1, unit: 1, ct: 1, count: 1, piece: 1 };
+function _unitFactor(u) {
+  u = (u || "").trim().toLowerCase();
+  if (u in _UNIT_VOL) return ["v", _UNIT_VOL[u]];
+  if (u in _UNIT_WT) return ["w", _UNIT_WT[u]];
+  if (u in _UNIT_CT) return ["c", _UNIT_CT[u]];
+  return [null, null];
+}
+function convertUnit(qty, from, to) {
+  const [fd, ff] = _unitFactor(from), [td, tf] = _unitFactor(to);
+  if (!fd || !td || fd !== td) return null;
+  return (qty * ff) / tf;
+}
+
 function el(html) {
   const t = document.createElement("template");
   t.innerHTML = html.trim();
@@ -863,6 +882,12 @@ async function openItemEditor(it) {
         <label class="fld"><span>On Hand</span><input type="number" step="0.5" id="i-cnt" value="${num(it.last_count)}"></label>
         <label class="fld"><span>Unit $</span><input type="number" step="0.01" id="i-cost" value="${num(it.unit_cost)}"></label>
       </div>
+      <div class="row2">
+        <label class="fld"><span>Size / unit</span><input type="number" step="0.01" id="i-size" value="${num(it.size_qty)}" placeholder="e.g. 750"></label>
+        <label class="fld"><span>Size unit</span><input id="i-sunit" list="unit-list" value="${esc(it.size_unit || "")}" placeholder="ml, oz, each…">
+          <datalist id="unit-list">${RECIPE_UNITS.map((u) => `<option value="${u}">`).join("")}</datalist></label>
+      </div>
+      <p class="muted" style="font-size:.78rem;margin:.1rem 0 0">Content of one purchase unit (a 750 ml bottle ⇒ 750 / ml). Lets recipes cost a 1.5 oz pour.</p>
       <label class="fld"><span>Vendor</span><input id="i-vendor" list="vendor-list" value="${esc(it.vendor || "")}"><datalist id="vendor-list"></datalist></label>
     </div></div>
     <button class="btn btn-grn btn-block" id="save-item">Save</button>
@@ -879,6 +904,7 @@ async function openItemEditor(it) {
       unit: $("#i-unit").value.trim(),
       par_level: f($("#i-par").value, 0), last_count: f($("#i-cnt").value, 0),
       unit_cost: f($("#i-cost").value, 0), vendor: $("#i-vendor").value.trim(),
+      size_qty: f($("#i-size").value, null), size_unit: $("#i-sunit").value.trim() || null,
     };
     if (!payload.name) { toast("Give it a name."); return; }
     try {
@@ -1706,29 +1732,10 @@ async function recipeEditor(id) {
     <div class="card-body" id="r-lines"></div></div>`);
   v.appendChild(ingCard);
   const linesEl = ingCard.querySelector("#r-lines");
+  v.appendChild(el(`<datalist id="unit-list">${RECIPE_UNITS.map((u) => `<option value="${u}">`).join("")}</datalist>`));
   const prodOptions = products.map((p) =>
-    `<option value="${p.id}">${esc(p.name)} (${money(p.unit_cost)}/${esc(p.unit || "ea")})</option>`).join("");
-  const costOf = (pid) => { const p = products.find((x) => String(x.id) === String(pid)); return p ? (p.unit_cost || 0) : 0; };
-
-  const addRow = (it) => {
-    it = it || {};
-    const row = el(`<div class="lrow rrow">
-      <select class="ri-prod"><option value="">— product —</option>${prodOptions}</select>
-      <input class="ri-qty" type="number" step="0.0001" placeholder="qty" value="${num(it.qty)}">
-      <button class="btn btn-sm btn-ghost ri-del">&times;</button>
-    </div>`);
-    if (it.product_id) row.querySelector(".ri-prod").value = String(it.product_id);
-    row.querySelector(".ri-del").addEventListener("click", () => { row.remove(); recalc(); });
-    row.querySelector(".ri-prod").addEventListener("change", recalc);
-    row.querySelector(".ri-qty").addEventListener("input", recalc);
-    linesEl.appendChild(row);
-  };
-  (rec.items || []).forEach(addRow);
-  if (!(rec.items || []).length) addRow();
-  ingCard.querySelector("#r-add").addEventListener("click", () => { addRow(); recalc(); });
-
-  const preview = el(`<div class="note" id="r-preview"></div>`);
-  v.appendChild(preview);
+    `<option value="${p.id}">${esc(p.name)} (${money(p.unit_cost)}/${esc(p.unit || "ea")}${p.size_qty ? `, ${p.size_qty}${esc(p.size_unit || "")}` : ""})</option>`).join("");
+  const prodById = (pid) => products.find((x) => String(x.id) === String(pid));
   // Round half-to-even, matching Python's round() / money.normalize on the
   // backend, so the live preview equals the saved cost to the penny.
   const bankers = (n) => {
@@ -1737,13 +1744,48 @@ async function recipeEditor(id) {
     if (d > 0.5) return fl + 1;
     return fl % 2 === 0 ? fl : fl + 1;
   };
+  // Mirror recipes._line_cost: convert qty into the product's size unit and take
+  // the fraction of a purchase unit, else fall back to qty * unit_cost.
+  const lineCents = (pid, qty, unit) => {
+    const p = prodById(pid);
+    if (!p) return 0;
+    const uc = p.unit_cost || 0;
+    if (p.size_qty > 0 && unit && p.size_unit) {
+      const used = convertUnit(qty, unit, p.size_unit);
+      if (used !== null) return bankers(uc * (used / p.size_qty) * 100);
+    }
+    return bankers(qty * uc * 100);
+  };
+
+  const addRow = (it) => {
+    it = it || {};
+    const row = el(`<div class="lrow rrow">
+      <select class="ri-prod"><option value="">— product —</option>${prodOptions}</select>
+      <input class="ri-qty" type="number" step="0.0001" placeholder="qty" value="${num(it.qty)}">
+      <input class="ri-unit" list="unit-list" placeholder="unit" value="${esc(it.unit || "")}" style="max-width:5.5rem">
+      <button class="btn btn-sm btn-ghost ri-del">&times;</button>
+    </div>`);
+    if (it.product_id) row.querySelector(".ri-prod").value = String(it.product_id);
+    row.querySelector(".ri-del").addEventListener("click", () => { row.remove(); recalc(); });
+    row.querySelector(".ri-prod").addEventListener("change", recalc);
+    row.querySelector(".ri-qty").addEventListener("input", recalc);
+    row.querySelector(".ri-unit").addEventListener("input", recalc);
+    linesEl.appendChild(row);
+  };
+  (rec.items || []).forEach(addRow);
+  if (!(rec.items || []).length) addRow();
+  ingCard.querySelector("#r-add").addEventListener("click", () => { addRow(); recalc(); });
+
+  const preview = el(`<div class="note" id="r-preview"></div>`);
+  v.appendChild(preview);
   // Mirror the backend: cost each line in cents, sum, divide by yield.
   function recalc() {
     let cents = 0;
     linesEl.querySelectorAll(".rrow").forEach((row) => {
       const pid = row.querySelector(".ri-prod").value;
       const qty = Number(row.querySelector(".ri-qty").value) || 0;
-      cents += bankers(costOf(pid) * qty * 100);
+      const unit = row.querySelector(".ri-unit").value;
+      cents += lineCents(pid, qty, unit);
     });
     const batch = cents / 100;
     const yld = Number($("#r-yield").value) > 0 ? Number($("#r-yield").value) : 1;
@@ -1770,7 +1812,8 @@ async function recipeEditor(id) {
   $("#r-save").addEventListener("click", async () => {
     const items = [...linesEl.querySelectorAll(".rrow")]
       .map((row) => ({ product_id: row.querySelector(".ri-prod").value || null,
-                       qty: Number(row.querySelector(".ri-qty").value) || 0 }))
+                       qty: Number(row.querySelector(".ri-qty").value) || 0,
+                       unit: row.querySelector(".ri-unit").value.trim() }))
       .filter((x) => x.product_id);
     const name = $("#r-name").value.trim();
     if (!name) { toast("Name the recipe."); return; }
