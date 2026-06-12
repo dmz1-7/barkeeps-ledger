@@ -268,6 +268,9 @@ input:focus, select:focus, textarea:focus {
 }
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+/* invoice line row (the JS adds an inline grid too; this backs the class) */
+.lrow { display: grid; grid-template-columns: 1fr auto; gap: 6px; align-items: start;
+  border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 8px; }
 /* recipe ingredient row: product | qty | unit | delete */
 .rrow { display: grid; grid-template-columns: 1fr 4.5rem 5rem auto; gap: 6px; align-items: center; margin-bottom: 6px; }
 .rrow input, .rrow select { width: 100%; }

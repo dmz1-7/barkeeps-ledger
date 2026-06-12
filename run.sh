@@ -14,4 +14,7 @@ if [ ! -d ".venv" ]; then
 fi
 
 .venv/bin/pip install -q -r requirements.txt
+# Local dev convenience: allow running without a passcode on localhost. For a
+# public/remote deploy set APP_PASSWORD instead (see run_remote.sh / README).
+export ALLOW_OPEN="${ALLOW_OPEN:-1}"
 exec .venv/bin/python app.py

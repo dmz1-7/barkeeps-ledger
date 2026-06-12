@@ -208,6 +208,7 @@ CREATE INDEX IF NOT EXISTS idx_items_category ON invoice_items(category_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_loc_date ON invoices(location_id, invoice_date);
 CREATE INDEX IF NOT EXISTS idx_inv_loc_arch ON inventory_items(location_id, archived);
 CREATE INDEX IF NOT EXISTS idx_counts_loc_taken ON counts(location_id, taken_at);
+CREATE INDEX IF NOT EXISTS idx_items_invitem ON invoice_items(inventory_item_id);
 """
 
 # The seeded two-level taxonomy: {Category Type: [Category, ...]}. Order within
@@ -294,6 +295,10 @@ def close_db(_exc=None):
 # risk, and the app soft-deletes (archived=1) rather than hard-deleting, so the
 # missing ON DELETE SET NULL paths effectively never fire. Tenant scoping is
 # enforced in the queries, not by these FKs.
+# Also: get_db()'s self-heal only re-runs _ensure_columns + POST_INDEXES. Any new
+# column here that needs non-NULL values on EXISTING rows must get its own
+# idempotent backfill wired into init_db (see _backfill_location_ids) — the
+# self-heal won't populate it.
 _ADDED_COLUMNS = {
     "invoices": {
         "status": "TEXT DEFAULT 'closed'",

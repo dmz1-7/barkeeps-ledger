@@ -177,6 +177,8 @@ def _num(v):
 def _normalize(data):
     items = []
     for it in data.get("line_items") or []:
+        if not isinstance(it, dict):
+            continue   # the model occasionally returns a non-object line; skip it
         cat = it.get("category")
         if cat not in LINE_CATEGORIES:
             cat = "Uncategorized"

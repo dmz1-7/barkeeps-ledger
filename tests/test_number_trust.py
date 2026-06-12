@@ -28,6 +28,7 @@ from unittest import mock
 os.environ["LEDGER_DB"] = tempfile.mktemp(suffix=".db")
 os.environ["APP_PASSWORD"] = ""
 os.environ["APP_SECRET"] = ""
+os.environ["ALLOW_OPEN"] = "1"   # tests run open; acknowledge the fail-closed guard
 
 import db                       # noqa: E402
 import square_client            # noqa: E402
@@ -2502,6 +2503,108 @@ class PrimeDollarConsistency(Base):
                 s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
         # span = 33 days (opening excluded); prime COGS = 900 * 30/33 = 818.18 (+$0 labor)
         self.assertEqual(s["prime"], 818.18)
+
+
+# ============================================================================
+# Eighth audit-fix regression tests (2026-06-12, 8th re-audit)
+# ============================================================================
+
+class CogsTaxBasis(Base):
+    def test_tax_inclusive_lines_deflated_to_pretax(self):
+        with flask_app.app_context():
+            d = get_db()
+            wine = d.execute("SELECT id FROM categories WHERE name='Wine'").fetchone()["id"]
+            # subtotal 100, tax 8, total 108; the single line prints tax-INCLUSIVE (108)
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,subtotal,tax,total) "
+                            "VALUES(1,'V','2026-06-05',100,8,108)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total,category_id) VALUES(?,?,?,?)",
+                      (iid, "a", 108.0, wine))
+            d.commit()
+            p = cogs.purchases(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+            cr = reports.category_report(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(p["total"], 100.0)              # deflated 108 * 100/108 = 100 (pre-tax)
+        self.assertEqual(cr["grand_total"], 100.0)
+
+    def test_tax_exclusive_lines_unchanged(self):
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,subtotal,tax,total) "
+                            "VALUES(1,'V','2026-06-05',100,8,108)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'a',100.0)", (iid,))  # = subtotal
+            d.commit()
+            p = cogs.purchases(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(p["total"], 100.0)              # already pre-tax, untouched
+
+
+class ReportEndpointsHttp(Base):
+    def test_report_routes_respond(self):
+        for path in ("/api/reports/category", "/api/reports/controllable-pl",
+                     "/api/reports/sales", "/api/reports/price-movers",
+                     "/api/reports/category?start=2026-06-01&end=2026-06-30"):
+            self.assertEqual(self.client.get(path).status_code, 200)
+
+    def test_category_report_filters(self):
+        with flask_app.app_context():
+            d = get_db()
+            for v, n in (("Acme", "100"), ("Beta", "50")):
+                iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                                "VALUES(1,?,?,?)", (v, "2026-06-05", float(n))).lastrowid
+                d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',?)", (iid, float(n)))
+            d.commit()
+        cr = self.client.get("/api/reports/category?start=2026-06-01&end=2026-06-30&vendor=Acme").get_json()
+        self.assertEqual(cr["grand_total"], 100.0)       # only Acme's invoice
+
+
+class AuthMutatingEndpoints(AuthGateCoverage):
+    def test_tokenless_mutations_rejected(self):
+        for method, path in (("post", "/api/invoices"), ("delete", "/api/invoices/1"),
+                             ("post", "/api/settings"), ("put", "/api/products/1")):
+            r = getattr(self.client, method)(path, json={})
+            self.assertEqual(r.status_code, 401, f"{method} {path}")
+
+
+class PriceTenantIsolation(Base):
+    def _line(self, loc, vendor, name, price, date):
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(?,?,?,?)", (loc, vendor, date, price)).lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,unit_cost,qty,total) "
+                      "VALUES(?,?,?,?,?)", (iid, name, price, 1, price))
+            d.commit()
+
+    def test_price_movers_excludes_other_store(self):
+        self._line(1, "Acme", "Gin", 20.0, "2026-05-15")   # store-1 prior
+        self._line(1, "Acme", "Gin", 24.0, "2026-06-10")   # store-1 move
+        self._line(2, "Acme", "Gin", 99.0, "2026-06-11")   # store-2 noise, must not appear
+        with flask_app.app_context():
+            res = reports.price_movers(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        gin = [m for m in res["movers"] if m["name"] == "Gin"]
+        self.assertEqual(len(gin), 1)
+        self.assertEqual(gin[0]["new_price"], 24.0)        # store-1's, not store-2's 99
+
+
+class PriceMoversInWindowChange(Base):
+    def test_change_entirely_within_window_is_caught(self):
+        with flask_app.app_context():
+            d = get_db()
+            for price, date in ((20.0, "2026-06-05"), (26.0, "2026-06-20")):   # both in-window, no prior
+                iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                                "VALUES(1,'Acme',?,?)", (date, price)).lastrowid
+                d.execute("INSERT INTO invoice_items(invoice_id,name,unit_cost,qty,total) "
+                          "VALUES(?,'Gin',?,1,?)", (iid, price, price))
+            d.commit()
+            res = reports.price_movers(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        gin = [m for m in res["movers"] if m["name"] == "Gin"][0]
+        self.assertEqual((gin["old_price"], gin["new_price"]), (20.0, 26.0))   # in-window fallback
+
+
+class SquareLocationUnique(Base):
+    def test_cannot_assign_a_square_id_to_two_stores(self):
+        # store 2 already seeded with LS1WRASW8V02R; assigning it to store 1 -> 400
+        r = self.client.post("/api/settings", json={"square_location_id": "LS1WRASW8V02R"},
+                             headers={"X-Location-Id": "1"})
+        self.assertEqual(r.status_code, 400)
 
 
 if __name__ == "__main__":
