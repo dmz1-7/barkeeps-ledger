@@ -156,8 +156,10 @@ class DuplicateInvoiceGuard(Base):
         self.assertEqual(r.status_code, 200)
 
     def test_no_vendor_no_false_positive(self):
-        blank = {"vendor": "", "invoice_number": "", "invoice_date": "", "total": None,
-                 "line_items": []}
+        # blank vendor/number must not false-positive as a duplicate; a valid date
+        # is now required (an unvalidated date would silently drop reports).
+        blank = {"vendor": "", "invoice_number": "", "invoice_date": "2026-06-01",
+                 "total": None, "line_items": []}
         self.assertEqual(self.client.post("/api/invoices", json=blank).status_code, 200)
         self.assertEqual(self.client.post("/api/invoices", json=blank).status_code, 200)
 
@@ -340,8 +342,8 @@ class InvoiceEdit(Base):
     def test_detail_flags_reconciliation_mismatch(self):
         iid = self._create()
         self.client.put(f"/api/invoices/{iid}", json={
-            "vendor": "Acme", "subtotal": 100.0, "tax": 0.0, "total": 100.0,
-            "line_items": [{"name": "Gin", "total": 60.0}]})
+            "vendor": "Acme", "invoice_date": "2026-06-01", "subtotal": 100.0, "tax": 0.0,
+            "total": 100.0, "line_items": [{"name": "Gin", "total": 60.0}]})
         recon = self.client.get(f"/api/invoices/{iid}").get_json()["reconciliation"]
         self.assertFalse(recon["ok"])
         self.assertEqual(recon["delta"], -40.0)
@@ -1318,11 +1320,13 @@ class RecipeCosting(Base):
         self.assertTrue(r["items"][0]["converted"])
         self.assertEqual(r["unconverted_lines"], 0)
 
-    def test_incompatible_unit_falls_back_and_flags(self):
+    def test_incompatible_unit_costs_zero_and_flags(self):
         gin = self._sized_product("Gin", 20.0, 750, "ml")
         r = self._create(name="Bad", menu_price=12.0, yield_qty=1,
                          items=[{"product_id": gin, "qty": 2, "unit": "g"}])  # g can't -> ml
-        self.assertEqual(r["batch_cost"], 40.0)             # fallback 2 * $20
+        # size present but unit won't convert: contribute $0 (flagged), NOT a wildly
+        # wrong 2 * $20/bottle that would inflate batch_cost/cost%/margin.
+        self.assertEqual(r["batch_cost"], 0.0)
         self.assertFalse(r["items"][0]["converted"])
         self.assertEqual(r["unconverted_lines"], 1)
 
@@ -3364,6 +3368,115 @@ class UsageCogsRealCacheToday(Base):
         # the cache+fetch layer covered every interval day, so the interval basis is trusted
         self.assertEqual(s["cogs_sales_basis"], "interval")
         self.assertEqual(s["cogs_method"], "usage")
+
+
+# ============================================================================
+# Fourteenth audit-fix regression tests (2026-06-12, 14th re-audit)
+# ============================================================================
+
+class CategoryReportArchivedSpend(Base):
+    def test_archived_category_spend_still_counted_and_reconciles(self):
+        with flask_app.app_context():
+            d = get_db()
+            cid = d.execute("INSERT INTO categories(name, category_type, sort_order) "
+                            "VALUES('Seasonal','Liquor',5)").lastrowid
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-05',500)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total,category_id) VALUES(?,?,?,?)",
+                      (iid, "x", 500.0, cid))
+            d.execute("UPDATE categories SET archived=1 WHERE id=?", (cid,))   # soft-delete the category
+            d.commit()
+            cr = reports.category_report(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+            pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(cr["grand_total"], 500.0)          # archived spend NOT dropped
+        self.assertEqual(cr["grand_total"], pl["total_cogs"])  # still ties to the P&L
+        # the archived category's $500 folds into the Uncategorized column
+        self.assertEqual(cr["column_totals"][0], 500.0)
+
+
+class CategorySummaryCsvPretax(Base):
+    def test_tax_inclusive_export_deflates_to_pretax(self):
+        with flask_app.app_context():
+            d = get_db()
+            wine = d.execute("SELECT id FROM categories WHERE name='Wine'").fetchone()["id"]
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,subtotal,tax,total) "
+                            "VALUES(1,'V','2026-06-05',100,8,108)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total,category_id) VALUES(?,?,?,?)",
+                      (iid, "a", 108.0, wine))   # tax-inclusive line
+            d.commit()
+        body = self.client.get("/api/export/category-summary.csv"
+                               "?start=2026-06-01&end=2026-06-30").get_data(as_text=True)
+        rows = [r.split(",") for r in body.strip().splitlines()]
+        total = [r for r in rows if len(r) >= 2 and r[1] == "TOTAL"][0]
+        self.assertEqual(total[2], "100.0")        # deflated, ties to Category Report (not 108)
+
+
+class InvoiceDateValidation(Base):
+    def test_blank_or_garbage_date_rejected(self):
+        for bad in ("", "not-a-date", "2026-13-40"):
+            r = self.client.post("/api/invoices", json={
+                "vendor": "V", "invoice_date": bad, "total": 10, "line_items": []})
+            self.assertEqual(r.status_code, 400, bad)
+        ok = self.client.post("/api/invoices", json={
+            "vendor": "V", "invoice_date": "2026-06-05", "total": 10, "line_items": []})
+        self.assertEqual(ok.status_code, 200)
+
+    def test_update_rejects_bad_date(self):
+        iid = self.client.post("/api/invoices", json={
+            "vendor": "V", "invoice_date": "2026-06-05", "total": 10, "line_items": []}).get_json()["id"]
+        r = self.client.put(f"/api/invoices/{iid}", json={
+            "vendor": "V", "invoice_date": "", "total": 10, "line_items": []})
+        self.assertEqual(r.status_code, 400)
+
+
+class OpenModeForwardingHeaders(Base):
+    def test_cf_connecting_ip_refused_in_open_mode(self):
+        for hdr in ("CF-Connecting-IP", "X-Real-IP", "True-Client-IP"):
+            r = self.client.get("/api/health", headers={hdr: "8.8.8.8"},
+                                environ_overrides={"REMOTE_ADDR": "127.0.0.1"})
+            self.assertEqual(r.status_code, 403, hdr)
+
+
+class VendorSummaryBasisPinned(Base):
+    def test_total_purchased_is_tax_inclusive_grand_total(self):
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,subtotal,tax,total) "
+                            "VALUES(1,'V','2026-06-05',100,8,108)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'a',108)", (iid,))
+            d.commit()
+        out = self.client.get("/api/vendors/summary", headers={"X-Location-Id": "1"}).get_json()
+        # "total purchased" is what you PAID the vendor (A/P, tax-included) — deliberately
+        # the gross invoice total, NOT the pre-tax COGS basis. Pin it so it can't drift.
+        self.assertEqual(out["total_purchased"], 108.0)
+
+
+class CategoryReportFilters(Base):
+    def _inv(self, num, status, total):
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,invoice_number,status,total) "
+                            "VALUES(1,'Acme',?,?,?,?)", ("2026-06-05", num, status, total)).lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',?)", (iid, total))
+            d.commit()
+
+    def test_status_and_search_filters(self):
+        self._inv("CLO-1", "closed", 100)
+        self._inv("PRO-9", "processing", 40)
+        q = "/api/reports/category?start=2026-06-01&end=2026-06-30"
+        self.assertEqual(self.client.get(q).get_json()["grand_total"], 140.0)               # both
+        self.assertEqual(self.client.get(q + "&status=processing").get_json()["grand_total"], 40.0)
+        self.assertEqual(self.client.get(q + "&q=CLO").get_json()["grand_total"], 100.0)   # search = ?q=
+
+
+class SettingsGlobalTenancy(Base):
+    def test_numeric_settings_are_global_across_stores(self):
+        # pin the intended design: target_cogs_pct etc. are GLOBAL (single owner),
+        # not per-store — set under store 1, visible from store 2.
+        self.client.post("/api/settings", json={"target_cogs_pct": 31},
+                         headers={"X-Location-Id": "1"})
+        c2 = self.client.get("/api/config", headers={"X-Location-Id": "2"}).get_json()
+        self.assertEqual(str(c2["target_cogs_pct"]), "31")
 
 
 if __name__ == "__main__":
