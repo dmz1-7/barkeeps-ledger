@@ -35,6 +35,7 @@ import cogs                     # noqa: E402
 import money                    # noqa: E402
 import reports                  # noqa: E402
 import units                    # noqa: E402
+import invoice_ai               # noqa: E402
 from db import get_db           # noqa: E402
 import app as app_module        # noqa: E402
 
@@ -455,9 +456,11 @@ class UsageCogs(Base):
 
     def _invoice(self, date_str, total):
         with flask_app.app_context():
-            get_db().execute(
+            iid = get_db().execute(
                 "INSERT INTO invoices(location_id, vendor, invoice_date, total) VALUES(1,'V',?,?)",
-                (date_str, total))
+                (date_str, total)).lastrowid
+            get_db().execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',?)",
+                             (iid, total))
             get_db().commit()
 
     def test_usage_cogs_uses_count_interval_not_requested_range(self):
@@ -1459,8 +1462,10 @@ class UsageCogsDenominator(Base):
 
     def _invoice(self, date_str, total):
         with flask_app.app_context():
-            get_db().execute("INSERT INTO invoices(location_id, vendor, invoice_date, total) "
-                             "VALUES(1,'V',?,?)", (date_str, total))
+            iid = get_db().execute("INSERT INTO invoices(location_id, vendor, invoice_date, total) "
+                                   "VALUES(1,'V',?,?)", (date_str, total)).lastrowid
+            get_db().execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',?)",
+                             (iid, total))
             get_db().commit()
 
     def test_cogs_pct_uses_interval_sales_not_range_sales(self):
@@ -1759,8 +1764,10 @@ class PrimePctUsageMode(Base):
 
     def _invoice(self, d, t):
         with flask_app.app_context():
-            get_db().execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
-                             "VALUES(1,'V',?,?)", (d, t)); get_db().commit()
+            iid = get_db().execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                                   "VALUES(1,'V',?,?)", (d, t)).lastrowid
+            get_db().execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',?)",
+                             (iid, t)); get_db().commit()
 
     def _summary(self, interval_cache):
         labor = dict(_LABOR0); labor["labor"] = 300.0
@@ -1903,6 +1910,164 @@ class SchemaColumns(Base):
         self.assertIn("unit", ri)
         self.assertIn("size_qty", inv)
         self.assertIn("size_unit", inv)
+
+
+# ============================================================================
+# Third audit-fix regression tests (2026-06-12, 3rd re-audit)
+# ============================================================================
+
+class CogsBasisConsistency(Base):
+    """All three reports derive COGS from the same line-item basis, so the
+    dashboard, Category Report, and P&L agree for the same period even when line
+    items don't reconcile to the invoice grand total."""
+
+    def test_dashboard_category_and_pl_agree(self):
+        with flask_app.app_context():
+            d = get_db()
+            wine = d.execute("SELECT id FROM categories WHERE name='Wine'").fetchone()["id"]
+            # grand total 150 (incl. tax/fees) but only 120 of categorized line items
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-05',150)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total,category_id) VALUES(?,?,?,?)",
+                      (iid, "a", 120.0, wine))
+            d.commit()
+            purch = cogs.purchases(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+            cr = reports.category_report(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(purch["total"], 120.0)              # line-item basis, not 150
+        self.assertEqual(cr["grand_total"], 120.0)
+        self.assertEqual(round(sum(purch["by_category"].values()), 2), 120.0)  # header = breakdown
+
+
+class InvoiceUpdateHardening(Base):
+    def _create(self, items):
+        return self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_number": "U1", "invoice_date": "2026-06-10",
+            "total": 20, "line_items": items}).get_json()["id"]
+
+    def test_malformed_line_item_on_update_does_not_500(self):
+        rid = self._create([{"name": "Gin", "unit_cost": 20, "qty": 1, "total": 20}])
+        r = self.client.put(f"/api/invoices/{rid}", json={
+            "vendor": "Acme", "invoice_number": "U1", "invoice_date": "2026-06-10",
+            "total": 20, "line_items": [{"name": "Gin", "total": 20}, "oops"]})
+        self.assertNotEqual(r.status_code, 500)
+
+    def test_editing_a_line_out_clears_its_stale_last_price(self):
+        rid = self._create([{"name": "Gin", "unit_cost": 20, "qty": 1, "total": 20}])
+        with flask_app.app_context():
+            p = get_db().execute("SELECT last_purchase_price FROM vendor_items "
+                                 "WHERE lower(vendor_item_name)='gin'").fetchone()
+            self.assertEqual(p["last_purchase_price"], 20.0)
+        # edit the Gin line OUT (replace with a different SKU)
+        self.client.put(f"/api/invoices/{rid}", json={
+            "vendor": "Acme", "invoice_number": "U1", "invoice_date": "2026-06-10",
+            "total": 5, "line_items": [{"name": "Lime", "unit_cost": 5, "qty": 1, "total": 5}]})
+        with flask_app.app_context():
+            p = get_db().execute("SELECT last_purchase_price FROM vendor_items "
+                                 "WHERE lower(vendor_item_name)='gin'").fetchone()
+        self.assertIsNone(p["last_purchase_price"])          # no remaining line -> NULL, not stale 20
+
+
+class UploadsScoping(Base):
+    def test_foreign_store_image_not_served(self):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO invoices(location_id,vendor,invoice_date,image_path) "
+                             "VALUES(2,'V','2026-06-01','secret.jpg')")
+            get_db().commit()
+        r = self.client.get("/uploads/secret.jpg", headers={"X-Location-Id": "1"})
+        self.assertEqual(r.status_code, 404)
+
+    def test_unknown_image_404(self):
+        self.assertEqual(self.client.get("/uploads/nope.jpg").status_code, 404)
+
+
+class CsvAllPrefixes(Base):
+    def test_all_formula_prefixes_neutralized(self):
+        with flask_app.app_context():
+            d = get_db()
+            for i, vendor in enumerate(("=A1", "+1", "-2", "@SUM", " =B2")):
+                iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                                "VALUES(1,?,?,10)", (vendor, f"2026-06-0{i+1}")).lastrowid
+                d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',10)", (iid,))
+            d.commit()
+        text = self.client.get("/api/export/purchases.csv?start=2026-06-01&end=2026-06-30").get_data(as_text=True)
+        for v in ("=A1", "+1", "-2", "@SUM"):
+            self.assertIn("'" + v, text)
+        self.assertIn("' =B2", text)   # leading-space formula also guarded
+
+
+class ListLocationsError(Base):
+    def test_request_error_soft(self):
+        import requests as rq
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "get",
+                                   side_effect=rq.RequestException("boom")):
+                out = square_client.list_locations()
+        self.assertEqual(out["locations"], [])
+        self.assertIsNotNone(out["error"])
+
+    def test_no_token_soft(self):
+        with flask_app.app_context():
+            out = square_client.list_locations()
+        self.assertEqual(out["locations"], [])
+        self.assertIsNotNone(out["error"])
+
+
+class InvoiceAiParsing(unittest.TestCase):
+    def test_extract_json_bare_prose_and_garbage(self):
+        self.assertEqual(invoice_ai._extract_json('{"a": 1}'), {"a": 1})
+        self.assertEqual(invoice_ai._extract_json('Here you go:\n{"a": 2}\nThanks'), {"a": 2})
+        self.assertIsNone(invoice_ai._extract_json("no json here"))
+        self.assertIsNone(invoice_ai._extract_json(""))
+
+    def test_normalize_preserves_negatives_and_clamps_category(self):
+        out = invoice_ai._normalize({
+            "vendor": "V", "line_items": [
+                {"name": "Keg deposit refund", "total": -30, "unit_cost": -30, "category": "Bogus"}]})
+        line = out["line_items"][0]
+        self.assertEqual(line["total"], -30.0)               # negative preserved
+        self.assertEqual(line["category"], "Uncategorized")  # unknown category clamped
+
+
+class InvoiceParseEndpoint(Base):
+    def test_missing_bad_ext_and_empty(self):
+        self.assertEqual(self.client.post("/api/invoices/parse").status_code, 400)
+        self.assertEqual(self.client.post("/api/invoices/parse", data={
+            "image": (io.BytesIO(b"x"), "note.txt")},
+            content_type="multipart/form-data").status_code, 400)
+        self.assertEqual(self.client.post("/api/invoices/parse", data={
+            "image": (io.BytesIO(b""), "p.jpg")},
+            content_type="multipart/form-data").status_code, 400)
+
+    def test_parse_failure_is_422(self):
+        with mock.patch.object(app_module, "parse_invoice",
+                               side_effect=app_module.InvoiceError("nope")):
+            r = self.client.post("/api/invoices/parse", data={
+                "image": (io.BytesIO(b"realbytes"), "p.jpg")},
+                content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("error", r.get_json())
+
+
+class ListEndpointScoping(Base):
+    def test_collections_exclude_foreign_store(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("INSERT INTO inventory_items(location_id,name) VALUES(2,'NYCprod')")
+            d.execute("INSERT INTO recipes(location_id,name) VALUES(2,'NYCrecipe')")
+            d.execute("INSERT INTO counts(location_id,note,value) VALUES(2,'NYCcount',0)")
+            d.execute("INSERT INTO vendor_items(location_id,vendor_item_name,status) "
+                      "VALUES(2,'NYCsku','reviewed')")
+            d.commit()
+        h = {"X-Location-Id": "1"}
+        prods = self.client.get("/api/products", headers=h).get_json()
+        recs = self.client.get("/api/recipes", headers=h).get_json()
+        counts = self.client.get("/api/counts", headers=h).get_json()
+        vis = self.client.get("/api/vendor-items", headers=h).get_json()
+        self.assertFalse(any(p["name"] == "NYCprod" for p in prods))
+        self.assertFalse(any(r["name"] == "NYCrecipe" for r in recs))
+        self.assertFalse(any(c.get("note") == "NYCcount" for c in counts))
+        self.assertFalse(any(v["vendor_item_name"] == "NYCsku" for v in vis))
 
 
 if __name__ == "__main__":

@@ -364,7 +364,8 @@ function dataTable(columns, rows, opts = {}) {
     const head = columns.map((c) => {
       const sortable = c.sortable !== false;
       const aria = sortKey === c.key ? ` aria-sort="${sortDir > 0 ? "ascending" : "descending"}"` : "";
-      return `<th class="${c.align === "right" ? "r" : ""} ${sortable ? "sortable" : ""}"${sortable ? ' tabindex="0" role="button"' : ""}${aria} data-k="${esc(c.key)}">${esc(c.label)}${sortKey === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>`;
+      // keep the implicit columnheader role (no role="button") so aria-sort is announced
+      return `<th class="${c.align === "right" ? "r" : ""} ${sortable ? "sortable" : ""}"${sortable ? ' tabindex="0"' : ""}${aria} data-k="${esc(c.key)}">${esc(c.label)}${sortKey === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>`;
     }).join("");
     const body = r.length ? r.map((row) =>
       `<tr ${row._href ? `data-href="${esc(row._href)}" tabindex="0" role="link"` : ""}>` + columns.map((c) =>
@@ -840,7 +841,7 @@ async function renderInvoiceDetail(parts) {
         ⚠ Line items add up to ${money(recon.line_sum)}, but the invoice is ${money(recon.expected)}
         (off by ${money(Math.abs(recon.delta))}). Tap Edit to fix.</div>` : ""}
       ${iv.line_items.length ? `<div class="card"><div class="card-band">Items</div><div class="card-body">
-        ${iv.line_items.map((li) => `<div class="kv"><span>${esc(li.name)}${li.qty ? ` <span class="muted">×${li.qty} ${esc(li.unit || "")}</span>` : ""}${li.category_id ? ` <span class="muted">· ${esc(catName[li.category_id] || "")}</span>` : ""}</span><b>${money(li.total)}</b></div>`).join("")}
+        ${iv.line_items.map((li) => `<div class="kv"><span>${esc(li.name)}${li.qty ? ` <span class="muted">×${esc(String(li.qty))} ${esc(li.unit || "")}</span>` : ""}${li.category_id ? ` <span class="muted">· ${esc(catName[li.category_id] || "")}</span>` : ""}</span><b>${money(li.total)}</b></div>`).join("")}
       </div></div>` : ""}
       <button class="btn btn-brass btn-block" id="edit-inv" style="margin-top:.6rem">Edit Invoice</button>
       <button class="btn btn-ox btn-block" id="del-inv" style="margin-top:.5rem">Delete Invoice</button>
@@ -1004,6 +1005,9 @@ async function showOrderList() {
    ============================================================ */
 async function renderCount() {
   loading();
+  // The save bar is appended to <body> (outside #view), so route()'s view reset
+  // doesn't clear it — drop any leftover before re-rendering.
+  document.querySelectorAll(".sticky-action").forEach((n) => n.remove());
   let items;
   try { items = await api("GET", "/api/products"); }
   catch (e) { view().innerHTML = `<p class="err">${esc(e.message)}</p>`; return; }

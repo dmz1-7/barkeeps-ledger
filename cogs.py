@@ -10,45 +10,52 @@ import datetime as dt
 from flask import abort
 
 from db import get_db, get_setting, active_location_id
+import money
 import square_client
 
 
 def purchases(start, end):
-    """Total invoice spend in [start, end], plus a breakdown by category type.
+    """COGS-basis invoice spend in [start, end], plus a breakdown by category type.
 
-    The total comes from invoice grand totals; the breakdown comes from
-    categorized line items (so it reflects the two-level taxonomy)."""
+    Both the total AND the breakdown come from LINE ITEMS (invoice_items.total),
+    so the dashboard's purchases-COGS matches the Controllable P&L and Category
+    Report exactly (all three share one basis), and the header equals the sum of
+    the category rows. Summed in integer cents. Note: this is cost-of-goods (the
+    pre-tax/fees line items), not the invoice grand total."""
     db = get_db()
     loc = active_location_id()
-    total_row = db.execute(
-        "SELECT COALESCE(SUM(total),0) AS amt, COUNT(*) AS n FROM invoices "
-        "WHERE location_id IS ? AND invoice_date >= ? AND invoice_date <= ?",
-        (loc, start.isoformat(), end.isoformat()),
-    ).fetchone()
     rows = db.execute(
-        "SELECT COALESCE(c.category_type,'Uncategorized') AS ctype, "
-        "       COALESCE(SUM(ii.total),0) AS amt "
+        "SELECT COALESCE(c.category_type,'Uncategorized') AS ctype, ii.total AS amt "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN categories c ON c.id = ii.category_id "
-        "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ? "
-        "GROUP BY c.category_type",
+        "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ?",
         (loc, start.isoformat(), end.isoformat()),
     ).fetchall()
-    by_cat = {r["ctype"]: round(r["amt"], 2) for r in rows if r["amt"]}
-    return {"by_category": by_cat, "total": round(total_row["amt"], 2), "count": total_row["n"]}
+    by_cat_c = {}
+    for r in rows:
+        by_cat_c[r["ctype"]] = by_cat_c.get(r["ctype"], 0) + money.to_cents(r["amt"])
+    n = db.execute(
+        "SELECT COUNT(*) AS n FROM invoices "
+        "WHERE location_id IS ? AND invoice_date >= ? AND invoice_date <= ?",
+        (loc, start.isoformat(), end.isoformat()),
+    ).fetchone()["n"]
+    by_cat = {k: round(v / 100.0, 2) for k, v in by_cat_c.items() if v}
+    return {"by_category": by_cat,
+            "total": round(sum(by_cat_c.values()) / 100.0, 2), "count": n}
 
 
 def _purchase_total(loc, after_date, through_date):
-    """Sum invoice grand totals received after `after_date` through `through_date`
-    (both ISO dates). Used for usage-COGS, where purchases must span the SAME
-    interval as the bracketing counts (the opening count subsumes its own day's
-    deliveries, so the lower bound is exclusive)."""
-    row = get_db().execute(
-        "SELECT COALESCE(SUM(total),0) AS amt FROM invoices "
-        "WHERE location_id IS ? AND invoice_date > ? AND invoice_date <= ?",
+    """Sum invoice LINE-ITEM totals received after `after_date` through
+    `through_date` (both ISO dates) — same cost-of-goods basis as purchases().
+    Used for usage-COGS, where purchases must span the SAME interval as the
+    bracketing counts (the opening count subsumes its own day's deliveries, so
+    the lower bound is exclusive)."""
+    rows = get_db().execute(
+        "SELECT ii.total AS amt FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
+        "WHERE inv.location_id IS ? AND inv.invoice_date > ? AND inv.invoice_date <= ?",
         (loc, after_date, through_date),
-    ).fetchone()
-    return round(row["amt"], 2)
+    ).fetchall()
+    return money.sum_dollars(r["amt"] for r in rows)
 
 
 # How far a bracketing count may sit outside the requested period and still be

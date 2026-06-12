@@ -19,7 +19,9 @@ def _safe(cell):
     +, -, @, or a control char is evaluated as a formula by Excel/Sheets, and
     vendor/item/recipe names are free text (some AI-parsed). Prefix such cells
     with an apostrophe so they import as literal text."""
-    if isinstance(cell, str) and cell[:1] in ("=", "+", "-", "@", "\t", "\r"):
+    # Test the value with leading whitespace/quotes stripped — Excel ignores
+    # those before deciding a cell is a formula.
+    if isinstance(cell, str) and cell.lstrip(" \t\r\n\"'")[:1] in ("=", "+", "-", "@"):
         return "'" + cell
     return cell
 
