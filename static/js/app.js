@@ -252,7 +252,7 @@ const ROUTES = {
 
 function buildNav() {
   const section = SECTION_OF[(location.hash.replace(/^#\//, "").split("/")[0]) || "dashboard"];
-  const sub = location.hash.replace(/^#/, "");
+  const sub = location.hash;   // keep the leading '#' so it matches child hrefs (e.g. "#/recipes")
   $("#nav").innerHTML = NAV.map((n) => {
     const active = n.tab === section;
     let html = `<a class="nav-link ${active ? "active" : ""}" href="${esc(n.href)}">
@@ -335,6 +335,12 @@ $("#theme-toggle").addEventListener("click", () => {
   applyThemeToggleIcon();
 });
 applyThemeToggleIcon();
+// In follow-OS mode the CSS @media rule recolors surfaces on a live OS switch,
+// but the JS-driven <meta theme-color> and the toggle glyph would go stale until
+// a reload — refresh them when the OS preference changes.
+try {
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyThemeToggleIcon);
+} catch (e) {}
 
 function loading() { view().innerHTML = '<div class="spinner"></div>'; }
 

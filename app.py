@@ -67,7 +67,7 @@ def _too_large(_e):
 
 @app.errorhandler(HTTPException)
 def _json_http_error(e):
-    # Every error matches the {"error": ...} shape the SPA expects (abort(404),
+    # Every error matches the {"error": ...} shape the SPA expects (abort(404, description="Not found."),
     # a malformed-JSON 400, etc.), not Werkzeug's default HTML page.
     return jsonify({"error": e.description}), e.code
 
@@ -163,12 +163,17 @@ def _resolve_location():
     h = request.headers.get("X-Location-Id")
     if not h:
         return
+    # int() accepts arbitrarily large values, but SQLite raises OverflowError
+    # (not ValueError) when binding anything outside signed-64-bit — keep the DB
+    # lookup inside the guard so a junk/oversized header falls back to the default
+    # store instead of 500ing every endpoint via this before_request hook.
     try:
         lid = int(h)
-    except (TypeError, ValueError):
+        row = db.get_db().execute(
+            "SELECT 1 FROM locations WHERE id=? AND archived=0", (lid,)).fetchone()
+    except (TypeError, ValueError, OverflowError):
         return
-    if db.get_db().execute(
-            "SELECT 1 FROM locations WHERE id=? AND archived=0", (lid,)).fetchone():
+    if row:
         g.location_override = lid
 
 
@@ -230,7 +235,7 @@ def uploaded(name):
         "SELECT 1 FROM invoices WHERE image_path=? AND location_id IS ?",
         (name, db.active_location_id()),
     ).fetchone():
-        abort(404)
+        abort(404, description="Not found.")
     return send_from_directory(UPLOAD_DIR, name)
 
 
@@ -456,7 +461,7 @@ def invoice_get(inv_id):
     row = db_.execute("SELECT * FROM invoices WHERE id=? AND location_id IS ?",
                       (inv_id, db.active_location_id())).fetchone()
     if not row:
-        abort(404)
+        abort(404, description="Not found.")
     items = db_.execute(
         "SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY id", (inv_id,)
     ).fetchall()
@@ -474,7 +479,7 @@ def invoice_delete(inv_id):
     row = db_.execute("SELECT image_path FROM invoices WHERE id=? AND location_id IS ?",
                       (inv_id, loc)).fetchone()
     if not row:
-        abort(404)
+        abort(404, description="Not found.")
     # Which SKUs does this invoice touch? Capture before the cascade so we can
     # recompute their last price afterward (deleting the newest delivery must not
     # strand a now-wrong "last price" on the vendor item).
@@ -505,7 +510,7 @@ def invoice_update(inv_id):
     if not database.execute(
         "SELECT 1 FROM invoices WHERE id=? AND location_id IS ?", (inv_id, loc)
     ).fetchone():
-        abort(404)
+        abort(404, description="Not found.")
     vendor = _s(d.get("vendor"))
     inv_date = _s(d.get("invoice_date"))
     database.execute(
@@ -583,7 +588,7 @@ def inventory_update(item_id):
     cur = db.get_db().execute(
         f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
     if cur.rowcount == 0:
-        abort(404)
+        abort(404, description="Not found.")
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -594,7 +599,7 @@ def inventory_delete(item_id):
         "UPDATE inventory_items SET archived=1 WHERE id=? AND location_id IS ?",
         (item_id, db.active_location_id()))
     if cur.rowcount == 0:
-        abort(404)
+        abort(404, description="Not found.")
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -761,7 +766,7 @@ def vendor_get(vid):
     v = db_.execute("SELECT * FROM vendors WHERE id=? AND location_id IS ?",
                     (vid, db.active_location_id())).fetchone()
     if not v:
-        abort(404)
+        abort(404, description="Not found.")
     out = dict(v)
     invoices = db_.execute(
         "SELECT id, invoice_date, invoice_number, category, total FROM invoices "
@@ -795,7 +800,7 @@ def vendor_update(vid):
     cur = db.get_db().execute(
         f"UPDATE vendors SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
     if cur.rowcount == 0:
-        abort(404)
+        abort(404, description="Not found.")
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -806,7 +811,7 @@ def vendor_delete(vid):
         "UPDATE vendors SET archived=1 WHERE id=? AND location_id IS ?",
         (vid, db.active_location_id()))
     if cur.rowcount == 0:
-        abort(404)
+        abort(404, description="Not found.")
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -960,7 +965,7 @@ def product_new_item_accept(vid):
     cur = db.get_db().execute(
         f"UPDATE vendor_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
     if cur.rowcount == 0:
-        abort(404)
+        abort(404, description="Not found.")
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -974,7 +979,7 @@ def product_get(pid):
         "WHERE p.id=? AND p.location_id IS ?", (pid, db.active_location_id()),
     ).fetchone()
     if not row:
-        abort(404)
+        abort(404, description="Not found.")
     out = dict(row)
     out["purchase_history"] = [dict(r) for r in d.execute(
         "SELECT inv.invoice_date, inv.vendor, ii.qty, ii.unit, ii.unit_cost, ii.total "
@@ -998,7 +1003,7 @@ def product_update(pid):
         cur = db.get_db().execute(
             f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
         if cur.rowcount == 0:
-            abort(404)
+            abort(404, description="Not found.")
         db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -1009,7 +1014,7 @@ def product_delete(pid):
         "UPDATE inventory_items SET archived=1 WHERE id=? AND location_id IS ?",
         (pid, db.active_location_id()))
     if cur.rowcount == 0:
-        abort(404)
+        abort(404, description="Not found.")
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -1074,7 +1079,7 @@ def vendor_item_update(vid):
         cur = db.get_db().execute(
             f"UPDATE vendor_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
         if cur.rowcount == 0:
-            abort(404)
+            abort(404, description="Not found.")
         db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -1085,7 +1090,7 @@ def vendor_item_delete(vid):
         "UPDATE vendor_items SET archived=1 WHERE id=? AND location_id IS ?",
         (vid, db.active_location_id()))
     if cur.rowcount == 0:
-        abort(404)
+        abort(404, description="Not found.")
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -1242,7 +1247,7 @@ def recipe_create():
 def recipe_get(rid):
     r = recipes.cost(rid)          # location-scoped; None when foreign/missing
     if r is None:
-        abort(404)
+        abort(404, description="Not found.")
     return jsonify(r)
 
 
@@ -1254,7 +1259,7 @@ def recipe_update(rid):
     if not database.execute(
         "SELECT 1 FROM recipes WHERE id=? AND location_id IS ?", (rid, loc)
     ).fetchone():
-        abort(404)
+        abort(404, description="Not found.")
     database.execute(
         "UPDATE recipes SET name=?, menu_price=?, yield_qty=?, notes=? "
         "WHERE id=? AND location_id IS ?",
@@ -1275,7 +1280,7 @@ def recipe_delete(rid):
         (rid, db.active_location_id()),
     )
     if cur.rowcount == 0:
-        abort(404)
+        abort(404, description="Not found.")
     database.commit()
     return jsonify({"ok": True})
 
@@ -1427,10 +1432,14 @@ def _f(v, default=None):
 
 
 def _i(v, default=None):
+    # Bound to signed-64-bit: an id outside that range binds fine to int() but
+    # raises OverflowError when SQLite binds it, turning the intended 400/NULL-drop
+    # into a 500. Clamp it out here so every id-coercion path stays robust.
     try:
-        return int(v)
+        n = int(v)
     except (TypeError, ValueError):
         return default
+    return n if -(2 ** 63) <= n < 2 ** 63 else default
 
 
 def _s(v):

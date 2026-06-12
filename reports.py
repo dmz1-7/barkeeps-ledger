@@ -63,16 +63,19 @@ def category_report(start, end, vendor=None, status=None, search=None):
             f"GROUP BY invoice_id, category_id",
             inv_ids,
         ):
-            cell[(r["invoice_id"], r["category_id"])] = _r(r["amt"])
+            cell[(r["invoice_id"], r["category_id"])] = r["amt"] or 0.0
 
     # Deflate each invoice's cells to the pre-tax basis (so a tax-inclusive
-    # invoice doesn't inflate COGS), consistent with cogs.purchases.
+    # invoice doesn't inflate COGS), consistent with cogs.purchases. Carry the
+    # raw deflated floats through and let money.to_cents do the SINGLE rounding
+    # below — an intermediate _r() here would make grand_total drift from the
+    # Controllable P&L, which deflates line-by-line straight to cents.
     line_sum = {}
     for (iid, _cid), amt in cell.items():
         line_sum[iid] = line_sum.get(iid, 0.0) + amt
     factor = {inv["id"]: pretax_factor(inv["subtotal"], inv["total"],
                                             line_sum.get(inv["id"], 0.0)) for inv in invs}
-    cell = {k: _r(v * factor.get(k[0], 1.0)) for k, v in cell.items()}
+    cell = {k: v * factor.get(k[0], 1.0) for k, v in cell.items()}
 
     # id 0 = an "Uncategorized" column for line items with category_id NULL, so
     # their spend is counted in column_totals/grand_total (otherwise the Category
@@ -85,8 +88,8 @@ def category_report(start, end, vendor=None, status=None, search=None):
         cells = {}
         for cid in col_ids:
             amt = cell.get((inv["id"], None if cid == 0 else cid), 0.0)
-            cells[cid] = amt
             col_cents[cid] += money.to_cents(amt)
+            cells[cid] = round(amt, 2)   # display rounding only; totals use cents
         rows.append({**dict(inv), "cells": cells})
 
     cats_out = [dict(c) for c in cats] + [
