@@ -1588,6 +1588,12 @@ class AuthGateCoverage(Base):
         r = self.client.get("/api/invoices", headers={"Authorization": "Bearer " + token})
         self.assertEqual(r.status_code, 200)
 
+    def test_token_invalid_after_secret_rotation(self):
+        token = self.client.post("/api/login", json={"password": "secret"}).get_json()["token"]
+        os.environ["APP_SECRET"] = "rotated-secret"   # rotating the signing key voids old tokens
+        r = self.client.get("/api/invoices", headers={"Authorization": "Bearer " + token})
+        self.assertEqual(r.status_code, 401)
+
 
 class GetSalesPagination(Base):
     def test_sums_net_across_pages_and_converts_cents(self):
@@ -2068,6 +2074,126 @@ class ListEndpointScoping(Base):
         self.assertFalse(any(r["name"] == "NYCrecipe" for r in recs))
         self.assertFalse(any(c.get("note") == "NYCcount" for c in counts))
         self.assertFalse(any(v["vendor_item_name"] == "NYCsku" for v in vis))
+
+
+# ============================================================================
+# Fourth audit-fix regression tests (2026-06-12, 4th re-audit)
+# ============================================================================
+
+class NumericColumnCoercion(Base):
+    def test_string_in_numeric_column_does_not_corrupt_or_500(self):
+        pid = self.client.post("/api/products", json={"name": "X", "unit_cost": 1,
+                                                     "par_level": 5}).get_json()["id"]
+        # a string par_level must coerce to NULL/number, not store "abc"
+        self.client.put(f"/api/products/{pid}", json={"par_level": "abc"})
+        with flask_app.app_context():
+            v = get_db().execute("SELECT par_level FROM inventory_items WHERE id=?", (pid,)).fetchone()
+        self.assertNotEqual(v["par_level"], "abc")
+        # and the read path that does arithmetic must not 500
+        self.assertEqual(self.client.get("/api/inventory/order-list").status_code, 200)
+        self.assertEqual(self.client.get("/api/inventory/order-guide").status_code, 200)
+
+
+class LaborBreaks(unittest.TestCase):
+    def _iso(self, base, minutes):
+        return (base + dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_unpaid_break_subtracted_paid_break_kept(self):
+        start = dt.datetime(2026, 6, 1, 18, 0, 0, tzinfo=dt.timezone.utc)
+        shift = {
+            "start_at": self._iso(start, 0), "end_at": self._iso(start, 240),   # 4h
+            "wage": {"hourly_rate": {"amount": 2000}},                          # $20/hr
+            "breaks": [
+                {"start_at": self._iso(start, 60), "end_at": self._iso(start, 90), "is_paid": False},   # 30m unpaid
+                {"start_at": self._iso(start, 120), "end_at": self._iso(start, 135), "is_paid": True},  # 15m paid
+            ],
+        }
+        cost, hours, _ = square_client._shift_cost(shift, 0.0)
+        self.assertAlmostEqual(hours, 3.5, places=2)         # 4h - 0.5h unpaid (paid break kept)
+        self.assertAlmostEqual(cost, 70.0, places=2)         # 3.5h * $20
+
+
+class DailySalesBucketing(Base):
+    def test_orders_bucket_by_business_day_across_5am(self):
+        page = {"orders": [
+            {"closed_at": "2026-06-12T07:00:00Z",   # 03:00 ET -> 06-11 (before 5am)
+             "net_amounts": {"total_money": {"amount": 1180},
+                             "tax_money": {"amount": 100}, "tip_money": {"amount": 80}}},
+            {"closed_at": "2026-06-12T10:00:00Z",   # 06:00 ET -> 06-12
+             "net_amounts": {"total_money": {"amount": 1000}}},
+        ], "cursor": None}
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return page
+
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post", return_value=FakeResp()):
+                res = square_client.get_daily_sales(dt.date(2026, 6, 11), dt.date(2026, 6, 12))
+        self.assertEqual(res.get("2026-06-11"), 10.0)        # 1180-100-80 cents
+        self.assertEqual(res.get("2026-06-12"), 10.0)
+
+
+class BusinessDayAttribution(Base):
+    def test_order_business_day(self):
+        with flask_app.app_context():
+            self.assertEqual(square_client._business_day("2026-06-12T07:00:00Z"), "2026-06-11")
+            self.assertEqual(square_client._business_day("2026-06-12T10:00:00Z"), "2026-06-12")
+            self.assertIsNone(square_client._business_day("garbage"))
+
+
+class UnitFactorParity(unittest.TestCase):
+    """The JS conversion FACTORS must match units.py, not just the alias sets."""
+
+    def _js_factors(self, varname):
+        import re
+        path = os.path.join(os.path.dirname(__file__), "..", "static", "js", "app.js")
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        m = re.search(r"const " + varname + r"\s*=\s*\{(.*?)\};", src)
+        out = {}
+        for k1, k2, val in re.findall(r'(?:"([^"]+)"|([A-Za-z][\w ]*?))\s*:\s*([\d.]+)', m.group(1)):
+            out[(k1 or k2).strip()] = float(val)
+        return out
+
+    def test_volume_weight_count_factors_match(self):
+        for js, py in (("_UNIT_VOL", units._VOLUME), ("_UNIT_WT", units._WEIGHT),
+                       ("_UNIT_CT", units._COUNT)):
+            got = self._js_factors(js)
+            self.assertEqual(set(got), set(py))
+            for k in py:
+                self.assertAlmostEqual(got[k], py[k], places=4, msg=f"{js}[{k}]")
+
+
+class UsageCogsIntervalPerStore(Base):
+    def test_interval_sales_uses_only_active_store(self):
+        # Use a PAST interval so daily_sales_cached serves the seeded cache and
+        # never tries to refresh today/yesterday. Interval = [02-04, 02-15] (12 days).
+        with flask_app.app_context():
+            d = get_db()
+            db.set_setting("square_token", "tok")
+            for day, val in (("2026-02-04", 1000.0), ("2026-02-15", 800.0)):   # opening / closing
+                d.execute("INSERT INTO counts(location_id,taken_at,value) VALUES(1,?,?)",
+                          (f"{day} 12:00:00", val))
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-02-10',700)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',700)", (iid,))
+            for n in range(4, 16):   # 02-04..02-15 = 12 days, DC $100/day, NYC $999/day (ignored)
+                day = f"2026-02-{n:02d}"
+                d.execute("INSERT INTO daily_sales(square_location_id,date,net_sales,fetched_at) "
+                          "VALUES('LNKNR2A7MBB4K',?,100.0,'2020-01-01')", (day,))
+                d.execute("INSERT INTO daily_sales(square_location_id,date,net_sales,fetched_at) "
+                          "VALUES('LS1WRASW8V02R',?,999.0,'2020-01-01')", (day,))
+            d.commit()
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "get_sales",
+                                      return_value={"sales": 5000.0, "orders": 1, "error": None}), \
+                    mock.patch.object(square_client, "get_labor", return_value=dict(_LABOR0)):
+                s = cogs.summary(dt.date(2026, 2, 5), dt.date(2026, 2, 14))
+        self.assertEqual(s["cogs_method"], "usage")
+        self.assertEqual(s["cogs_sales_basis"], "interval")
+        self.assertEqual(s["cogs_sales"], 1200.0)            # DC: 12 days * $100, NOT NYC's $999
 
 
 if __name__ == "__main__":

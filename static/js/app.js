@@ -255,11 +255,11 @@ function buildNav() {
   const sub = location.hash.replace(/^#/, "");
   $("#nav").innerHTML = NAV.map((n) => {
     const active = n.tab === section;
-    let html = `<a class="nav-link ${active ? "active" : ""}" href="${n.href}">
-      <span class="ic">${n.icon}</span><span>${n.label}</span></a>`;
+    let html = `<a class="nav-link ${active ? "active" : ""}" href="${esc(n.href)}">
+      <span class="ic">${esc(n.icon)}</span><span>${esc(n.label)}</span></a>`;
     if (n.children && active) {
       html += `<div class="nav-sub">` + n.children.map((c) =>
-        `<a href="${c.href}" class="${c.href === sub ? "active" : ""}">${c.label}</a>`).join("") + `</div>`;
+        `<a href="${esc(c.href)}" class="${c.href === sub ? "active" : ""}">${esc(c.label)}</a>`).join("") + `</div>`;
     }
     return html;
   }).join("");
@@ -337,7 +337,7 @@ function dataTable(columns, rows, opts = {}) {
   const wrap = el(`<div class="dtable-wrap"></div>`);
   let q = "", sortKey = initialSort ? initialSort.key : null, sortDir = initialSort ? (initialSort.dir || 1) : 1;
   if (search) {
-    const s = el(`<input class="dt-search" placeholder="Search…">`);
+    const s = el(`<input type="search" class="dt-search" aria-label="Search table" placeholder="Search…">`);
     s.addEventListener("input", () => { q = s.value.toLowerCase(); draw(); });
     wrap.appendChild(s);
   }
@@ -520,6 +520,14 @@ async function loadDash() {
         ${bar(d.prime_pct, primeTarget)}
       </div>
     </div>`));
+  if (d.cogs_sales_basis === "interval") {
+    // COGS% is measured over the inventory-count interval (a different span than
+    // the labor/sales range), so Prime% is COGS% + Labor% — it won't equal
+    // Prime$ ÷ Net Sales. Surface the basis so the numbers reconcile.
+    body.appendChild(el(`<div class="note muted">COGS% is measured over your count
+      interval (${money(d.cogs_sales)} of sales), so Prime% = COGS% + Labor% rather than
+      Prime$ ÷ Net Sales.</div>`));
+  }
 
   // Purchases breakdown
   const cats = Object.entries(d.purchases_by_category || {});

@@ -269,9 +269,9 @@ def get_db():
             try:
                 _ensure_columns(conn)
                 conn.commit()
+                _SCHEMA_READY.add(DB_PATH)   # only mark ready if it actually succeeded
             except sqlite3.OperationalError:
-                pass   # table not created yet (first boot) — init_db handles it
-            _SCHEMA_READY.add(DB_PATH)
+                pass   # table not created yet (first boot) — init_db handles it; retry next request
         g.db = conn
     return g.db
 
@@ -350,8 +350,12 @@ def _predrop_legacy_sales_mix(conn):
     and re-inserted by _restore_legacy_sales_mix (tagged location_id=0, which
     _migrate_locations then maps to the default store)."""
     conn.execute("DROP TABLE IF EXISTS _sales_mix_legacy")
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sales_mix)")}
-    if cols and "location_id" not in cols:
+    info = list(conn.execute("PRAGMA table_info(sales_mix)"))
+    cols = {r["name"] for r in info}
+    # Rebuild if the table predates location_id OR still carries the legacy
+    # DEFAULT 0 on location_id (CREATE IF NOT EXISTS can't drop a column default).
+    legacy_default = any(r["name"] == "location_id" and r["dflt_value"] is not None for r in info)
+    if cols and ("location_id" not in cols or legacy_default):
         conn.execute("ALTER TABLE sales_mix RENAME TO _sales_mix_legacy")
 
 
@@ -361,9 +365,12 @@ def _restore_legacy_sales_mix(conn):
     legacy = {r["name"] for r in conn.execute("PRAGMA table_info(_sales_mix_legacy)")}
     if not legacy:
         return
+    # Preserve real location_ids (the default-rebuild case); fall back to 0 (the
+    # pre-location case) which _migrate_locations/_backfill maps to the default store.
+    loc_expr = "location_id" if "location_id" in legacy else "0"
     conn.execute(
-        "INSERT OR IGNORE INTO sales_mix(location_id, period_start, period_end, category_type, pct) "
-        "SELECT 0, period_start, period_end, category_type, pct FROM _sales_mix_legacy")
+        f"INSERT OR IGNORE INTO sales_mix(location_id, period_start, period_end, category_type, pct) "
+        f"SELECT {loc_expr}, period_start, period_end, category_type, pct FROM _sales_mix_legacy")
     conn.execute("DROP TABLE _sales_mix_legacy")
 
 

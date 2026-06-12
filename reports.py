@@ -69,14 +69,14 @@ def category_report(start, end, vendor=None, status=None, search=None):
     # Report's grand_total silently undershoots the invoice totals and disagrees
     # with the Controllable P&L, which DOES include uncategorized cost).
     col_ids = [c["id"] for c in cats] + [0]
-    col_totals = {cid: 0.0 for cid in col_ids}
+    col_cents = {cid: 0 for cid in col_ids}   # accumulate in integer cents (no float drift)
     rows = []
     for inv in invs:
         cells = {}
         for cid in col_ids:
             amt = cell.get((inv["id"], None if cid == 0 else cid), 0.0)
             cells[cid] = amt
-            col_totals[cid] += amt
+            col_cents[cid] += money.to_cents(amt)
         rows.append({**dict(inv), "cells": cells})
 
     cats_out = [dict(c) for c in cats] + [
@@ -84,8 +84,8 @@ def category_report(start, end, vendor=None, status=None, search=None):
     return {
         "categories": cats_out,
         "rows": rows,
-        "column_totals": {k: _r(v) for k, v in col_totals.items()},
-        "grand_total": _r(sum(col_totals.values())),
+        "column_totals": {k: round(v / 100.0, 2) for k, v in col_cents.items()},
+        "grand_total": round(sum(col_cents.values()) / 100.0, 2),
     }
 
 

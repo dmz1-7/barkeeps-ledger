@@ -162,7 +162,9 @@ def _resolve_location():
 # WINDOW too. That's acceptable here because the tunnel URL is itself a random
 # per-install secret (the real first line of defense); the window is short so
 # any lockout self-heals in seconds, and a brief stall under active attack is
-# preferable to leaving guessing unthrottled. In-memory (single-process).
+# preferable to leaving guessing unthrottled. The counter is in PROCESS memory,
+# so deploy with a single worker (the README notes this) — multiple workers each
+# keep their own budget and weaken the limit.
 _LOGIN_FAILS = []          # recent wrong-guess timestamps (monotonic)
 _LOGIN_MAX = 10            # wrong guesses per window before requests are 429'd
 _LOGIN_WINDOW = 60         # seconds (short, so a throttle self-heals quickly)
@@ -536,9 +538,9 @@ def inventory_update(item_id):
               "vendor", "sort_order", "archived"]
     sets, vals = [], []
     for key in fields:
-        if key in d and _scalar(d[key]):
+        if key in d:
             sets.append(f"{key}=?")
-            vals.append(d[key])
+            vals.append(_coerce_col(key, d[key]))
     if not sets:
         return jsonify({"ok": True})
     vals += [item_id, db.active_location_id()]
@@ -803,8 +805,8 @@ def category_update(cid):
     d = body()
     sets, vals = [], []
     for key in ("name", "category_type", "sort_order", "archived"):
-        if key in d and _scalar(d[key]):
-            sets.append(f"{key}=?"); vals.append(d[key])
+        if key in d:
+            sets.append(f"{key}=?"); vals.append(_coerce_col(key, d[key]))
     if sets:
         vals.append(cid)
         db.get_db().execute(f"UPDATE categories SET {','.join(sets)} WHERE id=?", vals)
@@ -853,12 +855,12 @@ def product_create():
     name = _s(d.get("name"))
     if not name:
         return jsonify({"error": "Product needs a name."}), 400
-    cols = [k for k in _PRODUCT_COLS if k in d and _scalar(d[k])]   # drop list/dict values
+    cols = [k for k in _PRODUCT_COLS if k in d]
     if "name" not in cols:
         cols.append("name")
     cols.append("location_id")
-    vals = [name if k == "name" else (db.active_location_id() if k == "location_id" else d.get(k))
-            for k in cols]
+    vals = [name if k == "name" else (db.active_location_id() if k == "location_id"
+                                      else _coerce_col(k, d.get(k))) for k in cols]
     placeholders = ",".join("?" * len(cols))
     cur = db.get_db().execute(
         f"INSERT INTO inventory_items({','.join(cols)}) VALUES({placeholders})", vals
@@ -946,8 +948,8 @@ def product_update(pid):
     d = body()
     sets, vals = [], []
     for key in _PRODUCT_COLS:
-        if key in d and _scalar(d[key]):
-            sets.append(f"{key}=?"); vals.append(d[key])
+        if key in d:
+            sets.append(f"{key}=?"); vals.append(_coerce_col(key, d[key]))
     if sets:
         vals += [pid, db.active_location_id()]
         cur = db.get_db().execute(
@@ -1019,9 +1021,9 @@ def vendor_item_update(vid):
     sets, vals = [], []
     for key in ("vendor_name", "vendor_item_name", "product_id", "category_id",
                 "item_code", "order_guide", "status", "archived"):
-        if key in d and _scalar(d[key]):
+        if key in d:
             # a product_id must belong to the active store (else drop to NULL)
-            val = _own_product_id(db.get_db(), d[key]) if key == "product_id" else d[key]
+            val = _own_product_id(db.get_db(), d[key]) if key == "product_id" else _coerce_col(key, d[key])
             sets.append(f"{key}=?"); vals.append(val)
     if sets:
         vals += [vid, db.active_location_id()]
@@ -1244,7 +1246,7 @@ def alerts_price_increases():
     except (TypeError, ValueError):
         min_pct = 10.0
     try:
-        days = int(request.args.get("days", 30))
+        days = max(1, min(int(request.args.get("days", 30)), 3650))   # clamp: a huge value overflows date math
     except (TypeError, ValueError):
         days = 30
     return jsonify(reports.price_alerts(lookback_days=days, min_pct=min_pct))
@@ -1397,6 +1399,25 @@ def _scalar(v):
     """True if v is safe to bind to sqlite (not a list/dict). Used to drop
     structured values from dynamic UPDATE column lists instead of 500ing."""
     return not isinstance(v, (list, dict))
+
+
+# Columns whose values must be numeric — coerce on dynamic write so a string
+# like "abc" can't land in a REAL/INTEGER column (SQLite won't reject it) and
+# later 500 every read that does arithmetic on it.
+_NUM_REAL = {"par_level", "last_count", "unit_cost", "size_qty", "menu_price",
+             "yield_qty", "pct"}
+_NUM_INT = {"sort_order", "on_inventory", "tax_exempt", "archived", "category_id",
+            "product_id", "vendor_id", "order_guide"}
+
+
+def _coerce_col(key, v):
+    """Bind-safe value for a dynamic column: numeric columns -> _f/_i (NULL on
+    junk), text columns -> dropped to None if a list/dict."""
+    if key in _NUM_REAL:
+        return _f(v)
+    if key in _NUM_INT:
+        return _i(v)
+    return v if _scalar(v) else None
 
 
 def _recompute_last_price(database, vi_ids):

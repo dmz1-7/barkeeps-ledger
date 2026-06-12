@@ -96,7 +96,9 @@ In the Forge: **Opus** (default) is the most accurate reader; **Sonnet** and
 - The bundled server is Flask's development server — fine for one bar on a LAN.
   To put it on the open internet, run it behind a reverse proxy (Caddy/nginx with
   HTTPS) and **set `APP_PASSWORD`**. A production WSGI server is optional:
-  `pip install gunicorn` then `gunicorn -b 0.0.0.0:8088 app:app`.
+  `pip install gunicorn` then `gunicorn -b 0.0.0.0:8088 app:app` — **use a single
+  worker** (`-w 1`, the default), since the login rate-limit keeps its counter in
+  process memory and is bypassed if requests fan out across workers.
 - It's a normal Python app — drop it on any VPS, a Raspberry Pi, or run it in
   Docker (a `python:3.12-slim` base, `pip install -r requirements.txt`, `CMD
   ["python","app.py"]`).
