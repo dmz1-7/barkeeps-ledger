@@ -26,6 +26,7 @@ except ImportError:
 from flask import (
     Flask, g, jsonify, request, send_from_directory, abort, Response,
 )
+from werkzeug.exceptions import HTTPException
 
 import db
 import cogs
@@ -51,6 +52,27 @@ app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
 def _too_large(_e):
     mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
     return jsonify({"error": f"That file is too large (max {mb} MB)."}), 413
+
+
+@app.errorhandler(HTTPException)
+def _json_http_error(e):
+    # Every error matches the {"error": ...} shape the SPA expects (abort(404),
+    # a malformed-JSON 400, etc.), not Werkzeug's default HTML page.
+    return jsonify({"error": e.description}), e.code
+
+
+@app.errorhandler(Exception)
+def _json_error(_e):
+    # Last resort for an uncaught bug: a clean JSON 500, never an HTML traceback.
+    return jsonify({"error": "Internal server error."}), 500
+
+
+def body():
+    """request.json coerced to a dict. A syntactically valid but non-object body
+    (a JSON array/string/number) would pass `or {}` and then AttributeError on
+    .get(); this returns {} for anything that isn't an object."""
+    j = request.get_json(silent=True)
+    return j if isinstance(j, dict) else {}
 
 
 # --- auth -------------------------------------------------------------------
@@ -125,35 +147,21 @@ def _resolve_location():
         g.location_override = lid
 
 
-# Throttle passcode guessing. In-memory (single-process dev server).
-_LOGIN_FAILS = {}          # key -> [recent failure timestamps]
-_LOGIN_MAX = 8             # per-key failures per window before lockout
-_LOGIN_GLOBAL_MAX = 50     # backstop across ALL keys, immune to header spoofing
+# Throttle passcode guessing. Behind the Cloudflare tunnel every client connects
+# from loopback, so a per-IP key is meaningless and CF-Connecting-IP is
+# attacker-spoofable — we throttle GLOBALLY instead. Crucially the password is
+# checked first and a CORRECT passcode always succeeds and clears the counter,
+# so a flood of wrong guesses throttles the attacker (429) without ever locking
+# out the real owner. In-memory (single-process dev server).
+_LOGIN_FAILS = []          # recent wrong-guess timestamps (monotonic)
+_LOGIN_MAX = 10            # wrong guesses per window before further wrong guesses 429
 _LOGIN_WINDOW = 300        # seconds
 
 
-def _login_key():
-    # Trust the forwarded client IP only from the tunnel's loopback origin; on a
-    # direct connection CF-Connecting-IP is attacker-controlled, so key on the
-    # real socket address (which can't be spoofed per request) instead.
-    addr = request.remote_addr or "?"
-    if addr in ("127.0.0.1", "::1"):
-        return request.headers.get("CF-Connecting-IP") or addr
-    return addr
-
-
-def _login_blocked(key):
+def _login_recent_fails():
     now = time.monotonic()
-    total = 0
-    for k in list(_LOGIN_FAILS.keys()):          # sweep: prune stale, count live
-        live = [t for t in _LOGIN_FAILS[k] if now - t < _LOGIN_WINDOW]
-        if live:
-            _LOGIN_FAILS[k] = live
-            total += len(live)
-        else:
-            del _LOGIN_FAILS[k]                   # don't leak keys for one-off IPs
-    # Per-key lockout, plus a global cap that a rotated CF-Connecting-IP can't escape.
-    return len(_LOGIN_FAILS.get(key, [])) >= _LOGIN_MAX or total >= _LOGIN_GLOBAL_MAX
+    _LOGIN_FAILS[:] = [t for t in _LOGIN_FAILS if now - t < _LOGIN_WINDOW]
+    return len(_LOGIN_FAILS)
 
 
 @app.post("/api/login")
@@ -161,15 +169,14 @@ def login():
     expected = _expected_token()
     if expected is None:
         return jsonify({"token": "", "auth_required": False})
-    key = _login_key()
-    if _login_blocked(key):
-        return jsonify({"error": "Too many attempts. Wait a few minutes and try again."}), 429
-    pw = (request.json or {}).get("password", "")
+    pw = body().get("password", "")
     token = _token_for(pw)
     if hmac.compare_digest(token, expected):
-        _LOGIN_FAILS.pop(key, None)   # clear on success
+        _LOGIN_FAILS.clear()          # right passcode always wins -> owner is never locked out
         return jsonify({"token": token, "auth_required": True})
-    _LOGIN_FAILS.setdefault(key, []).append(time.monotonic())
+    _LOGIN_FAILS.append(time.monotonic())
+    if _login_recent_fails() > _LOGIN_MAX:
+        return jsonify({"error": "Too many attempts. Wait a few minutes and try again."}), 429
     return jsonify({"error": "Wrong passcode."}), 401
 
 
@@ -194,6 +201,10 @@ def health():
 
 @app.get("/api/config")
 def config():
+    # Readable pre-login ONLY so the SPA can learn whether a passcode is required;
+    # don't disclose store/Square/target config to an unauthenticated caller.
+    if not _authed():
+        return jsonify({"auth_required": True, "square_configured": False})
     s = db.all_settings()
     loc_row = db.get_db().execute(
         "SELECT square_location_id FROM locations WHERE id=?", (db.active_location_id(),)
@@ -216,10 +227,10 @@ def config():
 
 @app.post("/api/settings")
 def save_settings():
-    data = request.json or {}
+    data = body()
     for key in ("square_env", "square_version", "ai_model", "target_cogs_pct",
                 "target_labor_pct", "default_hourly_wage", "price_alert_pct"):
-        if key in data:
+        if key in data and _scalar(data[key]):
             db.set_setting(key, data[key])
     # The Square location is per-store now: write it onto the active store's row,
     # not a shared global setting.
@@ -229,8 +240,9 @@ def save_settings():
         db.get_db().commit()
     # Only persist a Square token if a non-blank one is supplied (so the UI can
     # show "set" without round-tripping the secret).
-    if data.get("square_token"):
-        db.set_setting("square_token", data["square_token"].strip())
+    tok = _s(data.get("square_token"))
+    if tok:
+        db.set_setting("square_token", tok)
     return jsonify({"ok": True})
 
 
@@ -269,7 +281,7 @@ def active_location_set():
     per-request X-Location-Id header is the real source of truth; the Square id is
     now resolved per-request from the locations table, so nothing is mirrored into
     a shared global setting here."""
-    loc_id = (request.json or {}).get("location_id")
+    loc_id = body().get("location_id")
     row = db.get_db().execute(
         "SELECT id FROM locations WHERE id=? AND archived=0", (loc_id,)
     ).fetchone()
@@ -316,8 +328,9 @@ def invoice_parse():
 
 @app.post("/api/invoices")
 def invoice_create():
-    d = request.json or {}
-    items = d.get("line_items") or []
+    d = body()
+    items = d.get("line_items")
+    items = items if isinstance(items, list) else []
     vendor = d.get("vendor", "")
     inv_date = d.get("invoice_date", "")
     database = db.get_db()
@@ -343,6 +356,8 @@ def invoice_create():
     )
     inv_id = cur.lastrowid
     for it in items:
+        if not isinstance(it, dict):
+            continue
         vi_id, cat_id = _resolve_vendor_item(database, vendor, inv_date, it, loc)
         database.execute(
             "INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, "
@@ -419,7 +434,7 @@ def invoice_update(inv_id):
     """Edit a saved invoice: update the header and replace its line items. Lets
     the owner fix an AI misparse instead of delete-and-re-enter. The image and
     the original AI audit (raw_json) are preserved."""
-    d = request.json or {}
+    d = body()
     database = db.get_db()
     loc = db.active_location_id()
     if not database.execute(
@@ -437,9 +452,12 @@ def invoice_update(inv_id):
          d.get("notes", ""), d.get("status", "closed"), d.get("payment_account"),
          inv_id, loc),
     )
-    items = d.get("line_items") or []
+    items = d.get("line_items")
+    items = items if isinstance(items, list) else []
     database.execute("DELETE FROM invoice_items WHERE invoice_id=?", (inv_id,))
     for it in items:
+        if not isinstance(it, dict):
+            continue
         vi_id, cat_id = _resolve_vendor_item(database, vendor, inv_date, it, loc)
         database.execute(
             "INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, "
@@ -466,11 +484,11 @@ def inventory_list():
 
 @app.post("/api/inventory")
 def inventory_create():
-    d = request.json or {}
+    d = body()
     cur = db.get_db().execute(
         "INSERT INTO inventory_items(location_id, name, category, unit, par_level, last_count, "
         "unit_cost, vendor, sort_order) VALUES(?,?,?,?,?,?,?,?,?)",
-        (db.active_location_id(), d.get("name", "").strip(), d.get("category", "other"), d.get("unit", ""),
+        (db.active_location_id(), _s(d.get("name")), d.get("category", "other"), d.get("unit", ""),
          _f(d.get("par_level"), 0), _f(d.get("last_count"), 0),
          _f(d.get("unit_cost"), 0), d.get("vendor", ""), _i(d.get("sort_order"), 0)),
     )
@@ -480,12 +498,12 @@ def inventory_create():
 
 @app.put("/api/inventory/<int:item_id>")
 def inventory_update(item_id):
-    d = request.json or {}
+    d = body()
     fields = ["name", "category", "unit", "par_level", "last_count", "unit_cost",
               "vendor", "sort_order", "archived"]
     sets, vals = [], []
     for key in fields:
-        if key in d:
+        if key in d and _scalar(d[key]):
             sets.append(f"{key}=?")
             vals.append(d[key])
     if not sets:
@@ -535,8 +553,9 @@ def order_guide():
 def count_save():
     """Record a walk-around count. lines: [{item_id, qty}]. Updates last_count
     and snapshots the total inventory $ value for usage-based COGS."""
-    d = request.json or {}
-    lines = d.get("lines") or []
+    d = body()
+    lines = d.get("lines")
+    lines = lines if isinstance(lines, list) else []
     database = db.get_db()
     loc = db.active_location_id()
     cur = database.execute(
@@ -546,6 +565,8 @@ def count_save():
     count_id = cur.lastrowid
     total_value = 0.0
     for ln in lines:
+        if not isinstance(ln, dict):
+            continue
         item = database.execute(
             "SELECT unit_cost FROM inventory_items WHERE id=? AND location_id IS ?",
             (ln.get("item_id"), loc),
@@ -642,8 +663,8 @@ def vendor_summary():
 
 @app.post("/api/vendors")
 def vendor_create():
-    d = request.json or {}
-    name = (d.get("name") or "").strip()
+    d = body()
+    name = _s(d.get("name"))
     if not name:
         return jsonify({"error": "Vendor needs a name."}), 400
     cur = db.get_db().execute(
@@ -682,12 +703,12 @@ def vendor_get(vid):
 
 @app.put("/api/vendors/<int:vid>")
 def vendor_update(vid):
-    d = request.json or {}
+    d = body()
     fields = ["name", "contact_name", "phone", "email", "account_number",
               "order_days", "notes", "archived"]
     sets, vals = [], []
     for key in fields:
-        if key in d:
+        if key in d and _scalar(d[key]):
             sets.append(f"{key}=?")
             vals.append(d[key])
     if not sets:
@@ -725,9 +746,9 @@ def category_list():
 
 @app.post("/api/categories")
 def category_create():
-    d = request.json or {}
-    name = (d.get("name") or "").strip()
-    ctype = (d.get("category_type") or "").strip()
+    d = body()
+    name = _s(d.get("name"))
+    ctype = _s(d.get("category_type"))
     if not name or not ctype:
         return jsonify({"error": "Category needs a name and a type."}), 400
     try:
@@ -743,10 +764,10 @@ def category_create():
 
 @app.put("/api/categories/<int:cid>")
 def category_update(cid):
-    d = request.json or {}
+    d = body()
     sets, vals = [], []
     for key in ("name", "category_type", "sort_order", "archived"):
-        if key in d:
+        if key in d and _scalar(d[key]):
             sets.append(f"{key}=?"); vals.append(d[key])
     if sets:
         vals.append(cid)
@@ -792,8 +813,8 @@ def product_list():
 
 @app.post("/api/products")
 def product_create():
-    d = request.json or {}
-    name = (d.get("name") or "").strip()
+    d = body()
+    name = _s(d.get("name"))
     if not name:
         return jsonify({"error": "Product needs a name."}), 400
     cols = [k for k in _PRODUCT_COLS if k in d]
@@ -832,12 +853,15 @@ def product_purchase_report():
 
 @app.get("/api/products/new-items")
 def product_new_items():
+    loc = db.active_location_id()
     rows = db.get_db().execute(
         "SELECT vi.*, c.name AS category_name, c.category_type, p.name AS product_name "
         "FROM vendor_items vi LEFT JOIN categories c ON c.id = vi.category_id "
-        "LEFT JOIN inventory_items p ON p.id = vi.product_id "
+        # scope the product join to this store so a stray cross-store product_id
+        # can't surface another store's product name
+        "LEFT JOIN inventory_items p ON p.id = vi.product_id AND p.location_id IS ? "
         "WHERE vi.archived=0 AND vi.status='new' AND vi.location_id IS ? "
-        "ORDER BY vi.created_at DESC, vi.id DESC", (db.active_location_id(),)
+        "ORDER BY vi.created_at DESC, vi.id DESC", (loc, loc)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -845,12 +869,12 @@ def product_new_items():
 @app.post("/api/products/new-items/<int:vid>/accept")
 def product_new_item_accept(vid):
     """Mark a new vendor item reviewed; optionally set its category/product."""
-    d = request.json or {}
+    d = body()
     sets, vals = ["status='reviewed'"], []
     if "category_id" in d:
-        sets.append("category_id=?"); vals.append(d["category_id"])
+        sets.append("category_id=?"); vals.append(_i(d.get("category_id")))
     if "product_id" in d:
-        sets.append("product_id=?"); vals.append(d["product_id"])
+        sets.append("product_id=?"); vals.append(_i(d.get("product_id")))
     vals += [vid, db.active_location_id()]
     cur = db.get_db().execute(
         f"UPDATE vendor_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
@@ -883,10 +907,10 @@ def product_get(pid):
 
 @app.put("/api/products/<int:pid>")
 def product_update(pid):
-    d = request.json or {}
+    d = body()
     sets, vals = [], []
     for key in _PRODUCT_COLS:
-        if key in d:
+        if key in d and _scalar(d[key]):
             sets.append(f"{key}=?"); vals.append(d[key])
     if sets:
         vals += [pid, db.active_location_id()]
@@ -913,8 +937,9 @@ def product_delete(pid):
 
 @app.get("/api/vendor-items")
 def vendor_item_list():
+    loc = db.active_location_id()
     where = ["vi.archived = 0", "vi.location_id IS ?"]
-    params = [db.active_location_id()]
+    params = [loc]
     if request.args.get("status"):
         where.append("vi.status = ?"); params.append(request.args["status"])
     if request.args.get("category"):
@@ -927,17 +952,18 @@ def vendor_item_list():
     rows = db.get_db().execute(
         "SELECT vi.*, c.name AS category_name, c.category_type, p.name AS product_name "
         "FROM vendor_items vi LEFT JOIN categories c ON c.id = vi.category_id "
-        "LEFT JOIN inventory_items p ON p.id = vi.product_id "
+        # scope the product join to this store (the join param precedes the WHERE params)
+        "LEFT JOIN inventory_items p ON p.id = vi.product_id AND p.location_id IS ? "
         f"WHERE {' AND '.join(where)} ORDER BY vi.vendor_item_name COLLATE NOCASE LIMIT 5000",
-        params,
+        [loc] + params,
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
 @app.post("/api/vendor-items")
 def vendor_item_create():
-    d = request.json or {}
-    name = (d.get("vendor_item_name") or "").strip()
+    d = body()
+    name = _s(d.get("vendor_item_name"))
     if not name:
         return jsonify({"error": "Vendor item needs a name."}), 400
     cur = db.get_db().execute(
@@ -952,11 +978,11 @@ def vendor_item_create():
 
 @app.put("/api/vendor-items/<int:vid>")
 def vendor_item_update(vid):
-    d = request.json or {}
+    d = body()
     sets, vals = [], []
     for key in ("vendor_name", "vendor_item_name", "product_id", "category_id",
                 "item_code", "order_guide", "status", "archived"):
-        if key in d:
+        if key in d and _scalar(d[key]):
             sets.append(f"{key}=?"); vals.append(d[key])
     if sets:
         vals += [vid, db.active_location_id()]
@@ -1000,7 +1026,14 @@ def sales_mix_get():
 @app.put("/api/sales-mix")
 def sales_mix_put():
     start, end = cogs.parse_range(request.args.get("start"), request.args.get("end"))
-    mix = (request.json or {}).get("mix") or {}
+    mix = body().get("mix") or {}
+    if not isinstance(mix, dict):
+        abort(400, description="mix must be an object of category_type -> percent.")
+    # A mix that doesn't total ~100% would make Income (sales x mix%) not reconcile
+    # to total sales and skew every per-type COGS%. Allow all-zero (clearing).
+    total = round(sum(_f(mix[t], 0) or 0 for t in reports.CATEGORY_TYPES if t in mix), 2)
+    if total and abs(total - 100) > 0.5:
+        abort(400, description=f"Sales mix must total 100% (got {total}%).")
     database = db.get_db()
     loc = db.active_location_id()
     for ctype in reports.CATEGORY_TYPES:
@@ -1094,7 +1127,7 @@ def _save_recipe_items(database, rid, items):
         database.execute(
             "INSERT INTO recipe_items(recipe_id, product_id, qty, unit, note) VALUES(?,?,?,?,?)",
             (rid, pid, _f(it.get("qty"), 0) or 0,
-             (it.get("unit") or "").strip(), (it.get("note") or "").strip()),
+             _s(it.get("unit")), _s(it.get("note"))),
         )
 
 
@@ -1105,12 +1138,12 @@ def recipe_list():
 
 @app.post("/api/recipes")
 def recipe_create():
-    d = request.json or {}
+    d = body()
     database = db.get_db()
     cur = database.execute(
         "INSERT INTO recipes(location_id, name, menu_price, yield_qty, notes) "
         "VALUES(?,?,?,?,?)",
-        (db.active_location_id(), (d.get("name") or "").strip(),
+        (db.active_location_id(), _s(d.get("name")),
          money.normalize(d.get("menu_price")) or 0, _f(d.get("yield_qty"), 1) or 1,
          d.get("notes", "")),
     )
@@ -1130,7 +1163,7 @@ def recipe_get(rid):
 
 @app.put("/api/recipes/<int:rid>")
 def recipe_update(rid):
-    d = request.json or {}
+    d = body()
     database = db.get_db()
     loc = db.active_location_id()
     if not database.execute(
@@ -1140,7 +1173,7 @@ def recipe_update(rid):
     database.execute(
         "UPDATE recipes SET name=?, menu_price=?, yield_qty=?, notes=? "
         "WHERE id=? AND location_id IS ?",
-        ((d.get("name") or "").strip(), money.normalize(d.get("menu_price")) or 0,
+        (_s(d.get("name")), money.normalize(d.get("menu_price")) or 0,
          _f(d.get("yield_qty"), 1) or 1, d.get("notes", ""), rid, loc),
     )
     database.execute("DELETE FROM recipe_items WHERE recipe_id=?", (rid,))
@@ -1230,8 +1263,8 @@ def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, tot
 
     Strong signal: same vendor + a non-empty invoice number. Fallback when there's
     no number: same vendor + date + total (within a cent)."""
-    vendor = (vendor or "").strip()
-    num = (invoice_number or "").strip()
+    vendor = _s(vendor)
+    num = _s(invoice_number)
     cols = "id, vendor, invoice_date, invoice_number, total"
     if vendor and num:
         row = database.execute(
@@ -1258,7 +1291,7 @@ def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, tot
 def _resolve_vendor_item(database, vendor, inv_date, line, loc):
     """Match an invoice line to a vendor_item within this location (creating a
     'new' one if unseen), refresh its last price/date, return (vi_id, cat_id)."""
-    name = (line.get("name") or "").strip()
+    name = _s(line.get("name"))
     cat_id = _category_id_by_name(database, line.get("category"))
     price = _f(line.get("unit_cost"))
     if not name:
@@ -1310,6 +1343,18 @@ def _i(v, default=None):
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+def _s(v):
+    """A trimmed string from request JSON. A non-string (number/list/dict) becomes
+    "" rather than crashing on .strip() — name-required checks then reject it."""
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _scalar(v):
+    """True if v is safe to bind to sqlite (not a list/dict). Used to drop
+    structured values from dynamic UPDATE column lists instead of 500ing."""
+    return not isinstance(v, (list, dict))
 
 
 with app.app_context():

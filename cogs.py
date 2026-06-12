@@ -7,6 +7,8 @@ Two ways to read COGS are offered:
 """
 import datetime as dt
 
+from flask import abort
+
 from db import get_db, get_setting, active_location_id
 import square_client
 
@@ -87,8 +89,8 @@ def summary(start, end):
     sales = sales_info["sales"]
     labor = labor_info["labor"]
 
-    def pct(part):
-        return round(part / sales * 100, 1) if sales else None
+    def pct_of(part, den):
+        return round(part / den * 100, 1) if den else None
 
     # Usage-based COGS when two counts genuinely bracket the period. The swing is
     # measured between the counts, so purchases must be summed over the SAME
@@ -97,6 +99,7 @@ def summary(start, end):
     end_inv = _inventory_value_near(end, prefer_before=False)
     usage_cogs = None
     usage_period = None
+    b_date = e_date = None
     if begin and end_inv:
         b_date = dt.date.fromisoformat(begin["taken_at"][:10])
         e_date = dt.date.fromisoformat(end_inv["taken_at"][:10])
@@ -119,6 +122,20 @@ def summary(start, end):
     cogs_amount = usage_cogs if usage_cogs is not None else purch["total"]
     cogs_method = "usage" if usage_cogs is not None else "purchases"
 
+    # COGS% must divide by sales over the SAME span as the cost. Purchases-based
+    # COGS spans the requested range (use `sales`). Usage-based COGS spans the
+    # count interval [b_date, e_date], which can sit well outside the range, so
+    # divide it by THAT interval's sales (cheap via the daily cache) rather than
+    # range sales — otherwise COGS%/prime% are inflated by up to ~2x. Labor%
+    # always stays on the requested-range sales.
+    cogs_sales = sales
+    if (usage_cogs is not None and square_client.is_configured()
+            and (b_date != start or e_date != end)):
+        daily = square_client.daily_sales_cached(b_date, e_date)
+        interval_sales = round(sum(daily.values()), 2) if daily else 0.0
+        if interval_sales:
+            cogs_sales = interval_sales
+
     prime = round(cogs_amount + labor, 2)
 
     return {
@@ -128,7 +145,7 @@ def summary(start, end):
         "sales_error": sales_info.get("error"),
         "labor": labor,
         "labor_hours": labor_info.get("hours", 0),
-        "labor_pct": pct(labor),
+        "labor_pct": pct_of(labor, sales),
         "labor_error": labor_info.get("error"),
         "labor_warning": labor_info.get("warning"),
         "unwaged_hours": labor_info.get("unwaged_hours", 0),
@@ -137,11 +154,12 @@ def summary(start, end):
         "purchases_by_category": purch["by_category"],
         "invoice_count": purch["count"],
         "cogs": cogs_amount,
-        "cogs_pct": pct(cogs_amount),
+        "cogs_pct": pct_of(cogs_amount, cogs_sales),
         "cogs_method": cogs_method,
+        "cogs_sales": cogs_sales,
         "usage_period": usage_period,
         "prime": prime,
-        "prime_pct": pct(prime),
+        "prime_pct": pct_of(prime, cogs_sales),
         "begin_inventory": begin,
         "end_inventory": end_inv,
         "targets": {
@@ -159,14 +177,20 @@ def _num(v, default):
         return default
 
 
+def _iso_or_400(s):
+    """Parse an ISO date or abort 400 — query-string dates are user input and a
+    bad value must be a clean 400, not an unhandled 500."""
+    try:
+        return dt.date.fromisoformat(s)
+    except (TypeError, ValueError):
+        abort(400, description=f"Invalid date: {s!r} (expected YYYY-MM-DD).")
+
+
 def parse_range(start_s, end_s):
     """Parse ISO date strings; default to the current week (Mon-today)."""
     today = square_client.business_today()
-    if start_s:
-        start = dt.date.fromisoformat(start_s)
-    else:
-        start = today - dt.timedelta(days=today.weekday())
-    end = dt.date.fromisoformat(end_s) if end_s else today
+    start = _iso_or_400(start_s) if start_s else today - dt.timedelta(days=today.weekday())
+    end = _iso_or_400(end_s) if end_s else today
     if end < start:
         start, end = end, start
     return start, end

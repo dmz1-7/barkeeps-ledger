@@ -64,18 +64,25 @@ def category_report(start, end, vendor=None, status=None, search=None):
         ):
             cell[(r["invoice_id"], r["category_id"])] = _r(r["amt"])
 
-    col_totals = {c["id"]: 0.0 for c in cats}
+    # id 0 = an "Uncategorized" column for line items with category_id NULL, so
+    # their spend is counted in column_totals/grand_total (otherwise the Category
+    # Report's grand_total silently undershoots the invoice totals and disagrees
+    # with the Controllable P&L, which DOES include uncategorized cost).
+    col_ids = [c["id"] for c in cats] + [0]
+    col_totals = {cid: 0.0 for cid in col_ids}
     rows = []
     for inv in invs:
         cells = {}
-        for c in cats:
-            amt = cell.get((inv["id"], c["id"]), 0.0)
-            cells[c["id"]] = amt
-            col_totals[c["id"]] += amt
+        for cid in col_ids:
+            amt = cell.get((inv["id"], None if cid == 0 else cid), 0.0)
+            cells[cid] = amt
+            col_totals[cid] += amt
         rows.append({**dict(inv), "cells": cells})
 
+    cats_out = [dict(c) for c in cats] + [
+        {"id": 0, "name": "Uncategorized", "category_type": "Uncategorized", "sort_order": 9999}]
     return {
-        "categories": [dict(c) for c in cats],
+        "categories": cats_out,
         "rows": rows,
         "column_totals": {k: _r(v) for k, v in col_totals.items()},
         "grand_total": _r(sum(col_totals.values())),
@@ -289,7 +296,11 @@ def price_movers(start, end):
             }
         if g["new_price"] is None and r["price"] is not None:
             g["new_price"] = r["price"]      # newest-first, so this is the latest price
-        g["qty"] += (r["qty"] or 0)
+        # Impact = price delta x qty bought AT the new price; only count units at
+        # the latest price so units bought earlier in the window at the old price
+        # don't get charged the full delta (which overstated impact).
+        if r["price"] == g["new_price"]:
+            g["qty"] += (r["qty"] or 0)
 
     pvkey = _PM_VENDOR.format(vi="v", inv="xi")
     pnkey = _PM_NAME.format(vi="v", ii="x")
