@@ -411,10 +411,12 @@ async function loadDash() {
     pb.appendChild(el(`<div class="kv"><span>${typePill(c)}</span><b>${money(amt)}</b></div>`)));
   body.appendChild(card);
 
-  if (d.begin_inventory && d.end_inventory) {
-    body.appendChild(el(`<div class="note">Usage-based COGS using counts:
-      open ${money(d.begin_inventory.value)} + buys ${money(d.purchases)} &minus;
-      close ${money(d.end_inventory.value)} = <b>${money(d.cogs)}</b>.</div>`));
+  if (d.usage_period) {
+    const up = d.usage_period;
+    body.appendChild(el(`<div class="note">Usage-based COGS, measured between your counts
+      (${up.start} &rarr; ${up.end}): open ${money(d.begin_inventory.value)} + buys
+      ${money(up.purchases)} &minus; close ${money(d.end_inventory.value)} = <b>${money(d.cogs)}</b>.
+      <span class="muted">&ldquo;Buys&rdquo; covers the count window, not just the selected range.</span></div>`));
   } else {
     body.appendChild(el(`<div class="note muted">Tip: take an inventory count at the start and end of a
       period and COGS switches from purchases-based to true usage-based automatically.</div>`));

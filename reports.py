@@ -239,49 +239,80 @@ def sales_report(today=None):
 
 # --- Price Movers -----------------------------------------------------------
 
+#   A line's stable SKU identity = (vendor, vendor-item name). It's derivable
+#   whether or not the line is currently linked to a vendor_item, because
+#   vendor_items are keyed on exactly those fields — so re-running the importer
+#   (which deletes vendor_items and nulls invoice_items.vendor_item_id) doesn't
+#   change the identity, and a product can't split across "linked" and "unlinked"
+#   groups. It also never merges across vendors. We deliberately key on the vendor
+#   item name (not the raw line name + unit), since that IS the model's notion of a
+#   distinct pack/SKU. (A vendor_item renamed across the window/prior boundary is
+#   intentionally treated as a new identity — that move won't be reported.)
+#   NULLIF(...,'') so a blank vendor_item field falls back to the invoice line too,
+#   keeping linked and unlinked lines for the same product on the same key.
+_PM_VENDOR = "lower(TRIM(COALESCE(NULLIF(TRIM({vi}.vendor_name), ''), {inv}.vendor, '')))"
+_PM_NAME = "lower(TRIM(COALESCE(NULLIF(TRIM({vi}.vendor_item_name), ''), {ii}.name, '')))"
+
+
 def price_movers(start, end):
-    """Items whose unit cost moved between the prior price and the latest price
-    in the window, ranked by dollar impact (delta x qty bought in window)."""
+    """Items whose unit cost moved between the prior price and the latest price in
+    the window, ranked by dollar impact (delta x qty bought in window)."""
     db = get_db()
     loc = active_location_id()
-    # Latest price + qty within the window, per item name.
-    in_window = db.execute(
-        "SELECT ii.name AS name, ii.category_id AS category_id, "
-        "       SUM(ii.qty) AS qty, "
-        "       (SELECT unit_cost FROM invoice_items x JOIN invoices xi ON xi.id=x.invoice_id "
-        "        WHERE x.name = ii.name AND xi.location_id IS ? "
-        "          AND xi.invoice_date >= ? AND xi.invoice_date <= ? "
-        "        ORDER BY xi.invoice_date DESC, x.id DESC LIMIT 1) AS new_price "
+    vkey = _PM_VENDOR.format(vi="vi", inv="inv")
+    nkey = _PM_NAME.format(vi="vi", ii="ii")
+    rows = db.execute(
+        f"SELECT {vkey} AS vkey, {nkey} AS nkey, "
+        "       COALESCE(vi.vendor_name, inv.vendor) AS vendor, "
+        "       COALESCE(vi.vendor_item_name, ii.name) AS name, "
+        "       ii.unit_cost AS price, ii.qty AS qty, ii.category_id AS cat "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
+        "LEFT JOIN vendor_items vi ON vi.id = ii.vendor_item_id "
         "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ? "
-        "  AND ii.name IS NOT NULL AND TRIM(ii.name) <> '' "
-        "GROUP BY ii.name",
-        (loc, start.isoformat(), end.isoformat(), loc, start.isoformat(), end.isoformat()),
+        "  AND TRIM(COALESCE(vi.vendor_item_name, ii.name, '')) <> '' "
+        "ORDER BY inv.invoice_date DESC, ii.id DESC",   # newest first -> first price seen is latest
+        (loc, start.isoformat(), end.isoformat()),
     ).fetchall()
 
+    groups = {}
+    for r in rows:
+        g = groups.get((r["vkey"], r["nkey"]))
+        if g is None:
+            groups[(r["vkey"], r["nkey"])] = g = {
+                "vendor": r["vendor"], "name": r["name"], "cat": r["cat"],
+                "new_price": None, "qty": 0.0,
+            }
+        if g["new_price"] is None and r["price"] is not None:
+            g["new_price"] = r["price"]      # newest-first, so this is the latest price
+        g["qty"] += (r["qty"] or 0)
+
+    pvkey = _PM_VENDOR.format(vi="v", inv="xi")
+    pnkey = _PM_NAME.format(vi="v", ii="x")
     cat_names = {r["id"]: r["name"] for r in db.execute("SELECT id, name FROM categories")}
     movers = []
-    for r in in_window:
-        prior = db.execute(
-            "SELECT unit_cost FROM invoice_items x JOIN invoices xi ON xi.id=x.invoice_id "
-            "WHERE x.name=? AND xi.location_id IS ? AND xi.invoice_date < ? AND x.unit_cost IS NOT NULL "
-            "ORDER BY xi.invoice_date DESC, x.id DESC LIMIT 1",
-            (r["name"], loc, start.isoformat()),
-        ).fetchone()
-        old_price = prior["unit_cost"] if prior else None
-        new_price = r["new_price"]
-        if old_price is None or new_price is None or old_price == new_price:
+    for (gv, gn), g in groups.items():
+        new_price, qty = g["new_price"], (g["qty"] or 0)
+        if new_price is None or not qty:     # no price or nothing bought -> no signal
             continue
-        qty = r["qty"] or 0
-        impact = _r((new_price - old_price) * qty)
+        prior = db.execute(
+            "SELECT x.unit_cost AS p FROM invoice_items x JOIN invoices xi ON xi.id=x.invoice_id "
+            "LEFT JOIN vendor_items v ON v.id = x.vendor_item_id "
+            "WHERE xi.location_id IS ? AND xi.invoice_date < ? AND x.unit_cost IS NOT NULL "
+            f"  AND {pvkey} = ? AND {pnkey} = ? "
+            "ORDER BY xi.invoice_date DESC, x.id DESC LIMIT 1",
+            (loc, start.isoformat(), gv, gn),
+        ).fetchone()
+        old_price = prior["p"] if prior else None
+        if old_price is None or old_price == new_price:
+            continue
         movers.append({
-            "name": r["name"],
-            "category": cat_names.get(r["category_id"], "Uncategorized"),
+            "name": g["name"],
+            "category": cat_names.get(g["cat"], "Uncategorized"),
             "old_price": _r(old_price),
             "new_price": _r(new_price),
             "change_pct": _r((new_price - old_price) / old_price * 100) if old_price else None,
             "qty": _r(qty),
-            "impact": impact,
+            "impact": _r((new_price - old_price) * qty),
         })
 
     movers.sort(key=lambda m: -abs(m["impact"]))

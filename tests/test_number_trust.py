@@ -28,6 +28,8 @@ os.environ["APP_SECRET"] = ""
 
 import db                       # noqa: E402
 import square_client            # noqa: E402
+import cogs                     # noqa: E402
+import reports                  # noqa: E402
 from db import get_db           # noqa: E402
 import app as app_module        # noqa: E402
 
@@ -437,6 +439,113 @@ class UploadCap(Base):
             self.assertIn("too large", r.get_json()["error"])
         finally:
             flask_app.config["MAX_CONTENT_LENGTH"] = old
+
+
+class UsageCogs(Base):
+    def _count(self, date_str, value):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO counts(location_id, taken_at, value) VALUES(1, ?, ?)",
+                             (f"{date_str} 12:00:00", value))
+            get_db().commit()
+
+    def _invoice(self, date_str, total):
+        with flask_app.app_context():
+            get_db().execute(
+                "INSERT INTO invoices(location_id, vendor, invoice_date, total) VALUES(1,'V',?,?)",
+                (date_str, total))
+            get_db().commit()
+
+    def test_usage_cogs_uses_count_interval_not_requested_range(self):
+        self._count("2026-05-30", 1000.0)   # opening (just before the period)
+        self._count("2026-07-02", 800.0)    # closing (just after the period)
+        self._invoice("2026-05-20", 999.0)  # before interval  -> excluded
+        self._invoice("2026-05-30", 999.0)  # ON opening date  -> excluded (exclusive lower bound)
+        self._invoice("2026-06-15", 500.0)  # in interval
+        self._invoice("2026-07-02", 200.0)  # ON closing date  -> included
+        self._invoice("2026-07-05", 999.0)  # after interval   -> excluded
+        with flask_app.app_context():
+            s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(s["cogs_method"], "usage")
+        self.assertEqual(s["usage_period"],
+                         {"start": "2026-05-30", "end": "2026-07-02", "purchases": 700.0})
+        self.assertEqual(s["cogs"], 900.0)  # 1000 + 700 - 800
+
+    def test_far_counts_fall_back_to_purchases(self):
+        self._count("2026-01-01", 1000.0)   # outside the 14-day grace window
+        self._count("2026-12-31", 800.0)
+        self._invoice("2026-06-15", 500.0)
+        with flask_app.app_context():
+            s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(s["cogs_method"], "purchases")
+        self.assertIsNone(s["usage_period"])
+        self.assertEqual(s["cogs"], 500.0)
+
+
+class PriceMovers(Base):
+    def _vi(self, vendor, name):
+        with flask_app.app_context():
+            cur = get_db().execute(
+                "INSERT INTO vendor_items(location_id, vendor_name, vendor_item_name, status) "
+                "VALUES(1, ?, ?, 'reviewed')", (vendor, name))
+            get_db().commit()
+            return cur.lastrowid
+
+    def _line(self, date_str, vendor, name, price, qty, vi=None):
+        # Real model: the line name IS the vendor-item name. vi links it (or None).
+        with flask_app.app_context():
+            d = get_db()
+            inv = d.execute(
+                "INSERT INTO invoices(location_id, vendor, invoice_date, total) VALUES(1,?,?,?)",
+                (vendor, date_str, price * qty)).lastrowid
+            d.execute(
+                "INSERT INTO invoice_items(invoice_id, name, unit_cost, qty, vendor_item_id) "
+                "VALUES(?,?,?,?,?)", (inv, name, price, qty, vi))
+            d.commit()
+
+    def _movers(self):
+        with flask_app.app_context():
+            return reports.price_movers(dt.date(2026, 6, 1), dt.date(2026, 6, 30))["movers"]
+
+    def test_pack_sizes_do_not_merge(self):
+        # Different packs are distinct vendor-item names -> distinct keys.
+        self._line("2026-05-15", "Acme", "Tito 750ml", 20.0, 3)
+        self._line("2026-05-15", "Acme", "Tito 1.75L", 40.0, 2)
+        self._line("2026-06-10", "Acme", "Tito 750ml", 25.0, 4)   # moved 20 -> 25
+        self._line("2026-06-10", "Acme", "Tito 1.75L", 40.0, 1)   # unchanged
+        movers = self._movers()
+        self.assertEqual(len(movers), 1)
+        m = movers[0]
+        self.assertEqual((m["old_price"], m["new_price"], m["qty"], m["impact"]), (20.0, 25.0, 4.0, 20.0))
+
+    def test_move_survives_vendor_item_wipe(self):
+        # The importer wipes vendor_items (nulling vendor_item_id) then new lines get
+        # fresh ids; the (vendor, name) identity must still tie prior to current.
+        self._line("2026-05-15", "Acme", "Tito 750ml", 20.0, 3, vi=None)        # prior, unlinked
+        vi = self._vi("Acme", "Tito 750ml")
+        self._line("2026-06-10", "Acme", "Tito 750ml", 25.0, 4, vi=vi)          # window, linked
+        movers = self._movers()
+        self.assertEqual(len(movers), 1)
+        self.assertEqual((movers[0]["old_price"], movers[0]["new_price"]), (20.0, 25.0))
+
+    def test_blank_vendor_item_name_falls_back_to_invoice_line(self):
+        # A vendor_item created with a blank vendor must still unify with an
+        # unlinked prior line for the same product (NULLIF -> invoice vendor).
+        self._line("2026-05-15", "Acme", "Tito 750ml", 20.0, 3, vi=None)
+        vi = self._vi("", "Tito 750ml")                       # blank vendor_name
+        self._line("2026-06-10", "Acme", "Tito 750ml", 25.0, 4, vi=vi)
+        movers = self._movers()
+        self.assertEqual(len(movers), 1)
+        self.assertEqual((movers[0]["old_price"], movers[0]["new_price"]), (20.0, 25.0))
+
+    def test_same_name_different_vendor_not_merged(self):
+        self._line("2026-05-15", "Acme", "Vodka", 20.0, 2)
+        self._line("2026-05-15", "Beta", "Vodka", 30.0, 2)
+        self._line("2026-06-10", "Acme", "Vodka", 25.0, 3)   # Acme moved
+        self._line("2026-06-10", "Beta", "Vodka", 30.0, 3)   # Beta unchanged
+        movers = self._movers()
+        self.assertEqual(len(movers), 1)                     # not a cross-vendor merge
+        self.assertEqual(movers[0]["name"], "Vodka")
+        self.assertEqual((movers[0]["old_price"], movers[0]["new_price"]), (20.0, 25.0))
 
 
 if __name__ == "__main__":

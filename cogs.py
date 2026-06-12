@@ -36,6 +36,24 @@ def purchases(start, end):
     return {"by_category": by_cat, "total": round(total_row["amt"], 2), "count": total_row["n"]}
 
 
+def _purchase_total(loc, after_date, through_date):
+    """Sum invoice grand totals received after `after_date` through `through_date`
+    (both ISO dates). Used for usage-COGS, where purchases must span the SAME
+    interval as the bracketing counts (the opening count subsumes its own day's
+    deliveries, so the lower bound is exclusive)."""
+    row = get_db().execute(
+        "SELECT COALESCE(SUM(total),0) AS amt FROM invoices "
+        "WHERE location_id IS ? AND invoice_date > ? AND invoice_date <= ?",
+        (loc, after_date, through_date),
+    ).fetchone()
+    return round(row["amt"], 2)
+
+
+# How far a bracketing count may sit outside the requested period and still be
+# trusted for usage-based COGS (else the inventory swing covers a different span).
+USAGE_GRACE_DAYS = 14
+
+
 def _inventory_value_near(target, prefer_before=True):
     """Find the inventory count nearest `target` date and return its $ value.
 
@@ -72,12 +90,31 @@ def summary(start, end):
     def pct(part):
         return round(part / sales * 100, 1) if sales else None
 
-    # Usage-based COGS when counts bracket the period.
+    # Usage-based COGS when two counts genuinely bracket the period. The swing is
+    # measured between the counts, so purchases must be summed over the SAME
+    # interval (not the requested range) or the figure is internally inconsistent.
     begin = _inventory_value_near(start, prefer_before=True)
     end_inv = _inventory_value_near(end, prefer_before=False)
     usage_cogs = None
-    if begin and end_inv and begin["taken_at"] != end_inv["taken_at"]:
-        usage_cogs = round(begin["value"] + purch["total"] - end_inv["value"], 2)
+    usage_period = None
+    if begin and end_inv:
+        b_date = dt.date.fromisoformat(begin["taken_at"][:10])
+        e_date = dt.date.fromisoformat(end_inv["taken_at"][:10])
+        # The usage cost spans [b_date, e_date] but cogs_pct divides by sales over
+        # the requested range, so keep the count interval close to that range
+        # (each end within grace AND total overshoot <= the range length). This
+        # also rejects usage for very short ranges, where it's meaningless.
+        slop = (start - b_date).days + (e_date - end).days
+        brackets = (b_date < e_date
+                    and (start - b_date).days <= USAGE_GRACE_DAYS
+                    and (e_date - end).days <= USAGE_GRACE_DAYS
+                    and slop <= (end - start).days)
+        if brackets:
+            interval_purch = _purchase_total(
+                active_location_id(), b_date.isoformat(), e_date.isoformat())
+            usage_cogs = round(begin["value"] + interval_purch - end_inv["value"], 2)
+            usage_period = {"start": b_date.isoformat(), "end": e_date.isoformat(),
+                            "purchases": interval_purch}
 
     cogs_amount = usage_cogs if usage_cogs is not None else purch["total"]
     cogs_method = "usage" if usage_cogs is not None else "purchases"
@@ -99,6 +136,7 @@ def summary(start, end):
         "cogs": cogs_amount,
         "cogs_pct": pct(cogs_amount),
         "cogs_method": cogs_method,
+        "usage_period": usage_period,
         "prime": prime,
         "prime_pct": pct(prime),
         "begin_inventory": begin,
