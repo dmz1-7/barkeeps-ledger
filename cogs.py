@@ -166,8 +166,12 @@ def summary(start, end):
     # always stays on the requested-range sales.
     cogs_sales = sales
     cogs_sales_basis = "range"
-    if (usage_cogs is not None and square_client.is_configured()
-            and (b_date != start or e_date != end)):
+    # Run the interval alignment whenever usage COGS is in play — even when the
+    # counts land exactly on the range endpoints. Purchases are summed over the
+    # HALF-OPEN (b_date, e_date] (the opening-count day is excluded), so the sales
+    # denominator must drop that day's sales too; skipping this in the coincident
+    # b_date==start / e_date==end case would leave COGS% understated by one day.
+    if usage_cogs is not None and square_client.is_configured():
         daily = square_client.daily_sales_cached(b_date, e_date)
         # Only trust the interval basis when the cache covers EVERY day of the
         # interval — a cold/partial cache would understate the denominator and

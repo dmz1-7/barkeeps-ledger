@@ -29,6 +29,7 @@ os.environ["LEDGER_DB"] = tempfile.mktemp(suffix=".db")
 os.environ["APP_PASSWORD"] = ""
 os.environ["APP_SECRET"] = ""
 os.environ["ALLOW_OPEN"] = "1"   # tests run open; acknowledge the fail-closed guard
+os.environ["LEDGER_DISABLE_BACKUPS"] = "1"   # don't spawn the backup thread/snapshot under tests
 
 import db                       # noqa: E402
 import square_client            # noqa: E402
@@ -2763,6 +2764,191 @@ class InvoiceEditPriceDownAndRemoval(Base):
             "total": 5, "line_items": self._gin(name="Tonic", price=5.0)})
         with flask_app.app_context():
             self.assertEqual(self._price(), 20.0)   # reverts to the surviving older delivery
+
+
+# ============================================================================
+# Tenth audit-fix regression tests (2026-06-12, 10th re-audit)
+# ============================================================================
+
+class UsageCogsCoincidentDay(Base):
+    def test_counts_on_range_endpoints_still_align_the_denominator(self):
+        """When the bracketing counts land exactly on start/end, COGS still
+        excludes the opening-count day's purchases, so the sales denominator must
+        drop that day too — the interval basis must run, not fall back to range."""
+        with flask_app.app_context():
+            d = get_db()
+            for day, val in (("2026-06-01", 1000.0), ("2026-06-30", 800.0)):
+                d.execute("INSERT INTO counts(location_id,taken_at,value) VALUES(1,?,?)",
+                          (f"{day} 12:00:00", val))
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-15',500)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',500)", (iid,))
+            d.commit()
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "get_sales",
+                                      return_value={"sales": 3000.0, "orders": 1, "error": None}), \
+                    mock.patch.object(square_client, "get_labor", return_value=dict(_LABOR0)), \
+                    mock.patch.object(square_client, "daily_sales_cached",
+                                      side_effect=lambda b, e: {(b + dt.timedelta(days=i)).isoformat(): 100.0
+                                                                for i in range((e - b).days + 1)}):
+                s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(s["cogs_sales_basis"], "interval")   # not skipped to "range"
+        self.assertEqual(s["cogs_sales"], 2900.0)             # 29 days x 100 (06-01 dropped)
+        self.assertEqual(s["cogs"], 700.0)                    # 1000 + 500 - 800
+
+
+class AuthNonAsciiHeader(AuthGateCoverage):
+    def test_non_ascii_bearer_is_clean_401_not_500(self):
+        r = self.client.get("/api/invoices",
+                            headers={"Authorization": "Bearer \udcff".encode("latin-1", "replace")
+                                     .decode("latin-1")})
+        self.assertEqual(r.status_code, 401)
+
+
+class BackupStartup(Base):
+    def test_backup_creates_snapshot(self):
+        with flask_app.app_context():
+            snap = db.backup()
+        self.assertTrue(snap and os.path.exists(snap))
+
+    def test_start_backups_respects_disable_env(self):
+        bdir = os.path.join(os.path.dirname(db.DB_PATH), "backups")
+        before = set(glob.glob(os.path.join(bdir, "ledger-*.db")))
+        app_module._start_backups()                 # LEDGER_DISABLE_BACKUPS=1 in the test env
+        after = set(glob.glob(os.path.join(bdir, "ledger-*.db")))
+        self.assertEqual(before, after)             # no snapshot taken, no thread spawned
+
+
+class SquareLocationUniqueIndex(Base):
+    def test_duplicate_square_id_blocked_at_db_level(self):
+        with flask_app.app_context():
+            d = get_db()
+            with self.assertRaises(sqlite3.IntegrityError):
+                d.execute("INSERT INTO locations(name, square_location_id) VALUES('X', ?)", (_DC_SQID,))
+                d.commit()
+
+    def test_blank_square_ids_do_not_collide(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("INSERT INTO locations(name, square_location_id) VALUES('A','')")
+            d.execute("INSERT INTO locations(name, square_location_id) VALUES('B','')")
+            d.execute("INSERT INTO locations(name, square_location_id) VALUES('C', NULL)")
+            d.commit()   # partial index ignores blanks/NULLs — no collision
+
+
+class CategoryValidation(Base):
+    def _wine_id(self):
+        return get_db().execute("SELECT id FROM categories WHERE name='Wine'").fetchone()["id"]
+
+    def test_create_rejects_unknown_type(self):
+        r = self.client.post("/api/categories", json={"name": "Weird", "category_type": "Bogus"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("type", r.get_json()["error"].lower())
+
+    def test_update_malformed_type_is_precise_not_unique_collision(self):
+        with flask_app.app_context():
+            cid = self._wine_id()
+        r = self.client.put(f"/api/categories/{cid}", json={"category_type": ["x"]})
+        self.assertEqual(r.status_code, 400)
+        self.assertNotIn("already exists", r.get_json()["error"])   # not mislabeled
+
+
+class MalformedJsonBody(Base):
+    def test_corrupt_json_is_400_not_silent_blank_row(self):
+        r = self.client.post("/api/invoices", data="{not json",
+                             content_type="application/json")
+        self.assertEqual(r.status_code, 400)
+
+
+class SalesMixNumericGuard(Base):
+    def test_non_numeric_percent_rejected(self):
+        r = self.client.put("/api/sales-mix?start=2026-06-01&end=2026-06-30",
+                            json={"mix": {"Food": ["oops"]}})
+        self.assertEqual(r.status_code, 400)
+
+
+class SalesMixTenantIsolation(Base):
+    def test_store1_mix_not_visible_to_store2(self):
+        q = "?start=2026-06-01&end=2026-06-30"
+        self.client.put("/api/sales-mix" + q, json={"mix": {"Food": 100}},
+                        headers={"X-Location-Id": "1"})
+        m1 = self.client.get("/api/sales-mix" + q, headers={"X-Location-Id": "1"}).get_json()["mix"]
+        m2 = self.client.get("/api/sales-mix" + q, headers={"X-Location-Id": "2"}).get_json()["mix"]
+        self.assertEqual(m1["Food"], 100)
+        self.assertEqual(m2["Food"], 0)        # store 2's P&L never sees store 1's mix
+
+
+class InvoiceAiNonFinite(Base):
+    def test_num_rejects_inf_and_nan(self):
+        self.assertIsNone(invoice_ai._num(float("inf")))
+        self.assertIsNone(invoice_ai._num(float("nan")))
+
+    def test_normalize_strips_non_finite_totals(self):
+        out = invoice_ai._normalize({"total": float("inf"),
+                                     "line_items": [{"name": "x", "total": float("nan"),
+                                                     "unit_cost": float("inf"), "category": "Wine"}]})
+        self.assertIsNone(out["total"])
+        self.assertIsNone(out["line_items"][0]["total"])
+        self.assertIsNone(out["line_items"][0]["unit_cost"])
+
+
+class DailySalesStaleZeroProtect(Base):
+    def test_successful_fetch_omitting_yesterday_keeps_cached_value(self):
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            today = square_client.business_today()
+            yesterday = (today - dt.timedelta(days=1)).isoformat()
+            d = get_db()
+            d.execute("INSERT INTO daily_sales(square_location_id,date,net_sales,fetched_at) "
+                      "VALUES(?,?,?, '2020-01-01')", (_DC_SQID, yesterday, 500.0))
+            d.commit()
+            # a SUCCESSFUL fetch that returns only today (yesterday omitted)
+            with mock.patch.object(square_client, "get_daily_sales",
+                                   return_value={today.isoformat(): 40.0}):
+                res = square_client.daily_sales_cached(today - dt.timedelta(days=1), today)
+        self.assertEqual(res[yesterday], 500.0)        # real cached value not zeroed
+
+
+class SquareMalformed200(Base):
+    def _resp(self, payload):
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return payload
+        return FakeResp()
+
+    def test_null_order_is_treated_as_zero(self):
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post",
+                                   return_value=self._resp({"orders": [None], "cursor": None})):
+                info = square_client.get_sales(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertEqual(info["sales"], 0.0)
+        self.assertIsNone(info["error"])               # null order is benign, not an error
+
+    def test_wrong_shape_fails_soft_with_error(self):
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            bad = {"orders": [{"net_amounts": ["not", "a", "dict"]}], "cursor": None}
+            with mock.patch.object(square_client.requests, "post", return_value=self._resp(bad)):
+                info = square_client.get_sales(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertEqual(info["sales"], 0.0)
+        self.assertIsNotNone(info["error"])            # malformed 200 -> soft error, not 500
+
+
+class SquareHttpErrorMessage(Base):
+    def test_err_extracts_square_error_detail(self):
+        import requests as rq
+
+        class FakeResp:
+            status_code = 401
+            def json(self): return {"errors": [{"detail": "Bad token", "code": "UNAUTHORIZED"}]}
+        e = rq.exceptions.HTTPError("401 Client Error")
+        e.response = FakeResp()
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post", side_effect=e):
+                info = square_client.get_sales(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertEqual(info["error"], "Bad token")   # the response-body branch of _err
 
 
 if __name__ == "__main__":

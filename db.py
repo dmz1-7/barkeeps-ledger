@@ -209,6 +209,14 @@ CREATE INDEX IF NOT EXISTS idx_invoices_loc_date ON invoices(location_id, invoic
 CREATE INDEX IF NOT EXISTS idx_inv_loc_arch ON inventory_items(location_id, archived);
 CREATE INDEX IF NOT EXISTS idx_counts_loc_taken ON counts(location_id, taken_at);
 CREATE INDEX IF NOT EXISTS idx_items_invitem ON invoice_items(inventory_item_id);
+-- Case-insensitive product-name seek: the MarginEdge importer resolves each row
+-- with lower(name)=lower(?) per store; without this, every row is a per-store scan.
+CREATE INDEX IF NOT EXISTS idx_inv_loc_name ON inventory_items(location_id, name COLLATE NOCASE);
+-- One Square location id per store: the daily_sales cache + sales/labor pulls key
+-- on it, so a duplicate would cross-pollute two stores' Square numbers. Partial,
+-- so blank/NULL ids (stores not yet wired to Square) don't collide.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_locations_sqid ON locations(square_location_id)
+    WHERE COALESCE(square_location_id, '') <> '';
 """
 
 # The seeded two-level taxonomy: {Category Type: [Category, ...]}. Order within
