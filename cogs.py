@@ -140,11 +140,15 @@ def summary(start, end):
     if (usage_cogs is not None and square_client.is_configured()
             and (b_date != start or e_date != end)):
         daily = square_client.daily_sales_cached(b_date, e_date)
-        interval_sales = round(sum(daily.values()), 2) if daily else 0.0
-        if interval_sales:
-            cogs_sales, cogs_sales_basis = interval_sales, "interval"
+        # Only trust the interval basis when the cache covers EVERY day of the
+        # interval — a cold/partial cache would understate the denominator and
+        # inflate COGS%. Otherwise fall back to range sales.
+        interval_days = (e_date - b_date).days + 1
+        if daily and len(daily) == interval_days:
+            interval_sales = round(sum(daily.values()), 2)
+            if interval_sales:
+                cogs_sales, cogs_sales_basis = interval_sales, "interval"
 
-    prime = round(cogs_amount + labor, 2)
     # COGS% and Labor% use different sales bases in usage mode (interval vs
     # range), so prime% is the SUM of the two correctly-based percentages — never
     # prime/cogs_sales, which would divide range labor by interval sales.
@@ -152,6 +156,13 @@ def summary(start, end):
     labor_pct = pct_of(labor, sales)
     prime_pct = (round(cogs_pct + labor_pct, 1)
                  if cogs_pct is not None and labor_pct is not None else None)
+    # Prime DOLLARS: in interval mode scale COGS to the requested range before
+    # adding (range-spanning) labor, so the figure isn't an interval+range mash.
+    prime_cogs = cogs_amount
+    if cogs_sales_basis == "interval":
+        range_days = (end - start).days + 1
+        prime_cogs = money.normalize(cogs_amount * range_days / interval_days) or 0.0
+    prime = round((prime_cogs or 0.0) + labor, 2)
 
     return {
         "range": {"start": start.isoformat(), "end": end.isoformat()},
