@@ -2951,5 +2951,178 @@ class SquareHttpErrorMessage(Base):
         self.assertEqual(info["error"], "Bad token")   # the response-body branch of _err
 
 
+# ============================================================================
+# Eleventh audit-fix regression tests (2026-06-12, 11th re-audit)
+# ============================================================================
+
+class NameRequiredOnUpdate(Base):
+    def _product(self):
+        return self.client.post("/api/products", json={"name": "Gin"}).get_json()["id"]
+
+    def test_null_or_list_name_is_400_not_500(self):
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute("INSERT INTO inventory_items(location_id,name) VALUES(1,'X')").lastrowid
+            vid = d.execute("INSERT INTO vendors(location_id,name) VALUES(1,'V')").lastrowid
+            d.commit()
+        for path, val in ((f"/api/inventory/{iid}", None), (f"/api/inventory/{iid}", ["x"]),
+                          (f"/api/vendors/{vid}", None), (f"/api/products/{iid}", ["x"])):
+            r = self.client.put(path, json={"name": val})
+            self.assertEqual(r.status_code, 400, f"{path} name={val!r}")
+
+
+class LoginNonStringPassword(AuthGateCoverage):
+    def test_non_string_password_401_and_counts_toward_throttle(self):
+        app_module._LOGIN_FAILS.clear()
+        r = self.client.post("/api/login", json={"password": 123})
+        self.assertEqual(r.status_code, 401)              # not a 500
+        self.assertEqual(len(app_module._LOGIN_FAILS), 1)  # the bad guess was throttled
+        app_module._LOGIN_FAILS.clear()
+
+
+class OpenModeLoopbackGuard(Base):
+    def test_non_loopback_client_blocked_in_open_mode(self):
+        # Base runs open (APP_PASSWORD=""); a non-loopback client must be refused.
+        r = self.client.get("/api/health", environ_overrides={"REMOTE_ADDR": "8.8.8.8"})
+        self.assertEqual(r.status_code, 403)
+
+    def test_loopback_client_allowed_in_open_mode(self):
+        r = self.client.get("/api/health", environ_overrides={"REMOTE_ADDR": "127.0.0.1"})
+        self.assertEqual(r.status_code, 200)
+
+
+class OpenModeLoopbackWithAuth(AuthGateCoverage):
+    def test_remote_client_allowed_when_auth_enabled(self):
+        # With APP_PASSWORD set, the loopback guard is a no-op (auth governs access).
+        token = self.client.post("/api/login", json={"password": "secret"}).get_json()["token"]
+        r = self.client.get("/api/invoices", headers={"Authorization": "Bearer " + token},
+                            environ_overrides={"REMOTE_ADDR": "8.8.8.8"})
+        self.assertEqual(r.status_code, 200)
+
+
+class CategoryDeleteMissing(Base):
+    def test_nonexistent_category_delete_is_404(self):
+        self.assertEqual(self.client.delete("/api/categories/999999").status_code, 404)
+
+
+class FkChildIndexes(Base):
+    def test_set_null_child_columns_are_indexed(self):
+        with flask_app.app_context():
+            idx = {r["name"] for r in get_db().execute("PRAGMA index_list(count_lines)")}
+            idx |= {r["name"] for r in get_db().execute("PRAGMA index_list(recipe_items)")}
+        self.assertIn("idx_countlines_item", idx)
+        self.assertIn("idx_recipeitems_product", idx)
+
+
+class SquareMultiPageError(Base):
+    def _resp(self, payload):
+        class FakeResp:
+            def __init__(self, d): self._d = d
+            def raise_for_status(self): pass
+            def json(self): return self._d
+        return FakeResp(payload)
+
+    def test_page2_error_discards_page1_sales(self):
+        import requests as rq
+        page1 = {"orders": [{"net_amounts": {"total_money": {"amount": 5000}}}], "cursor": "c"}
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post",
+                                   side_effect=[self._resp(page1), rq.RequestException("boom")]):
+                info = square_client.get_sales(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertEqual(info["sales"], 0.0)        # page-1 $50 discarded, not banked
+        self.assertIsNotNone(info["error"])
+
+    def test_page2_error_returns_none_for_daily(self):
+        import requests as rq
+        page1 = {"orders": [{"closed_at": "2026-06-01T20:00:00Z",
+                             "net_amounts": {"total_money": {"amount": 5000}}}], "cursor": "c"}
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post",
+                                   side_effect=[self._resp(page1), rq.RequestException("boom")]):
+                out = square_client.get_daily_sales(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertIsNone(out)                       # partial page never banked into the cache
+
+
+class RecipeMutationIsolation(Base):
+    def _product(self, name, loc):
+        with flask_app.app_context():
+            d = get_db()
+            pid = d.execute("INSERT INTO inventory_items(location_id,name,unit_cost) VALUES(?,?,5)",
+                            (loc, name)).lastrowid
+            d.commit()
+            return pid
+
+    def test_foreign_recipe_put_and_delete_are_404_and_unchanged(self):
+        p = self._product("NycGin", 2)
+        rid = self.client.post("/api/recipes", headers={"X-Location-Id": "2"}, json={
+            "name": "NYC", "menu_price": 9, "yield_qty": 1,
+            "items": [{"product_id": p, "qty": 1}]}).get_json()["id"]
+        # store 1 must not be able to edit or delete store 2's recipe
+        put = self.client.put(f"/api/recipes/{rid}", headers={"X-Location-Id": "1"},
+                              json={"name": "HACK", "menu_price": 1, "yield_qty": 1})
+        dele = self.client.delete(f"/api/recipes/{rid}", headers={"X-Location-Id": "1"})
+        self.assertEqual(put.status_code, 404)
+        self.assertEqual(dele.status_code, 404)
+        with flask_app.app_context():
+            row = get_db().execute("SELECT name, menu_price FROM recipes WHERE id=?", (rid,)).fetchone()
+        self.assertEqual(row["name"], "NYC")          # untouched by the foreign store
+        self.assertEqual(row["menu_price"], 9)
+
+
+class ParseInvoiceEndToEnd(Base):
+    def _fake_anthropic(self, payload_json, fail_output_config=False):
+        import types
+        mod = types.ModuleType("anthropic")
+        mod.APIError = type("APIError", (Exception,), {})
+
+        class Block:
+            type = "text"
+            def __init__(self, t): self.text = t
+
+        class Resp:
+            def __init__(self, blocks): self.content = blocks
+
+        class Messages:
+            def create(self, **kw):
+                if fail_output_config and "output_config" in kw:
+                    raise TypeError("no output_config")   # exercise the plain-text fallback
+                return Resp([Block(payload_json)])
+
+        class Client:
+            def __init__(self, **kw): self.messages = Messages()
+
+        mod.Anthropic = Client
+        return mod
+
+    def test_structured_response_normalizes_into_invoice_dict(self):
+        import sys
+        payload = ('{"vendor":"Acme","invoice_date":"2026-06-01","invoice_number":"7",'
+                   '"subtotal":100,"tax":8,"total":108,'
+                   '"line_items":[{"name":"Gin","qty":1,"unit":"case","unit_cost":100,'
+                   '"total":100,"category":"Liquor"}]}')
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}), \
+                mock.patch.dict(sys.modules, {"anthropic": self._fake_anthropic(payload)}), \
+                flask_app.app_context():
+            out = invoice_ai.parse_invoice(b"img", "image/png")
+        self.assertEqual(out["vendor"], "Acme")
+        self.assertEqual(out["total"], 108.0)
+        self.assertEqual(out["line_items"][0]["name"], "Gin")
+        self.assertEqual(out["line_items"][0]["category"], "Liquor")
+
+    def test_plain_text_json_fallback_path(self):
+        import sys
+        payload = ('{"vendor":"Beta","invoice_date":"","invoice_number":"",'
+                   '"subtotal":null,"tax":null,"total":50,"line_items":[]}')
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}), \
+                mock.patch.dict(sys.modules,
+                                {"anthropic": self._fake_anthropic(payload, fail_output_config=True)}), \
+                flask_app.app_context():
+            out = invoice_ai.parse_invoice(b"img", "image/png")
+        self.assertEqual(out["vendor"], "Beta")
+        self.assertEqual(out["total"], 50.0)
+
+
 if __name__ == "__main__":
     unittest.main()

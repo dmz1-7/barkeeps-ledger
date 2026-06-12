@@ -144,6 +144,24 @@ def _authed():
     return hmac.compare_digest(sent.encode("utf-8", "ignore"), expected.encode())
 
 
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+@app.before_request
+def _open_mode_loopback_only():
+    """Open mode (no APP_PASSWORD) disables auth entirely, so it must never be
+    reachable off-host. `python app.py` already forces a 127.0.0.1 bind, but under
+    gunicorn the app can't choose the bind — so enforce loopback at the request
+    layer too: in open mode, reject any non-loopback client. With APP_PASSWORD set
+    this is a no-op (auth governs access and trusted remote clients are allowed)."""
+    if _expected_token() is not None:
+        return
+    addr = request.remote_addr or ""
+    if not (addr in _LOOPBACK or addr.startswith("127.")):
+        return jsonify({"error": "Running without authentication; serving localhost "
+                        "only. Set APP_PASSWORD to allow remote access."}), 403
+
+
 @app.before_request
 def _guard():
     p = request.path
@@ -215,6 +233,11 @@ def login():
     if expected is None:
         return jsonify({"token": "", "auth_required": False})
     pw = body().get("password", "")
+    if not isinstance(pw, str):
+        # A non-string password (number/list/bool) would AttributeError in
+        # _token_for(pw).encode() -> 500, slipping past the throttle. Treat it as
+        # an ordinary wrong guess so it 401s AND increments the rate limit.
+        pw = ""
     # Hold the lock across the budget check AND the mutation so concurrent
     # requests can't both slip past the threshold or corrupt the list.
     with _LOGIN_LOCK:
@@ -582,6 +605,8 @@ def inventory_create():
 @app.put("/api/inventory/<int:item_id>")
 def inventory_update(item_id):
     d = body()
+    if "name" in d and not _s(d["name"]):   # name is NOT NULL — 400, not a 500 on the constraint
+        return jsonify({"error": "Name is required."}), 400
     fields = ["name", "category", "unit", "par_level", "last_count", "unit_cost",
               "vendor", "sort_order", "archived"]
     sets, vals = [], []
@@ -794,6 +819,8 @@ def vendor_get(vid):
 @app.put("/api/vendors/<int:vid>")
 def vendor_update(vid):
     d = body()
+    if "name" in d and not _s(d["name"]):   # name is NOT NULL — 400, not a 500 on the constraint
+        return jsonify({"error": "Name is required."}), 400
     fields = ["name", "contact_name", "phone", "email", "account_number",
               "order_days", "notes", "archived"]
     sets, vals = [], []
@@ -882,7 +909,9 @@ def category_update(cid):
 
 @app.delete("/api/categories/<int:cid>")
 def category_delete(cid):
-    db.get_db().execute("UPDATE categories SET archived=1 WHERE id=?", (cid,))
+    cur = db.get_db().execute("UPDATE categories SET archived=1 WHERE id=?", (cid,))
+    if cur.rowcount == 0:   # match every other delete: a missing id is a 404, not a silent 200
+        abort(404, description="Not found.")
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -1012,6 +1041,8 @@ def product_get(pid):
 @app.put("/api/products/<int:pid>")
 def product_update(pid):
     d = body()
+    if "name" in d and not _s(d["name"]):   # name is NOT NULL — 400, not a 500 on the constraint
+        return jsonify({"error": "Name is required."}), 400
     sets, vals = [], []
     for key in _PRODUCT_COLS:
         if key in d:

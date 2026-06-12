@@ -209,6 +209,11 @@ CREATE INDEX IF NOT EXISTS idx_invoices_loc_date ON invoices(location_id, invoic
 CREATE INDEX IF NOT EXISTS idx_inv_loc_arch ON inventory_items(location_id, archived);
 CREATE INDEX IF NOT EXISTS idx_counts_loc_taken ON counts(location_id, taken_at);
 CREATE INDEX IF NOT EXISTS idx_items_invitem ON invoice_items(inventory_item_id);
+-- Index the ON DELETE SET NULL child FK columns so deleting a parent inventory
+-- item (e.g. a MarginEdge re-import wiping a store's products) seeks the
+-- referencing rows instead of full-scanning count_lines / recipe_items.
+CREATE INDEX IF NOT EXISTS idx_countlines_item ON count_lines(item_id);
+CREATE INDEX IF NOT EXISTS idx_recipeitems_product ON recipe_items(product_id);
 -- Case-insensitive product-name seek: the MarginEdge importer resolves each row
 -- with lower(name)=lower(?) per store; without this, every row is a per-store scan.
 CREATE INDEX IF NOT EXISTS idx_inv_loc_name ON inventory_items(location_id, name COLLATE NOCASE);
@@ -338,8 +343,14 @@ _ADDED_COLUMNS = {
 def _ensure_columns(conn):
     """Add any missing columns to pre-existing tables (idempotent)."""
     for table, cols in _ADDED_COLUMNS.items():
+        # These identifiers come only from the _ADDED_COLUMNS constant, never from
+        # request data, so there's no injection today. Assert they're plain
+        # identifiers anyway, so a future edit that sourced a name from user input
+        # can't silently become injectable through this f-string interpolation.
+        assert table.isidentifier(), table
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         for col, decl in cols.items():
+            assert col.isidentifier(), col
             if col not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
