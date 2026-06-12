@@ -114,7 +114,10 @@ async function download(path, filename) {
 }
 
 /* ---------- date helpers ---------- */
-const iso = (d) => d.toISOString().slice(0, 10);
+// Format the LOCAL calendar date. toISOString() reads the UTC date, so for ET users
+// in the evening it returns tomorrow — silently pushing default date ranges a day
+// into the future. Build from the local getFullYear/Month/Date instead.
+const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 function weekStart(d = new Date()) { const x = new Date(d); const day = (x.getDay() + 6) % 7; x.setDate(x.getDate() - day); return x; }
 function monthStart(d = new Date()) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 

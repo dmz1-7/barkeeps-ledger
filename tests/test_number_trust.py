@@ -1819,23 +1819,26 @@ class PrimePctUsageMode(Base):
         self.assertEqual(s["labor_pct"], 30.0)         # 300/1000 (range)
         self.assertEqual(s["prime_pct"], round(cogs_pct + 30.0, 1))   # sum of correctly-based parts
 
-    def test_empty_interval_cache_falls_back_to_range_sales(self):
+    def test_empty_interval_cache_falls_back_to_purchases_basis(self):
         self._count("2026-05-30", 1000.0)
         self._count("2026-07-02", 800.0)
         self._invoice("2026-06-15", 700.0)
-        s = self._summary(lambda b, e: {})             # Square-down / cold cache
-        self.assertEqual(s["cogs_sales_basis"], "range")
-        self.assertEqual(s["cogs_sales"], 1000.0)
-        self.assertEqual(s["cogs_pct"], 90.0)          # 900/1000
+        # cold cache + interval wider than range: don't show usage-COGS/range-sales
+        # (which inflated to 90%); fall back to the range-consistent purchases basis.
+        s = self._summary(lambda b, e: {})
+        self.assertEqual(s["cogs_method"], "purchases")
+        self.assertIsNone(s["usage_period"])
+        self.assertEqual(s["cogs"], 700.0)             # range purchases, not usage 900
+        self.assertEqual(s["cogs_pct"], 70.0)          # 700/1000, not the inflated 90
 
-    def test_partial_cache_falls_back_to_range_sales(self):
+    def test_partial_cache_falls_back_to_purchases_basis(self):
         self._count("2026-05-30", 1000.0)
         self._count("2026-07-02", 800.0)
         self._invoice("2026-06-15", 700.0)
-        # only 2 of 34 interval days cached -> incomplete -> fall back to range
+        # only 2 of 34 interval days cached -> incomplete -> purchases basis
         s = self._summary(lambda b, e: {b.isoformat(): 100.0, e.isoformat(): 100.0})
-        self.assertEqual(s["cogs_sales_basis"], "range")
-        self.assertEqual(s["cogs_pct"], 90.0)
+        self.assertEqual(s["cogs_method"], "purchases")
+        self.assertEqual(s["cogs_pct"], 70.0)
 
 
 class RecipeSubCent(Base):
@@ -3790,6 +3793,139 @@ class VendorItemUpdateForeignProduct(Base):
         with flask_app.app_context():
             pid = get_db().execute("SELECT product_id FROM vendor_items WHERE id=?", (vi,)).fetchone()["product_id"]
         self.assertIsNone(pid)
+
+
+# ============================================================================
+# Eighteenth audit-fix regression tests (2026-06-12, 18th re-audit)
+# ============================================================================
+
+class MigrationOrderingLegacyDup(Base):
+    def test_backfill_before_unique_index_no_crash(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("DROP INDEX IF EXISTS uq_inv_loc_name")
+            # legacy state: NULL location_id + case-duplicate names (pre-locations schema)
+            d.execute("INSERT INTO inventory_items(location_id,name) VALUES(NULL,'House Red')")
+            d.execute("INSERT INTO inventory_items(location_id,name) VALUES(NULL,'house red')")
+            d.commit()
+            # init_db order: backfill FIRST (unguarded UPDATE), THEN guarded index build.
+            db._backfill_location_ids(d)     # must not raise (no unique index yet)
+            db._apply_post_indexes(d)         # dup trips the GUARDED create -> swallowed
+            d.commit()
+            rows = d.execute("SELECT location_id FROM inventory_items "
+                             "WHERE name IN ('House Red','house red')").fetchall()
+        self.assertTrue(all(r["location_id"] is not None for r in rows))   # backfilled, app alive
+
+
+class CreditTaxDeflation(Base):
+    def test_tax_inclusive_credit_strips_its_tax(self):
+        with flask_app.app_context():
+            d = get_db()
+            # a tax-inclusive vendor credit, stored negative; the single line = total
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,subtotal,tax,total) "
+                            "VALUES(1,'V','2026-06-05',-100,-6,-106)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'ret',-106)", (iid,))
+            d.commit()
+            p = cogs.purchases(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(p["total"], -100.0)   # deflated -106 -> -100 (tax credit stripped), not -106
+
+    def test_factor_symmetric_for_sign(self):
+        self.assertAlmostEqual(cogs.pretax_factor(100, 106, 106, 6), 100 / 106, places=4)
+        self.assertAlmostEqual(cogs.pretax_factor(-100, -106, -106, -6), 100 / 106, places=4)
+
+
+class RecipeLineCostFinite(Base):
+    def test_overflow_clamped_to_zero(self):
+        import recipes
+        # absurd unit_cost x qty overflows to inf; must clamp, not leak Infinity JSON
+        cost, conv = recipes._line_cost(1e200, "each", 1e200, None, None)
+        self.assertEqual(cost, 0.0)
+
+
+class IncomeResidualReconciles(Base):
+    def test_per_type_income_sums_to_total_income(self):
+        with flask_app.app_context():
+            db.set_setting("active_location_id", "1")
+            # 33/33/34 split that doesn't divide cleanly on an odd-cent sales figure
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "get_sales",
+                                      return_value={"sales": 1000.07, "orders": 1, "error": None}), \
+                    mock.patch.object(square_client, "get_labor", return_value=dict(_LABOR0)):
+                d = get_db()
+                for t, p in (("Wine", 33), ("Beer", 33), ("Liquor", 34)):
+                    d.execute("INSERT INTO sales_mix(location_id,period_start,period_end,category_type,pct) "
+                              "VALUES(1,'2026-06-01','2026-06-30',?,?)", (t, p))
+                d.commit()
+                pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        parts = round(sum(i["amt"] for i in pl["income"]), 2)
+        self.assertEqual(parts, pl["total_income"])   # residual allocated, no penny drift
+
+
+class GetDailySalesMultiPageSuccess(Base):
+    def test_two_success_pages_accumulate_per_day(self):
+        class FakeResp:
+            def __init__(self, d): self._d = d
+            def raise_for_status(self): pass
+            def json(self): return self._d
+        p1 = {"orders": [{"closed_at": "2026-06-01T20:00:00Z",
+                          "net_amounts": {"total_money": {"amount": 1000}}}], "cursor": "c"}
+        p2 = {"orders": [{"closed_at": "2026-06-01T21:00:00Z",
+                          "net_amounts": {"total_money": {"amount": 500}}}], "cursor": None}
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post",
+                                   side_effect=[FakeResp(p1), FakeResp(p2)]):
+                out = square_client.get_daily_sales(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertEqual(out["2026-06-01"], 15.0)   # 1000 + 500 cents from both pages
+
+
+class SquareOutboundStore2(Base):
+    def test_get_labor_posts_store2_location(self):
+        captured = {}
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return {"shifts": [], "cursor": None}
+
+        def fake_post(url, **kw):
+            captured["body"] = kw.get("json")
+            return FakeResp()
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            db.set_setting("active_location_id", "2")   # act as store 2
+            with mock.patch.object(square_client.requests, "post", side_effect=fake_post):
+                square_client.get_labor(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertEqual(captured["body"]["query"]["filter"]["location_ids"], ["LS1WRASW8V02R"])
+
+
+class OpenModeHostGuard(Base):
+    def test_non_loopback_host_refused(self):
+        r = self.client.get("/api/health",
+                            environ_overrides={"REMOTE_ADDR": "127.0.0.1", "HTTP_HOST": "evil.example.com"})
+        self.assertEqual(r.status_code, 403)
+
+
+class ParseInvoiceApiError(ParseInvoiceEndToEnd):
+    def test_api_error_becomes_invoice_error(self):
+        import sys
+        import types
+        mod = types.ModuleType("anthropic")
+        mod.APIError = type("APIError", (Exception,), {})
+
+        class Messages:
+            def create(self, **kw):
+                e = mod.APIError("rate limited")
+                e.message = "rate limited"
+                raise e
+
+        class Client:
+            def __init__(self, **kw): self.messages = Messages()
+        mod.Anthropic = Client
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}), \
+                mock.patch.dict(sys.modules, {"anthropic": mod}), \
+                flask_app.app_context():
+            with self.assertRaises(invoice_ai.InvoiceError):
+                invoice_ai.parse_invoice(b"img", "image/png")
 
 
 if __name__ == "__main__":
