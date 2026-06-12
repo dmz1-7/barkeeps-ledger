@@ -304,26 +304,21 @@ def _predrop_legacy_sales_mix(conn):
 
 
 def _migrate_locations(conn):
-    """One-time: tag all pre-location rows with the default store (DC), set the
-    active location, and mirror its Square id into the square_location_id setting."""
+    """One-time: tag all pre-location rows with the default store and set the
+    active location. The Square id lives per-store on the locations row now, so
+    nothing is mirrored into a global setting."""
     if conn.execute("SELECT 1 FROM settings WHERE key='migrated_locations'").fetchone():
         return
-    row = conn.execute(
-        "SELECT id, square_location_id FROM locations ORDER BY id LIMIT 1"
-    ).fetchone()
+    row = conn.execute("SELECT id FROM locations ORDER BY id LIMIT 1").fetchone()
     if not row:
         return
-    loc_id, sq = row["id"], row["square_location_id"]
+    loc_id = row["id"]
     for tbl in ("invoices", "inventory_items", "vendor_items", "vendors", "counts"):
         conn.execute(f"UPDATE {tbl} SET location_id=? WHERE location_id IS NULL", (loc_id,))
     conn.execute("UPDATE sales_mix SET location_id=? WHERE location_id=0", (loc_id,))
     conn.execute(
         "INSERT INTO settings(key, value) VALUES('active_location_id', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(loc_id),))
-    if sq:
-        conn.execute(
-            "INSERT INTO settings(key, value) VALUES('square_location_id', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (sq,))
     conn.execute("INSERT INTO settings(key, value) VALUES('migrated_locations','1')")
 
 
@@ -402,17 +397,24 @@ def init_db():
     conn.executescript(SCHEMA)
     _ensure_columns(conn)
     conn.executescript(POST_INDEXES)
-    # Seed any default settings not already present, and pull secrets from env.
-    env_seed = {
-        "square_token": os.environ.get("SQUARE_ACCESS_TOKEN", ""),
-        "square_location_id": os.environ.get("SQUARE_LOCATION_ID", ""),
-    }
+    # Seed any default settings not already present, and pull the (global) token
+    # from env. The Square *location* is per-store now, so it's seeded onto the
+    # store row below rather than into a global setting.
+    env_seed = {"square_token": os.environ.get("SQUARE_ACCESS_TOKEN", "")}
     for key, val in {**DEFAULT_SETTINGS, **env_seed}.items():
         row = conn.execute("SELECT 1 FROM settings WHERE key=?", (key,)).fetchone()
         if row is None:
             conn.execute("INSERT INTO settings(key, value) VALUES(?,?)", (key, val))
     _seed_taxonomy(conn)
     _seed_locations(conn)
+    # Env bootstrap of the default store's Square location id (only fills an empty
+    # slot — existing/seeded ids win).
+    env_sq = os.environ.get("SQUARE_LOCATION_ID", "").strip()
+    if env_sq:
+        conn.execute(
+            "UPDATE locations SET square_location_id=? "
+            "WHERE id=(SELECT MIN(id) FROM locations) AND COALESCE(square_location_id,'')=''",
+            (env_sq,))
     _migrate_legacy_data(conn)
     _migrate_locations(conn)
     conn.commit()
@@ -427,12 +429,18 @@ def get_setting(key, default=None):
 
 
 def active_location_id():
-    """The store currently being viewed. Falls back to the lowest location id."""
+    """The store THIS request is acting on. A per-request override (set from the
+    X-Location-Id header in app._resolve_location) wins, so concurrent devices and
+    tabs no longer share one mutable 'current store'. Falls back to the persisted
+    setting, then the lowest location id, for non-SPA callers."""
+    override = g.get("location_override")
+    if override is not None:
+        return override
     v = get_setting("active_location_id")
     try:
         return int(v)
     except (TypeError, ValueError):
-        row = get_db().execute("SELECT MIN(id) AS id FROM locations").fetchone()
+        row = get_db().execute("SELECT MIN(id) AS id FROM locations WHERE archived=0").fetchone()
         return row["id"] if row else None
 
 

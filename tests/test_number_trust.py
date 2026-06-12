@@ -76,8 +76,10 @@ class NetSalesBasis(Base):
 
 class CacheZeroOverwrite(Base):
     def _configure_square(self):
-        db.set_setting("square_token", "x")
-        db.set_setting("square_location_id", "LOC1")
+        db.set_setting("square_token", "x")   # token is global; the location id is per-store now
+        get_db().execute("UPDATE locations SET square_location_id='LOC1' WHERE id=?",
+                         (db.active_location_id(),))
+        get_db().commit()
 
     def _seed_today(self, value):
         ds = dt.date.today().isoformat()
@@ -546,6 +548,45 @@ class PriceMovers(Base):
         self.assertEqual(len(movers), 1)                     # not a cross-vendor merge
         self.assertEqual(movers[0]["name"], "Vodka")
         self.assertEqual((movers[0]["old_price"], movers[0]["new_price"]), (20.0, 25.0))
+
+
+class LocationHeader(Base):
+    """#6 — the active store is resolved per request from the X-Location-Id header,
+    not a shared mutable global, so concurrent devices don't cross-contaminate."""
+
+    def test_header_overrides_persisted_default(self):
+        with flask_app.app_context():
+            db.set_setting("active_location_id", "1")
+            nyc = get_db().execute(
+                "INSERT INTO invoices(location_id, vendor, total) VALUES(2,'N',5.0)").lastrowid
+            get_db().commit()
+        # Default store is 1 -> the NYC invoice is invisible...
+        self.assertEqual(self.client.get(f"/api/invoices/{nyc}").status_code, 404)
+        # ...until this request declares store 2 via the header.
+        self.assertEqual(
+            self.client.get(f"/api/invoices/{nyc}", headers={"X-Location-Id": "2"}).status_code, 200)
+
+    def test_invalid_header_falls_back_to_default(self):
+        with flask_app.app_context():
+            db.set_setting("active_location_id", "1")
+        for bad in ("999", "abc", ""):
+            r = self.client.get("/api/active-location", headers={"X-Location-Id": bad})
+            self.assertEqual(r.get_json()["active"], 1)
+
+    def test_square_location_resolves_per_request(self):
+        c1 = self.client.get("/api/config", headers={"X-Location-Id": "1"}).get_json()
+        c2 = self.client.get("/api/config", headers={"X-Location-Id": "2"}).get_json()
+        self.assertEqual(c1["square_location_id"], "LNKNR2A7MBB4K")   # seeded DC
+        self.assertEqual(c2["square_location_id"], "LS1WRASW8V02R")   # seeded NYC
+
+    def test_settings_writes_square_id_to_active_store_only(self):
+        self.client.post("/api/settings", json={"square_location_id": "NEWNYC"},
+                         headers={"X-Location-Id": "2"})
+        with flask_app.app_context():
+            r1 = get_db().execute("SELECT square_location_id FROM locations WHERE id=1").fetchone()[0]
+            r2 = get_db().execute("SELECT square_location_id FROM locations WHERE id=2").fetchone()[0]
+        self.assertEqual(r2, "NEWNYC")            # active store updated
+        self.assertEqual(r1, "LNKNR2A7MBB4K")     # other store untouched (no global mirror)
 
 
 if __name__ == "__main__":
