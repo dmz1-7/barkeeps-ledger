@@ -26,11 +26,17 @@ def pretax_factor(subtotal, total, line_sum, tax=None):
     `base` is the recorded subtotal; when that's missing (a tax+total-only
     invoice, common from AI/manual entry) it's derived as total - tax, so such an
     invoice still deflates instead of silently counting the tax in COGS — matching
-    _reconcile's tot - tax target."""
+    _reconcile's tot - tax target.
+
+    Works by MAGNITUDE, not sign, so a tax-inclusive CREDIT/return (stored
+    negative: subtotal=-100, tax=-6, total=-106) deflates the same way as the
+    +106 invoice — otherwise the tax credit would over-reduce COGS."""
     base = subtotal
-    if (not base or base <= 0) and total and tax and tax > 0:
+    # Derive base = total - tax when subtotal is missing OR its sign disagrees with
+    # total (a credit's base must be negative too).
+    if (not base or (total and base * total < 0)) and total and tax:
         base = total - tax
-    if not base or not total or base <= 0 or total <= 0 or base >= total:
+    if not base or not total or base * total <= 0 or abs(base) >= abs(total):
         return 1.0
     return base / total if abs(line_sum - total) < abs(line_sum - base) else 1.0
 
@@ -202,9 +208,21 @@ def summary(start, end):
             # Purchases are summed over (b_date, e_date] (exclusive of the opening
             # count day), so match the sales denominator: drop b_date's sales.
             b_iso = b_date.isoformat()
-            interval_sales = round(sum(v for day, v in daily.items() if day > b_iso), 2)
+            interval_sales = money.sum_dollars(v for day, v in daily.items() if day > b_iso)
             if interval_sales:
                 cogs_sales, cogs_sales_basis = interval_sales, "interval"
+
+    # If usage COGS spans an interval WIDER than the requested range but we couldn't
+    # establish the matching interval-sales denominator (cold/partial cache), then
+    # cogs_amount/range-sales would be inflated up to ~2x. Fall back to the
+    # range-consistent purchases basis rather than surface an inflated usage COGS%.
+    # Only when Square is configured: with no sales, cogs_pct is None anyway and the
+    # usage COGS dollar figure is still the useful one.
+    if (usage_cogs is not None and square_client.is_configured()
+            and cogs_sales_basis == "range" and (b_date != start or e_date != end)):
+        cogs_amount = purch["total"]
+        cogs_method = "purchases"
+        usage_period = None
 
     # COGS% and Labor% use different sales bases in usage mode (interval vs
     # range), so prime% is the SUM of the two correctly-based percentages — never

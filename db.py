@@ -554,7 +554,14 @@ def init_db():
     conn.executescript(SCHEMA)
     _restore_legacy_sales_mix(conn)
     _ensure_columns(conn)
-    _apply_post_indexes(conn)
+    # NOTE: _apply_post_indexes (which builds the uq_inv_loc_name UNIQUE index) is
+    # deliberately deferred to AFTER _backfill_location_ids below. On a legacy
+    # pre-locations DB the rows still have NULL location_id here; SQLite treats NULLs
+    # as distinct, so building the unique index now would SUCCEED even with
+    # case-duplicate names, and the later backfill UPDATE (NULL -> default store)
+    # would then trip the constraint with an UNGUARDED IntegrityError, crashing boot.
+    # Backfilling first means a real duplicate trips the GUARDED CREATE UNIQUE INDEX
+    # instead (logged, app keeps running) — matching get_db()'s self-heal order.
     # Seed any default settings not already present, and pull the (global) token
     # from env. The Square *location* is per-store now, so it's seeded onto the
     # store row below rather than into a global setting.
@@ -580,6 +587,10 @@ def init_db():
     # default (e.g. from an old DB) onto the default store so it's not invisible.
     conn.execute(
         "UPDATE sales_mix SET location_id=(SELECT MIN(id) FROM locations) WHERE location_id=0")
+    # Build indexes LAST — after every location_id column is populated — so the
+    # uq_inv_loc_name unique index sees real (non-NULL) location ids and a genuine
+    # duplicate is caught by the guarded CREATE rather than a later unguarded UPDATE.
+    _apply_post_indexes(conn)
     conn.commit()
     conn.close()
 

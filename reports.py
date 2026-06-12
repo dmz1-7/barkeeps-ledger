@@ -126,6 +126,7 @@ def controllable_pl(start, end):
     # Income by category type = total sales x that type's mix %.
     income = []
     income_by_type = {}
+    last_t = None
     for t in CATEGORY_TYPES:
         amt = _r(sales * mix.get(t, 0) / 100.0)
         income_by_type[t] = amt
@@ -134,7 +135,21 @@ def controllable_pl(start, end):
             "amt": amt,
             "pct_of_sales": _r(amt / sales * 100) if sales else None,
         })
+        if mix.get(t, 0):
+            last_t = t
     total_income = _r(sales)
+    # Per-type incomes are rounded independently, so on a full 100% split they can
+    # sum a penny off total_income. Allocate that residual to the last non-zero type
+    # so the parts reconcile to total_income exactly (the "income sums to sales"
+    # invariant) — only when the mix is actually a ~100% split.
+    if last_t is not None and abs(sum(mix.get(t, 0) for t in CATEGORY_TYPES) - 100) < 0.5:
+        residual = _r(total_income - sum(income_by_type.values()))
+        if residual:
+            income_by_type[last_t] = _r(income_by_type[last_t] + residual)
+            for row in income:
+                if row["category_type"] == last_t:
+                    row["amt"] = income_by_type[last_t]
+                    row["pct_of_sales"] = _r(row["amt"] / sales * 100) if sales else None
 
     # COGS by category type -> category, from invoice lines in the period, on the
     # PRE-TAX basis (deflate tax-inclusive invoices) and summed in integer cents.

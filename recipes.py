@@ -11,9 +11,18 @@ is priced in. A cocktail using 1.5 oz of a bottle-priced spirit records the
 fraction of a bottle. Garnishes/food priced "each" are natural (1 lime = qty 1).
 A future pass can add purchase-unit -> recipe-unit conversion.
 """
+import math
+
 import money
 import units
 from db import get_db, active_location_id
+
+
+def _finite(v):
+    """Clamp a non-finite product (inf/nan from an absurd unit_cost x qty) to 0, so
+    a recipe line can't leak the bare token `Infinity` into the JSON response (which
+    breaks strict JSON.parse) — mirrors money.normalize's non-finite rejection."""
+    return v if math.isfinite(v) else 0.0
 
 
 def _line_cost(qty, line_unit, unit_cost, size_qty, size_unit):
@@ -36,9 +45,9 @@ def _line_cost(qty, line_unit, unit_cost, size_qty, size_unit):
         if line_unit:
             used = units.convert(qty, line_unit, size_unit)
             if used is not None:
-                return unit_cost * (used / size_qty), True
+                return _finite(unit_cost * (used / size_qty)), True
         return 0.0, False
-    return qty * unit_cost, False
+    return _finite(qty * unit_cost), False
 
 
 def _costed_items(db, recipe_id, loc):
