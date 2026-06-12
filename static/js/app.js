@@ -580,11 +580,25 @@ async function openInvoiceForm(parsed, imagePath, warn) {
       image_path: imagePath || null, line_items: items,
       raw_json: parsed ? JSON.stringify(parsed) : "",
     };
+    const done = () => { toast("Logged to the ledger."); location.hash = "#/orders"; };
     try {
       await api("POST", "/api/invoices", payload);
-      toast("Logged to the ledger.");
-      location.hash = "#/orders";
-    } catch (e) { toast(e.message); }
+      done();
+    } catch (e) {
+      if (e.data && e.data.error === "duplicate") {
+        const dup = e.data.duplicate || {};
+        const tag = [dup.invoice_number && `#${dup.invoice_number}`,
+                     dup.invoice_date && `dated ${dup.invoice_date}`,
+                     dup.total != null && `for ${money(dup.total)}`].filter(Boolean).join(", ");
+        if (!confirm(`Looks like this invoice is already logged${tag ? ` (${tag})` : ""}.\n\nSave it anyway?`)) return;
+        try {
+          await api("POST", "/api/invoices", { ...payload, confirm_duplicate: true });
+          done();
+        } catch (e2) { toast(e2.message); }
+        return;
+      }
+      toast(e.message);
+    }
   });
 }
 

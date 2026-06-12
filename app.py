@@ -213,6 +213,14 @@ def invoice_create():
     inv_date = d.get("invoice_date", "")
     database = db.get_db()
     loc = db.active_location_id()
+    # Guard against logging the same delivery twice (a re-snapped photo or a
+    # double-tap), which would silently double-count purchases and inflate COGS.
+    # The client can re-submit with confirm_duplicate=true to override.
+    if not d.get("confirm_duplicate"):
+        dup = _find_duplicate_invoice(
+            database, loc, vendor, d.get("invoice_number", ""), inv_date, _f(d.get("total")))
+        if dup:
+            return jsonify({"error": "duplicate", "duplicate": dup}), 409
     cur = database.execute(
         "INSERT INTO invoices(location_id, vendor, invoice_date, invoice_number, category, "
         "subtotal, tax, total, image_path, notes, raw_json, status, payment_account) "
@@ -265,7 +273,8 @@ def invoice_list():
 @app.get("/api/invoices/<int:inv_id>")
 def invoice_get(inv_id):
     db_ = db.get_db()
-    row = db_.execute("SELECT * FROM invoices WHERE id=?", (inv_id,)).fetchone()
+    row = db_.execute("SELECT * FROM invoices WHERE id=? AND location_id IS ?",
+                      (inv_id, db.active_location_id())).fetchone()
     if not row:
         abort(404)
     items = db_.execute(
@@ -279,10 +288,14 @@ def invoice_get(inv_id):
 @app.delete("/api/invoices/<int:inv_id>")
 def invoice_delete(inv_id):
     db_ = db.get_db()
-    row = db_.execute("SELECT image_path FROM invoices WHERE id=?", (inv_id,)).fetchone()
-    db_.execute("DELETE FROM invoices WHERE id=?", (inv_id,))
+    loc = db.active_location_id()
+    row = db_.execute("SELECT image_path FROM invoices WHERE id=? AND location_id IS ?",
+                      (inv_id, loc)).fetchone()
+    if not row:
+        abort(404)
+    db_.execute("DELETE FROM invoices WHERE id=? AND location_id IS ?", (inv_id, loc))
     db_.commit()
-    if row and row["image_path"]:
+    if row["image_path"]:
         try:
             os.remove(os.path.join(UPLOAD_DIR, row["image_path"]))
         except OSError:
@@ -327,15 +340,22 @@ def inventory_update(item_id):
             vals.append(d[key])
     if not sets:
         return jsonify({"ok": True})
-    vals.append(item_id)
-    db.get_db().execute(f"UPDATE inventory_items SET {','.join(sets)} WHERE id=?", vals)
+    vals += [item_id, db.active_location_id()]
+    cur = db.get_db().execute(
+        f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
 
 @app.delete("/api/inventory/<int:item_id>")
 def inventory_delete(item_id):
-    db.get_db().execute("UPDATE inventory_items SET archived=1 WHERE id=?", (item_id,))
+    cur = db.get_db().execute(
+        "UPDATE inventory_items SET archived=1 WHERE id=? AND location_id IS ?",
+        (item_id, db.active_location_id()))
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -362,17 +382,21 @@ def count_save():
     d = request.json or {}
     lines = d.get("lines") or []
     database = db.get_db()
+    loc = db.active_location_id()
     cur = database.execute(
         "INSERT INTO counts(location_id, note, value) VALUES(?, ?, 0)",
-        (db.active_location_id(), d.get("note", "")),
+        (loc, d.get("note", "")),
     )
     count_id = cur.lastrowid
     total_value = 0.0
     for ln in lines:
         item = database.execute(
-            "SELECT unit_cost FROM inventory_items WHERE id=?", (ln.get("item_id"),)
+            "SELECT unit_cost FROM inventory_items WHERE id=? AND location_id IS ?",
+            (ln.get("item_id"), loc),
         ).fetchone()
-        unit_cost = (item["unit_cost"] if item else 0) or 0
+        if not item:
+            continue  # ignore items that don't belong to the active store
+        unit_cost = item["unit_cost"] or 0
         qty = _f(ln.get("qty"), 0) or 0
         total_value += qty * unit_cost
         database.execute(
@@ -380,7 +404,8 @@ def count_save():
             (count_id, ln.get("item_id"), qty, unit_cost),
         )
         database.execute(
-            "UPDATE inventory_items SET last_count=? WHERE id=?", (qty, ln.get("item_id"))
+            "UPDATE inventory_items SET last_count=? WHERE id=? AND location_id IS ?",
+            (qty, ln.get("item_id"), loc),
         )
     database.execute("UPDATE counts SET value=? WHERE id=?", (round(total_value, 2), count_id))
     database.commit()
@@ -477,7 +502,8 @@ def vendor_create():
 @app.get("/api/vendors/<int:vid>")
 def vendor_get(vid):
     db_ = db.get_db()
-    v = db_.execute("SELECT * FROM vendors WHERE id=?", (vid,)).fetchone()
+    v = db_.execute("SELECT * FROM vendors WHERE id=? AND location_id IS ?",
+                    (vid, db.active_location_id())).fetchone()
     if not v:
         abort(404)
     out = dict(v)
@@ -509,15 +535,22 @@ def vendor_update(vid):
             vals.append(d[key])
     if not sets:
         return jsonify({"ok": True})
-    vals.append(vid)
-    db.get_db().execute(f"UPDATE vendors SET {','.join(sets)} WHERE id=?", vals)
+    vals += [vid, db.active_location_id()]
+    cur = db.get_db().execute(
+        f"UPDATE vendors SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
 
 @app.delete("/api/vendors/<int:vid>")
 def vendor_delete(vid):
-    db.get_db().execute("UPDATE vendors SET archived=1 WHERE id=?", (vid,))
+    cur = db.get_db().execute(
+        "UPDATE vendors SET archived=1 WHERE id=? AND location_id IS ?",
+        (vid, db.active_location_id()))
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -660,8 +693,11 @@ def product_new_item_accept(vid):
         sets.append("category_id=?"); vals.append(d["category_id"])
     if "product_id" in d:
         sets.append("product_id=?"); vals.append(d["product_id"])
-    vals.append(vid)
-    db.get_db().execute(f"UPDATE vendor_items SET {','.join(sets)} WHERE id=?", vals)
+    vals += [vid, db.active_location_id()]
+    cur = db.get_db().execute(
+        f"UPDATE vendor_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -672,7 +708,7 @@ def product_get(pid):
     row = d.execute(
         "SELECT p.*, c.name AS category_name, c.category_type "
         "FROM inventory_items p LEFT JOIN categories c ON c.id = p.category_id "
-        "WHERE p.id=?", (pid,),
+        "WHERE p.id=? AND p.location_id IS ?", (pid, db.active_location_id()),
     ).fetchone()
     if not row:
         abort(404)
@@ -695,15 +731,22 @@ def product_update(pid):
         if key in d:
             sets.append(f"{key}=?"); vals.append(d[key])
     if sets:
-        vals.append(pid)
-        db.get_db().execute(f"UPDATE inventory_items SET {','.join(sets)} WHERE id=?", vals)
+        vals += [pid, db.active_location_id()]
+        cur = db.get_db().execute(
+            f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+        if cur.rowcount == 0:
+            abort(404)
         db.get_db().commit()
     return jsonify({"ok": True})
 
 
 @app.delete("/api/products/<int:pid>")
 def product_delete(pid):
-    db.get_db().execute("UPDATE inventory_items SET archived=1 WHERE id=?", (pid,))
+    cur = db.get_db().execute(
+        "UPDATE inventory_items SET archived=1 WHERE id=? AND location_id IS ?",
+        (pid, db.active_location_id()))
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -758,15 +801,22 @@ def vendor_item_update(vid):
         if key in d:
             sets.append(f"{key}=?"); vals.append(d[key])
     if sets:
-        vals.append(vid)
-        db.get_db().execute(f"UPDATE vendor_items SET {','.join(sets)} WHERE id=?", vals)
+        vals += [vid, db.active_location_id()]
+        cur = db.get_db().execute(
+            f"UPDATE vendor_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+        if cur.rowcount == 0:
+            abort(404)
         db.get_db().commit()
     return jsonify({"ok": True})
 
 
 @app.delete("/api/vendor-items/<int:vid>")
 def vendor_item_delete(vid):
-    db.get_db().execute("UPDATE vendor_items SET archived=1 WHERE id=?", (vid,))
+    cur = db.get_db().execute(
+        "UPDATE vendor_items SET archived=1 WHERE id=? AND location_id IS ?",
+        (vid, db.active_location_id()))
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -846,6 +896,35 @@ def _category_id_by_name(database, name):
         "SELECT id FROM categories WHERE lower(name)=lower(?)", (name,)
     ).fetchone()
     return r["id"] if r else None
+
+
+def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, total):
+    """Return a brief {id, vendor, invoice_date, invoice_number, total} for an
+    existing invoice in this location that looks like the same one, else None.
+
+    Strong signal: same vendor + a non-empty invoice number. Fallback when there's
+    no number: same vendor + date + total (within a cent)."""
+    vendor = (vendor or "").strip()
+    num = (invoice_number or "").strip()
+    cols = "id, vendor, invoice_date, invoice_number, total"
+    if vendor and num:
+        row = database.execute(
+            f"SELECT {cols} FROM invoices WHERE location_id IS ? AND lower(vendor)=lower(?) "
+            "AND invoice_number <> '' AND lower(invoice_number)=lower(?) ORDER BY id DESC LIMIT 1",
+            (loc, vendor, num),
+        ).fetchone()
+        if row:
+            return dict(row)
+    if vendor and inv_date and total is not None:
+        row = database.execute(
+            f"SELECT {cols} FROM invoices WHERE location_id IS ? AND lower(vendor)=lower(?) "
+            "AND invoice_date=? AND total IS NOT NULL AND ABS(total - ?) < 0.01 "
+            "ORDER BY id DESC LIMIT 1",
+            (loc, vendor, inv_date, total),
+        ).fetchone()
+        if row:
+            return dict(row)
+    return None
 
 
 def _resolve_vendor_item(database, vendor, inv_date, line, loc):

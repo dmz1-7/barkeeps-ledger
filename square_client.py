@@ -104,6 +104,32 @@ def list_locations():
         return {"error": _err(e), "locations": []}
 
 
+def _amt(m):
+    return (m or {}).get("amount", 0)
+
+
+def _net_sales_cents(o):
+    """Net sales for one order, in integer cents.
+
+    'Net sales' here is the restaurant cost-ratio denominator: item revenue after
+    discounts and refunds, but EXCLUDING tax, tips and service charges. Square's
+    `net_amounts.total_money` is net-of-refunds but still INCLUDES tax + tip +
+    service charge, so dividing cost by it inflates the denominator and deflates
+    every COGS%/Labor%/prime%/P&L figure. We strip those three back out.
+
+    Stay within ONE frame so refunded orders stay consistent: prefer the
+    net_amounts.* sub-fields (net of returns); only when an order has no
+    net_amounts at all (e.g. Square Invoice-sourced orders) fall back to the
+    order-level total_* fields — never mix the two.
+    """
+    na = o.get("net_amounts")
+    if na:
+        return (_amt(na.get("total_money")) - _amt(na.get("tax_money"))
+                - _amt(na.get("tip_money")) - _amt(na.get("service_charge_money")))
+    return (_amt(o.get("total_money")) - _amt(o.get("total_tax_money"))
+            - _amt(o.get("total_tip_money")) - _amt(o.get("total_service_charge_money")))
+
+
 def get_sales(start, end):
     """Sum completed-order net sales between start and end (inclusive dates).
 
@@ -142,10 +168,7 @@ def get_sales(start, end):
             data = r.json()
             for o in data.get("orders", []):
                 order_count += 1
-                # Prefer net (pre-tax, post-discount) sales for cost ratios.
-                net = o.get("net_amounts", {}).get("total_money")
-                money = net or o.get("total_money") or {}
-                total_cents += money.get("amount", 0)
+                total_cents += _net_sales_cents(o)
             cursor = data.get("cursor")
             if not cursor:
                 break
@@ -157,8 +180,9 @@ def get_sales(start, end):
 def get_daily_sales(start, end):
     """Net sales bucketed by business day (see _business_day / day_start_hour).
 
-    Returns {iso_date: dollars}. Empty dict if Square isn't configured or errors
-    — callers treat missing days as zero.
+    Returns {iso_date: dollars}, or None if the Square call ERRORED (distinct
+    from a successful fetch that found no sales, which is {}). Callers must not
+    treat an errored fetch as "zero sales" — that would corrupt the cache.
     """
     c = _cfg()
     if not is_configured():
@@ -194,15 +218,13 @@ def get_daily_sales(start, end):
                 day = _business_day(o.get("closed_at"))
                 if not day:
                     continue
-                net = o.get("net_amounts", {}).get("total_money")
-                money = net or o.get("total_money") or {}
-                by_day[day] = by_day.get(day, 0.0) + money.get("amount", 0) / 100.0
+                by_day[day] = by_day.get(day, 0.0) + _net_sales_cents(o) / 100.0
             cursor = data.get("cursor")
             if not cursor:
                 break
         return {d: round(v, 2) for d, v in by_day.items()}
     except requests.RequestException:
-        return {}
+        return None
 
 
 def daily_sales_cached(start, end):
@@ -235,6 +257,11 @@ def daily_sales_cached(start, end):
     if need:
         fetch_start = dt.date.fromisoformat(min(need))
         fresh = get_daily_sales(fetch_start, end)  # one paginated Square call
+        if fresh is None:
+            # The Square call errored. Serve whatever we already have and DO NOT
+            # write zeros — overwriting good cached days with 0 would silently
+            # and permanently corrupt the Sales history.
+            return cached
         d = fetch_start
         while d <= end:
             ds = d.isoformat()
