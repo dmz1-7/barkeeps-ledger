@@ -15,10 +15,10 @@ from db import get_db, active_location_id
 
 
 def _safe(cell):
-    """Neutralize spreadsheet formula injection: a text cell starting with =,
-    +, -, @, or a control char is evaluated as a formula by Excel/Sheets, and
-    vendor/item/recipe names are free text (some AI-parsed). Prefix such cells
-    with an apostrophe so they import as literal text."""
+    """Neutralize spreadsheet formula injection: a text cell whose first
+    non-whitespace/quote character is =, +, -, or @ is evaluated as a formula by
+    Excel/Sheets, and vendor/item/recipe names are free text (some AI-parsed).
+    Prefix such cells with an apostrophe so they import as literal text."""
     # Test the value with leading whitespace/quotes stripped — Excel ignores
     # those before deciding a cell is a formula.
     if isinstance(cell, str) and cell.lstrip(" \t\r\n\"'")[:1] in ("=", "+", "-", "@"):
