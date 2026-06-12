@@ -105,13 +105,12 @@ async function download(path, filename) {
   if (res.status === 401) { localStorage.removeItem(TOKEN_KEY); showGate(); throw new Error("unauthorized"); }
   if (!res.ok) throw new Error("HTTP " + res.status);
   const url = URL.createObjectURL(await res.blob());
-  try {
-    const a = document.createElement("a");
-    a.href = url; a.download = filename;
-    document.body.appendChild(a); a.click(); a.remove();
-  } finally {
-    URL.revokeObjectURL(url);   // always release, even if the click path throws
-  }
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  // Defer the revoke a tick: a.click() only schedules the download, so revoking
+  // in the same tick can cancel it / yield an empty file in some browsers.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 /* ---------- date helpers ---------- */
@@ -359,22 +358,32 @@ function dataTable(columns, rows, opts = {}) {
   }
   function draw() {
     const r = view_rows();
-    const head = columns.map((c) =>
-      `<th class="${c.align === "right" ? "r" : ""} ${c.sortable === false ? "" : "sortable"}" data-k="${esc(c.key)}">${esc(c.label)}${sortKey === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>`).join("");
+    const head = columns.map((c) => {
+      const sortable = c.sortable !== false;
+      const aria = sortKey === c.key ? ` aria-sort="${sortDir > 0 ? "ascending" : "descending"}"` : "";
+      return `<th class="${c.align === "right" ? "r" : ""} ${sortable ? "sortable" : ""}"${sortable ? ' tabindex="0" role="button"' : ""}${aria} data-k="${esc(c.key)}">${esc(c.label)}${sortKey === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>`;
+    }).join("");
     const body = r.length ? r.map((row) =>
-      `<tr ${row._href ? `data-href="${esc(row._href)}"` : ""}>` + columns.map((c) =>
+      `<tr ${row._href ? `data-href="${esc(row._href)}" tabindex="0" role="link"` : ""}>` + columns.map((c) =>
         `<td class="${c.align === "right" ? "r" : ""} ${c.cls || ""}" data-label="${esc(c.label)}">${c.fmt ? c.fmt(row) : esc(row[c.key] ?? "")}</td>`).join("") + `</tr>`).join("")
       : `<tr><td class="dt-empty" colspan="${columns.length}">${esc(empty)}</td></tr>`;
     const foot = footer ? `<tfoot><tr>${columns.map((c) =>
       `<td class="${c.align === "right" ? "r" : ""}" data-label="${esc(c.label)}">${footer[c.key] != null ? footer[c.key] : ""}</td>`).join("")}</tr></tfoot>` : "";
     host.innerHTML = `<table class="dtable"><thead><tr>${head}</tr></thead><tbody>${body}</tbody>${foot}</table>`;
-    host.querySelectorAll("th.sortable").forEach((th) => th.addEventListener("click", () => {
-      const k = th.dataset.k;
-      if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = 1; }
-      draw();
-    }));
-    host.querySelectorAll("tr[data-href]").forEach((tr) =>
-      tr.addEventListener("click", () => { location.hash = tr.dataset.href; }));
+    host.querySelectorAll("th.sortable").forEach((th) => {
+      const sort = () => {
+        const k = th.dataset.k;
+        if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = 1; }
+        draw();
+      };
+      th.addEventListener("click", sort);
+      th.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); sort(); } });
+    });
+    host.querySelectorAll("tr[data-href]").forEach((tr) => {
+      const go = () => { location.hash = tr.dataset.href; };
+      tr.addEventListener("click", go);
+      tr.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+    });
   }
   draw();
   return wrap;

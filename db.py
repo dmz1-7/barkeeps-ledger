@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS vendor_items (
 
 -- Actual sales mix the user enters per reporting period; powers P&L income.
 CREATE TABLE IF NOT EXISTS sales_mix (
-    location_id   INTEGER NOT NULL DEFAULT 0,
+    location_id   INTEGER NOT NULL,   -- no default: a missing store must error, not orphan on 0
     period_start  TEXT NOT NULL,
     period_end    TEXT NOT NULL,
     category_type TEXT NOT NULL,
@@ -328,10 +328,26 @@ def _seed_locations(conn):
 
 def _predrop_legacy_sales_mix(conn):
     """sales_mix gained location_id in its primary key; ALTER can't change a PK,
-    so drop the old (pre-location, transient) table and let SCHEMA recreate it."""
+    so set the old (pre-location) table ASIDE and let SCHEMA recreate it. The old
+    rows are user-entered P&L income mix — NOT transient — so they're preserved
+    and re-inserted by _restore_legacy_sales_mix (tagged location_id=0, which
+    _migrate_locations then maps to the default store)."""
+    conn.execute("DROP TABLE IF EXISTS _sales_mix_legacy")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(sales_mix)")}
     if cols and "location_id" not in cols:
-        conn.execute("DROP TABLE sales_mix")
+        conn.execute("ALTER TABLE sales_mix RENAME TO _sales_mix_legacy")
+
+
+def _restore_legacy_sales_mix(conn):
+    """Re-insert rows set aside by _predrop_legacy_sales_mix into the rebuilt
+    sales_mix with location_id=0 (mapped to the default store by migration)."""
+    legacy = {r["name"] for r in conn.execute("PRAGMA table_info(_sales_mix_legacy)")}
+    if not legacy:
+        return
+    conn.execute(
+        "INSERT OR IGNORE INTO sales_mix(location_id, period_start, period_end, category_type, pct) "
+        "SELECT 0, period_start, period_end, category_type, pct FROM _sales_mix_legacy")
+    conn.execute("DROP TABLE _sales_mix_legacy")
 
 
 def _migrate_locations(conn):
@@ -424,8 +440,10 @@ def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")   # match get_db so any cascading migration behaves
     _predrop_legacy_sales_mix(conn)
     conn.executescript(SCHEMA)
+    _restore_legacy_sales_mix(conn)
     _ensure_columns(conn)
     conn.executescript(POST_INDEXES)
     # Seed any default settings not already present, and pull the (global) token

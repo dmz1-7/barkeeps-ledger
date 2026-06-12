@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 # Point at a throwaway DB and disable the auth gate BEFORE importing the app, so
 # we never touch the real data/ledger.db and the test client isn't challenged.
@@ -392,13 +393,23 @@ class LoginRateLimit(Base):
         app_module._LOGIN_FAILS.clear()
         super().tearDown()
 
-    def test_lockout_after_max_failures(self):
+    def test_throttle_after_max_wrong_guesses(self):
+        # The first _LOGIN_MAX wrong guesses are plain 401s; beyond that, further
+        # WRONG guesses are throttled with 429.
         for _ in range(app_module._LOGIN_MAX):
             self.assertEqual(
                 self.client.post("/api/login", json={"password": "nope"}).status_code, 401)
-        # Even the RIGHT passcode is refused once locked out.
+        self.assertEqual(
+            self.client.post("/api/login", json={"password": "nope"}).status_code, 429)
+
+    def test_correct_passcode_is_never_locked_out(self):
+        # The key property: a flood of wrong guesses must NOT lock out the real
+        # owner — the correct passcode is checked first and always wins.
+        for _ in range(app_module._LOGIN_MAX + 5):
+            self.client.post("/api/login", json={"password": "nope"})
         r = self.client.post("/api/login", json={"password": "secret"})
-        self.assertEqual(r.status_code, 429)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("token", r.get_json())
 
     def test_success_clears_failures(self):
         for _ in range(app_module._LOGIN_MAX - 1):
@@ -406,30 +417,18 @@ class LoginRateLimit(Base):
         r = self.client.post("/api/login", json={"password": "secret"})
         self.assertEqual(r.status_code, 200)
         self.assertIn("token", r.get_json())
-        # The counter reset, so a later wrong attempt is a plain 401, not a lockout.
+        # The counter reset, so a later wrong attempt is a plain 401, not a 429.
         self.assertEqual(
             self.client.post("/api/login", json={"password": "nope"}).status_code, 401)
 
-    def test_spoofed_forwarded_header_on_direct_path_is_ignored(self):
-        # Direct LAN connection (real remote_addr): a rotated CF-Connecting-IP
-        # must NOT create fresh buckets, so the per-IP lockout still trips.
+    def test_rotated_forwarded_ip_does_not_bypass_the_throttle(self):
+        # The throttle is global (no per-IP bucket), so rotating CF-Connecting-IP
+        # on every request can't escape it — wrong guesses still 429 past the cap.
         for i in range(app_module._LOGIN_MAX):
-            r = self.client.post("/api/login", json={"password": "nope"},
-                                 headers={"CF-Connecting-IP": f"1.2.3.{i}"},
-                                 environ_base={"REMOTE_ADDR": "10.0.0.5"})
-            self.assertEqual(r.status_code, 401)
-        r = self.client.post("/api/login", json={"password": "secret"},
-                             headers={"CF-Connecting-IP": "9.9.9.9"},
-                             environ_base={"REMOTE_ADDR": "10.0.0.5"})
-        self.assertEqual(r.status_code, 429)
-
-    def test_global_cap_catches_distributed_spray(self):
-        # Through the tunnel (loopback remote_addr) each distinct CF-Connecting-IP
-        # is its own bucket, so per-IP never trips — the global cap still bounds it.
-        for i in range(app_module._LOGIN_GLOBAL_MAX):
-            self.client.post("/api/login", json={"password": "nope"},
-                             headers={"CF-Connecting-IP": f"203.0.113.{i}"})
-        r = self.client.post("/api/login", json={"password": "secret"},
+            self.assertEqual(self.client.post(
+                "/api/login", json={"password": "nope"},
+                headers={"CF-Connecting-IP": f"203.0.113.{i}"}).status_code, 401)
+        r = self.client.post("/api/login", json={"password": "nope"},
                              headers={"CF-Connecting-IP": "203.0.113.250"})
         self.assertEqual(r.status_code, 429)
 
@@ -1437,6 +1436,302 @@ class UnitTableParity(unittest.TestCase):
 
     def test_count_parity(self):
         self.assertEqual(self._js_keys("_UNIT_CT"), set(units._COUNT))
+
+
+# ============================================================================
+# Audit-fix regression tests (2026-06-12 full-spectrum audit, 28 findings)
+# ============================================================================
+
+_DC_SQID = "LNKNR2A7MBB4K"   # seeded Pubkey DC square_location_id
+_LABOR0 = {"labor": 0.0, "hours": 0, "shifts": 0, "unwaged_hours": 0,
+           "unwaged_shifts": 0, "warning": None, "error": None}
+
+
+class UsageCogsDenominator(Base):
+    """HIGH fix: usage COGS spans the count interval, so COGS%/prime% must divide
+    by THAT interval's sales, not the (shorter) requested range's sales."""
+
+    def _count(self, date_str, value):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO counts(location_id, taken_at, value) VALUES(1,?,?)",
+                             (f"{date_str} 12:00:00", value))
+            get_db().commit()
+
+    def _invoice(self, date_str, total):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO invoices(location_id, vendor, invoice_date, total) "
+                             "VALUES(1,'V',?,?)", (date_str, total))
+            get_db().commit()
+
+    def test_cogs_pct_uses_interval_sales_not_range_sales(self):
+        self._count("2026-05-30", 1000.0)        # opening, just before the range
+        self._count("2026-07-02", 800.0)         # closing, just after
+        self._invoice("2026-06-15", 700.0)       # in-interval -> usage = 1000+700-800 = 900
+        with flask_app.app_context(), \
+                mock.patch.object(square_client, "is_configured", return_value=True), \
+                mock.patch.object(square_client, "get_sales",
+                                  return_value={"sales": 1000.0, "orders": 1, "error": None}), \
+                mock.patch.object(square_client, "get_labor", return_value=dict(_LABOR0)), \
+                mock.patch.object(square_client, "daily_sales_cached",
+                                  return_value={"a": 1500.0, "b": 1500.0}):   # interval sales = 3000
+            s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(s["cogs_method"], "usage")
+        self.assertEqual(s["cogs"], 900.0)
+        self.assertEqual(s["cogs_sales"], 3000.0)
+        self.assertEqual(s["cogs_pct"], 30.0)    # 900/3000, NOT the inflated 900/1000=90
+        self.assertEqual(s["sales"], 1000.0)      # labor% still uses range sales
+
+
+class UsageCogsBrackets(Base):
+    def _count(self, d, v):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO counts(location_id, taken_at, value) VALUES(1,?,?)",
+                             (f"{d} 12:00:00", v)); get_db().commit()
+
+    def _invoice(self, d, t):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO invoices(location_id, vendor, invoice_date, total) "
+                             "VALUES(1,'V',?,?)", (d, t)); get_db().commit()
+
+    def test_short_range_overshoot_falls_back_to_purchases(self):
+        self._count("2026-06-01", 1000.0)
+        self._count("2026-06-20", 800.0)         # spans far beyond a 2-day range
+        self._invoice("2026-06-10", 500.0)
+        with flask_app.app_context():
+            s = cogs.summary(dt.date(2026, 6, 10), dt.date(2026, 6, 11))
+        self.assertEqual(s["cogs_method"], "purchases")
+
+    def test_single_count_falls_back_to_purchases(self):
+        self._count("2026-06-15", 1000.0)
+        self._invoice("2026-06-10", 500.0)
+        with flask_app.app_context():
+            s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(s["cogs_method"], "purchases")
+
+
+class CategoryReportUncategorized(Base):
+    def test_uncategorized_line_counts_in_grand_total(self):
+        with flask_app.app_context():
+            d = get_db()
+            wine = d.execute("SELECT id FROM categories WHERE name='Wine'").fetchone()["id"]
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-05',150)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total,category_id) VALUES(?,?,?,?)",
+                      (iid, "a", 100.0, wine))
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total,category_id) VALUES(?,?,?,NULL)",
+                      (iid, "b", 50.0))
+            d.commit()
+            cr = reports.category_report(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(cr["grand_total"], 150.0)          # includes the 50 uncategorized
+        self.assertEqual(cr["column_totals"][0], 50.0)      # the Uncategorized column (id 0)
+        self.assertTrue(any(c["id"] == 0 and c["name"] == "Uncategorized" for c in cr["categories"]))
+
+
+class ApiHardening(Base):
+    def test_bad_date_param_is_400_json(self):
+        r = self.client.get("/api/dashboard?start=not-a-date&end=2026-06-30")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("error", r.get_json())
+
+    def test_non_object_json_body_does_not_500(self):
+        for ep in ("/api/recipes", "/api/invoices", "/api/counts"):
+            self.assertNotEqual(self.client.post(ep, json=[1, 2, 3]).status_code, 500)
+
+    def test_404_is_json_error_shape(self):
+        r = self.client.get("/api/recipes/999999")
+        self.assertEqual(r.status_code, 404)
+        self.assertIn("error", r.get_json())
+
+    def test_array_field_value_does_not_500(self):
+        pid = self.client.post("/api/products", json={"name": "X", "unit_cost": 1}).get_json()["id"]
+        self.assertNotEqual(self.client.put(f"/api/products/{pid}", json={"unit": ["x"]}).status_code, 500)
+
+    def test_non_string_name_is_rejected_not_500(self):
+        r = self.client.post("/api/categories", json={"name": 123, "category_type": "Liquor"})
+        self.assertEqual(r.status_code, 400)            # 123 -> "" -> name required -> 400, not 500
+
+    def test_malformed_line_items_does_not_500(self):
+        r = self.client.post("/api/invoices", json={"vendor": "V", "invoice_number": "",
+                                                    "invoice_date": "2026-06-01", "total": 5,
+                                                    "line_items": "oops"})
+        self.assertNotEqual(r.status_code, 500)
+
+
+class AuthGateCoverage(Base):
+    def setUp(self):
+        super().setUp()
+        os.environ["APP_PASSWORD"] = "secret"
+        os.environ["APP_SECRET"] = "testsecret"
+
+    def tearDown(self):
+        os.environ["APP_PASSWORD"] = ""
+        os.environ["APP_SECRET"] = ""
+        super().tearDown()
+
+    def test_tokenless_data_endpoints_401(self):
+        for ep in ("/api/dashboard", "/api/invoices", "/api/counts"):
+            self.assertEqual(self.client.get(ep).status_code, 401)
+
+    def test_config_open_but_minimal_pre_login(self):
+        j = self.client.get("/api/config").get_json()
+        self.assertEqual(j.get("auth_required"), True)
+        self.assertNotIn("square_location_id", j)        # don't leak config pre-login
+        self.assertNotIn("target_cogs_pct", j)
+
+    def test_valid_token_is_accepted(self):
+        token = self.client.post("/api/login", json={"password": "secret"}).get_json()["token"]
+        r = self.client.get("/api/invoices", headers={"Authorization": "Bearer " + token})
+        self.assertEqual(r.status_code, 200)
+
+
+class GetSalesPagination(Base):
+    def test_sums_net_across_pages_and_converts_cents(self):
+        page1 = {"orders": [{"net_amounts": {"total_money": {"amount": 1180},
+                                             "tax_money": {"amount": 100},
+                                             "tip_money": {"amount": 80}}}], "cursor": "c"}
+        page2 = {"orders": [{"net_amounts": {"total_money": {"amount": 1000}}}], "cursor": None}
+
+        class FakeResp:
+            def __init__(self, d): self._d = d
+            def raise_for_status(self): pass
+            def json(self): return self._d
+
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post",
+                                   side_effect=[FakeResp(page1), FakeResp(page2)]):
+                info = square_client.get_sales(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertEqual(info["sales"], 20.0)   # (1000 + 1000) cents
+        self.assertEqual(info["orders"], 2)
+
+
+class SquareLocationOutbound(Base):
+    def test_get_labor_posts_active_store_location(self):
+        captured = {}
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return {"shifts": [], "cursor": None}
+
+        def fake_post(url, **kw):
+            captured["body"] = kw.get("json")
+            return FakeResp()
+
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post", side_effect=fake_post):
+                square_client.get_labor(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertEqual(captured["body"]["query"]["filter"]["location_ids"], [_DC_SQID])
+
+
+class DailySalesStaleWindow(Base):
+    def test_only_today_and_yesterday_refetched(self):
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            today = square_client.business_today()
+            d = get_db()
+            for n in range(0, 11):                      # cache every day in [today-10, today]
+                day = (today - dt.timedelta(days=n)).isoformat()
+                d.execute("INSERT INTO daily_sales(square_location_id,date,net_sales,fetched_at) "
+                          "VALUES(?,?,?, '2020-01-01')", (_DC_SQID, day, 111.0))
+            d.commit()
+            calls = {}
+
+            def fake_fetch(start, end):
+                calls["start"] = start
+                return {}
+
+            with mock.patch.object(square_client, "get_daily_sales", side_effect=fake_fetch):
+                res = square_client.daily_sales_cached(today - dt.timedelta(days=10), today)
+        self.assertEqual(calls["start"], today - dt.timedelta(days=1))   # only today+yesterday
+        old = (today - dt.timedelta(days=10)).isoformat()
+        self.assertEqual(res[old], 111.0)                                 # historical served from cache
+
+
+class ControllablePLValues(Base):
+    def test_income_cogs_and_margins(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("INSERT INTO sales_mix(location_id,period_start,period_end,category_type,pct) "
+                      "VALUES(1,'2026-06-01','2026-06-30','Wine',100)")
+            wine = d.execute("SELECT id FROM categories WHERE name='Wine'").fetchone()["id"]
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-05',300)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total,category_id) VALUES(?,?,?,?)",
+                      (iid, "a", 300.0, wine))
+            d.commit()
+            labor = dict(_LABOR0); labor["labor"] = 100.0
+            with mock.patch.object(square_client, "get_sales",
+                                   return_value={"sales": 1000.0, "orders": 1, "error": None}), \
+                    mock.patch.object(square_client, "get_labor", return_value=labor), \
+                    mock.patch.object(square_client, "is_configured", return_value=True):
+                pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(pl["total_income"], 1000.0)
+        wine_income = [i for i in pl["income"] if i["category_type"] == "Wine"][0]
+        self.assertEqual(wine_income["amt"], 1000.0)        # 1000 * 100%
+        self.assertEqual(pl["total_cogs"], 300.0)
+        self.assertEqual(pl["gross_profit"], 700.0)         # 1000 - 300
+        self.assertEqual(pl["controllable_profit"], 600.0)  # 700 - 100 labor
+
+
+class CsvFormulaSafety(Base):
+    def test_formula_prefix_is_neutralized(self):
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,?,'2026-06-05',10)", ("=HYPERLINK(1)",)).lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,?,?)", (iid, "x", 10.0))
+            d.commit()
+        text = self.client.get("/api/export/purchases.csv?start=2026-06-01&end=2026-06-30").get_data(as_text=True)
+        self.assertIn("'=HYPERLINK(1)", text)               # apostrophe-guarded
+
+
+class CrossStoreProductName(Base):
+    def test_foreign_product_name_not_leaked(self):
+        with flask_app.app_context():
+            d = get_db()
+            pid2 = d.execute("INSERT INTO inventory_items(location_id,name) VALUES(2,'SecretNYC')").lastrowid
+            d.execute("INSERT INTO vendor_items(location_id,vendor_name,vendor_item_name,product_id,status) "
+                      "VALUES(1,'V','item',?, 'reviewed')", (pid2,))
+            d.commit()
+        rows = self.client.get("/api/vendor-items", headers={"X-Location-Id": "1"}).get_json()
+        item = [r for r in rows if r["vendor_item_name"] == "item"][0]
+        self.assertIsNone(item["product_name"])             # store-2 product name not surfaced
+
+
+class SalesMixValidation(Base):
+    def _put(self, mix):
+        return self.client.put("/api/sales-mix?start=2026-06-01&end=2026-06-30", json={"mix": mix})
+
+    def test_mix_must_total_100(self):
+        self.assertEqual(self._put({"Wine": 80}).status_code, 400)
+        self.assertEqual(self._put({"Wine": 60, "Beer": 40}).status_code, 200)
+        self.assertEqual(self._put({"Wine": 0, "Beer": 0}).status_code, 200)   # all-zero clears
+
+
+class ImporterParsing(Base):
+    def test_import_invoices_attributes_category_columns(self):
+        import import_marginedge
+        rows = [
+            ["Invoice Date", "Invoice #", "Vendor", "Total", "Liquor", "Wine"],
+            ["06/05/2026", "INV1", "Acme", "$150.00", "100.00", "50.00"],
+        ]
+        path = os.path.join(self.tmpdir, "categoryReport.csv")
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            csv.writer(fh).writerows(rows)
+        with flask_app.app_context():
+            imp = import_marginedge.Importer(get_db(), 1)
+            imp.import_invoices(path)
+            get_db().commit()
+            inv = get_db().execute("SELECT id, total FROM invoices WHERE invoice_number='INV1'").fetchone()
+            self.assertEqual(inv["total"], 150.0)
+            lines = get_db().execute(
+                "SELECT ii.total, c.name AS cat FROM invoice_items ii "
+                "LEFT JOIN categories c ON c.id = ii.category_id WHERE ii.invoice_id=?",
+                (inv["id"],)).fetchall()
+        by_cat = {r["cat"]: r["total"] for r in lines}
+        self.assertEqual(by_cat.get("Liquor"), 100.0)
+        self.assertEqual(by_cat.get("Wine"), 50.0)
 
 
 if __name__ == "__main__":

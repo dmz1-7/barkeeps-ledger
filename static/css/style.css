@@ -266,6 +266,9 @@ input:focus, select:focus, textarea:focus {
 }
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+/* recipe ingredient row: product | qty | unit | delete */
+.rrow { display: grid; grid-template-columns: 1fr 4.5rem 5rem auto; gap: 6px; align-items: center; margin-bottom: 6px; }
+.rrow input, .rrow select { width: 100%; }
 
 /* ---------- lists ---------- */
 .list { margin: 4px 0; }

@@ -14,11 +14,21 @@ import reports
 from db import get_db, active_location_id
 
 
+def _safe(cell):
+    """Neutralize spreadsheet formula injection: a text cell starting with =,
+    +, -, @, or a control char is evaluated as a formula by Excel/Sheets, and
+    vendor/item/recipe names are free text (some AI-parsed). Prefix such cells
+    with an apostrophe so they import as literal text."""
+    if isinstance(cell, str) and cell[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + cell
+    return cell
+
+
 def _csv(header, rows):
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(header)
-    w.writerows(rows)
+    w.writerows([_safe(c) for c in row] for row in rows)
     return buf.getvalue()
 
 
