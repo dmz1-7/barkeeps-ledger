@@ -20,9 +20,17 @@ if [ ! -x ./cloudflared ]; then
   chmod +x cloudflared
 fi
 
-# Start the app (detached) unless it's already responding.
+# Start the app (detached) unless it's already responding. Prefer a production
+# WSGI server (gunicorn) over the Werkzeug dev server for public exposure; pin a
+# SINGLE worker so the in-process login throttle stays effective. Fall back to the
+# dev server only if gunicorn isn't installed.
 if ! curl -fsS -o /dev/null http://localhost:8088/api/health 2>/dev/null; then
-  setsid nohup .venv/bin/python app.py > /tmp/ledger.log 2>&1 &
+  if .venv/bin/python -c "import gunicorn" 2>/dev/null; then
+    setsid nohup .venv/bin/gunicorn -w 1 -b 127.0.0.1:8088 app:app > /tmp/ledger.log 2>&1 &
+  else
+    echo "  [!] gunicorn not installed; falling back to the dev server. Run 'pip install gunicorn' for production." >&2
+    setsid nohup .venv/bin/python app.py > /tmp/ledger.log 2>&1 &
+  fi
   sleep 3
 fi
 

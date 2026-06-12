@@ -112,9 +112,33 @@ class Importer:
             "UPDATE invoice_items SET vendor_item_id=NULL WHERE vendor_item_id IN "
             "(SELECT id FROM vendor_items WHERE location_id IS ?)", (self.loc,))
         self.c.execute("DELETE FROM vendor_items WHERE location_id IS ?", (self.loc,))
+        # recipe_items.product_id carries a real ON DELETE SET NULL FK, so deleting
+        # inventory_items would NULL every recipe ingredient link and make recipes
+        # silently cost $0. Snapshot each line's product NAME now and re-link by name
+        # after the products are re-imported (see relink_recipes).
+        self._recipe_links = {
+            r["id"]: r["name"] for r in self.c.execute(
+                "SELECT ri.id AS id, ii.name AS name FROM recipe_items ri "
+                "JOIN inventory_items ii ON ii.id = ri.product_id "
+                "WHERE ii.location_id IS ?", (self.loc,))
+        }
         self.c.execute("DELETE FROM inventory_items WHERE location_id IS ?", (self.loc,))
         self.c.execute("DELETE FROM vendors WHERE location_id IS ?", (self.loc,))
         print(f"  cleared prior data for location {self.loc} (invoices, items, vendor_items, products, vendors)")
+
+    def relink_recipes(self):
+        """Re-attach recipe ingredients to the re-imported products by name, undoing
+        the ON DELETE SET NULL the inventory wipe triggered. Call after import_products."""
+        relinked = 0
+        for ri_id, name in getattr(self, "_recipe_links", {}).items():
+            row = self.c.execute(
+                "SELECT id FROM inventory_items WHERE location_id IS ? AND name = ? COLLATE NOCASE",
+                (self.loc, name)).fetchone()
+            if row:
+                self.c.execute("UPDATE recipe_items SET product_id=? WHERE id=?", (row["id"], ri_id))
+                relinked += 1
+        if self._recipe_links:
+            print(f"  re-linked {relinked}/{len(self._recipe_links)} recipe ingredients by name")
 
     def import_products(self, rows):
         for r in rows:
@@ -249,6 +273,7 @@ def main():
     print(f"  category report: {os.path.basename(category_report)}")
     imp.clear_location()
     imp.import_products(_read(products))
+    imp.relink_recipes()   # restore recipe ingredient links the inventory wipe NULLed
     imp.import_vendor_items(_read(vendor_items))
     imp.import_invoices(category_report)
     conn.commit()
