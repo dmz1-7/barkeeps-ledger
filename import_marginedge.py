@@ -101,6 +101,16 @@ class Importer:
     # --- clear only THIS location's data so other stores are untouched ---
     def clear_location(self):
         self.c.execute("DELETE FROM invoices WHERE location_id IS ?", (self.loc,))  # cascades items
+        # A MIGRATED DB has no ON DELETE SET NULL FK on invoice_items.{inventory_item_id,
+        # vendor_item_id} (ALTER ADD COLUMN can't carry REFERENCES), so a fresh DB would
+        # NULL these on parent delete but a migrated one would dangle. Null any surviving
+        # (cross-location) references to THIS location's items BEFORE we hard-delete them.
+        self.c.execute(
+            "UPDATE invoice_items SET inventory_item_id=NULL WHERE inventory_item_id IN "
+            "(SELECT id FROM inventory_items WHERE location_id IS ?)", (self.loc,))
+        self.c.execute(
+            "UPDATE invoice_items SET vendor_item_id=NULL WHERE vendor_item_id IN "
+            "(SELECT id FROM vendor_items WHERE location_id IS ?)", (self.loc,))
         self.c.execute("DELETE FROM vendor_items WHERE location_id IS ?", (self.loc,))
         self.c.execute("DELETE FROM inventory_items WHERE location_id IS ?", (self.loc,))
         self.c.execute("DELETE FROM vendors WHERE location_id IS ?", (self.loc,))

@@ -298,9 +298,7 @@ input:focus, select:focus, textarea:focus {
 }
 /* category-type + status pills: data labels, tuned for AA text contrast.
    Rendered as a soft tint + readable colored text + hairline (restrained). */
-.pill.liquor, .pill.beer, .pill.wine, .pill.food, .pill.supplies,
-.pill.na_beverage, .pill.other,
-.pill[class*="type-"], .pill[class*="st-"] {
+.pill.wine, .pill[class*="type-"], .pill[class*="st-"] {
   background: var(--surface-2); color: var(--text); border-color: var(--border);
 }
 .pill.type-Food   { color: var(--ok); }

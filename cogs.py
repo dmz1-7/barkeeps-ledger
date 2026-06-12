@@ -95,15 +95,20 @@ def _inventory_value_near(target, prefer_before=True):
     """
     db = get_db()
     loc = active_location_id()
+    # Compare taken_at (text 'YYYY-MM-DD HH:MM:SS') as a plain string rather than
+    # wrapping it in date(): a bare column predicate is sargable, so the
+    # (location_id, taken_at) index serves the range scan instead of recomputing
+    # date() over every one of the store's counts. '<' next-day catches all of
+    # the target day's timestamps; '>=' target sorts at/before any same-day time.
     if prefer_before:
         row = db.execute(
-            "SELECT id, value, taken_at FROM counts WHERE location_id IS ? AND date(taken_at) <= ? "
+            "SELECT id, value, taken_at FROM counts WHERE location_id IS ? AND taken_at < ? "
             "ORDER BY taken_at DESC LIMIT 1",
-            (loc, target.isoformat()),
+            (loc, (target + dt.timedelta(days=1)).isoformat()),
         ).fetchone()
     else:
         row = db.execute(
-            "SELECT id, value, taken_at FROM counts WHERE location_id IS ? AND date(taken_at) >= ? "
+            "SELECT id, value, taken_at FROM counts WHERE location_id IS ? AND taken_at >= ? "
             "ORDER BY taken_at ASC LIMIT 1",
             (loc, target.isoformat()),
         ).fetchone()
@@ -185,14 +190,13 @@ def summary(start, end):
                  if cogs_pct is not None and labor_pct is not None else None)
     # Prime DOLLARS: in interval mode scale COGS to the requested range before
     # adding (range-spanning) labor, so the figure isn't an interval+range mash.
+    # Scale by the SALES ratio (range/interval), not a calendar-day ratio, so
+    # prime$ / range_sales reconciles with prime_pct (= cogs_pct + labor_pct).
+    # cogs_pct divides by interval sales, so prime_cogs = cogs_amount * range
+    # sales / interval sales == cogs_pct% * range sales — the same basis.
     prime_cogs = cogs_amount
-    if cogs_sales_basis == "interval":
-        range_days = (end - start).days + 1
-        # COGS/interval-sales span the (b_date, e_date] window = interval_days-1
-        # days (the opening-count day is excluded), so scale by that, not the
-        # inclusive interval_days, to stay consistent with cogs_pct.
-        span_days = max(interval_days - 1, 1)
-        prime_cogs = money.normalize(cogs_amount * range_days / span_days) or 0.0
+    if cogs_sales_basis == "interval" and cogs_sales:
+        prime_cogs = money.normalize(cogs_amount * sales / cogs_sales) or 0.0
     prime = round((prime_cogs or 0.0) + labor, 2)
 
     return {

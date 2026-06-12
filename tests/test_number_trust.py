@@ -2483,7 +2483,10 @@ class SalesReportColumns(Base):
 
 
 class PrimeDollarConsistency(Base):
-    def test_prime_dollars_scale_over_consumption_span(self):
+    def test_prime_dollars_reconcile_with_prime_pct(self):
+        """In usage+interval mode, prime$ / range-sales must equal prime% — the
+        natural P&L sanity check. prime_cogs is scaled by the SALES ratio
+        (range/interval), not calendar days, so the two derived figures agree."""
         with flask_app.app_context():
             d = get_db()
             for day, val in (("2026-05-30", 1000.0), ("2026-07-02", 800.0)):
@@ -2501,8 +2504,12 @@ class PrimeDollarConsistency(Base):
                                       side_effect=lambda b, e: {(b + dt.timedelta(days=i)).isoformat(): 100.0
                                                                 for i in range((e - b).days + 1)}):
                 s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
-        # span = 33 days (opening excluded); prime COGS = 900 * 30/33 = 818.18 (+$0 labor)
-        self.assertEqual(s["prime"], 818.18)
+        # usage COGS = 1000 + 700 - 800 = 900; interval sales = 33d*100 = 3300;
+        # cogs_pct = 900/3300 = 27.3%; prime_cogs = 900 * 1000/3300 = 272.73.
+        self.assertEqual(s["prime"], 272.73)
+        self.assertEqual(s["cogs_sales_basis"], "interval")
+        # the invariant: prime$ back-checks to prime% against the range sales.
+        self.assertAlmostEqual(s["prime"] / s["sales"] * 100, s["prime_pct"], places=1)
 
 
 # ============================================================================
@@ -2605,6 +2612,157 @@ class SquareLocationUnique(Base):
         r = self.client.post("/api/settings", json={"square_location_id": "LS1WRASW8V02R"},
                              headers={"X-Location-Id": "1"})
         self.assertEqual(r.status_code, 400)
+
+
+# ============================================================================
+# Ninth audit-fix regression tests (2026-06-12, 9th re-audit)
+# ============================================================================
+
+class LocationHeaderRobustness(Base):
+    def test_oversized_header_falls_back_not_500(self):
+        # > signed-64-bit: int() accepts it but SQLite would OverflowError on bind.
+        # The resolver must swallow it and fall back to the default store, not 500.
+        r = self.client.get("/api/dashboard", headers={"X-Location-Id": str(2 ** 63)})
+        self.assertEqual(r.status_code, 200)
+        r2 = self.client.get("/api/dashboard", headers={"X-Location-Id": "-" + str(2 ** 63 + 1)})
+        self.assertEqual(r2.status_code, 200)
+
+    def test_oversized_id_in_body_is_clean_not_500(self):
+        # an out-of-range id in a JSON body must drop to NULL/clean error, never 500
+        r = self.client.put("/api/active-location", json={"location_id": 10 ** 30})
+        self.assertNotEqual(r.status_code, 500)
+        r2 = self.client.post("/api/products", json={"name": "X", "category_id": 10 ** 30})
+        self.assertNotEqual(r2.status_code, 500)
+
+
+class LocationHeaderAuthGated(AuthGateCoverage):
+    def test_authed_header_scopes_tokenless_does_not(self):
+        token = self.client.post("/api/login", json={"password": "secret"}).get_json()["token"]
+        # authed + X-Location-Id:2 is honored
+        r = self.client.get("/api/invoices", headers={"Authorization": "Bearer " + token,
+                                                       "X-Location-Id": "2"})
+        self.assertEqual(r.status_code, 200)
+        # tokenless request with the same header never binds an override — it's 401'd
+        r2 = self.client.get("/api/invoices", headers={"X-Location-Id": "2"})
+        self.assertEqual(r2.status_code, 401)
+
+
+class CountsDateBoundary(Base):
+    """The sargable rewrite (taken_at < next-day / >= target) must keep the same
+    same-day-inclusive semantics the date() wrap had."""
+    def test_same_day_count_is_found_on_both_sides(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("INSERT INTO counts(location_id,taken_at,value) VALUES(1,'2026-06-15 23:30:00',500)")
+            d.commit()
+            before = cogs._inventory_value_near(dt.date(2026, 6, 15), prefer_before=True)
+            after = cogs._inventory_value_near(dt.date(2026, 6, 15), prefer_before=False)
+        self.assertEqual(before["value"], 500.0)   # late-evening count still counts for that day
+        self.assertEqual(after["value"], 500.0)
+
+
+class CategoryReportReconciles(Base):
+    def test_grand_total_matches_controllable_pl(self):
+        with flask_app.app_context():
+            d = get_db()
+            wine = d.execute("SELECT id FROM categories WHERE name='Wine'").fetchone()["id"]
+            beer = d.execute("SELECT id FROM categories WHERE name='Liquor'").fetchone()["id"]
+            # a tax-inclusive invoice with two categories whose lines sum to the total
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,subtotal,tax,total) "
+                            "VALUES(1,'V','2026-06-05',100,7,107)").lastrowid
+            for cat, amt in ((wine, 53.33), (beer, 53.67)):
+                d.execute("INSERT INTO invoice_items(invoice_id,name,total,category_id) VALUES(?,?,?,?)",
+                          (iid, "x", amt, cat))
+            d.commit()
+            cr = reports.category_report(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+            pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(cr["grand_total"], pl["total_cogs"])   # both deflate to the same pre-tax cents
+
+
+class ActiveLocationArchivedDefault(Base):
+    def test_archived_persisted_default_falls_through(self):
+        with flask_app.app_context():
+            d = get_db()
+            db.set_setting("active_location_id", "1")
+            d.execute("UPDATE locations SET archived=1 WHERE id=1")
+            d.commit()
+            # persisted default points at an archived store -> fall through to MIN active
+            self.assertEqual(db.active_location_id(), 2)
+
+
+class ImporterClearNoDangling(Base):
+    def test_clear_location_leaves_no_dangling_invoice_item_refs(self):
+        import import_marginedge
+        with flask_app.app_context():
+            d = get_db()
+            inv_item = d.execute("INSERT INTO inventory_items(location_id,name) VALUES(2,'Gin')").lastrowid
+            vi = d.execute("INSERT INTO vendor_items(location_id,vendor_item_name) VALUES(2,'Gin case')").lastrowid
+            # an invoice line in store 1 that (cross-tenant) references store-2 items
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-01',10)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total,inventory_item_id,vendor_item_id) "
+                      "VALUES(?,'x',10,?,?)", (iid, inv_item, vi))
+            d.commit()
+            import_marginedge.Importer(d, 2).clear_location()
+            d.commit()
+            row = d.execute("SELECT inventory_item_id, vendor_item_id FROM invoice_items "
+                            "WHERE invoice_id=?", (iid,)).fetchone()
+        self.assertIsNone(row["inventory_item_id"])   # nulled before the parent delete
+        self.assertIsNone(row["vendor_item_id"])
+
+
+class SquareErroredAggregators(Base):
+    def test_summary_and_pl_surface_square_errors_without_fake_zero(self):
+        soft_sales = {"sales": 0, "orders": 0, "error": "Square timed out"}
+        soft_labor = {"labor": 0, "hours": 0, "error": "Square timed out"}
+        with flask_app.app_context(), \
+                mock.patch.object(square_client, "is_configured", return_value=True), \
+                mock.patch.object(square_client, "get_sales", return_value=soft_sales), \
+                mock.patch.object(square_client, "get_labor", return_value=soft_labor):
+            s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+            pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(s["sales_error"], "Square timed out")
+        self.assertEqual(s["labor_error"], "Square timed out")
+        self.assertIsNone(s["cogs_pct"])    # no dividing real COGS by a spurious 0 sales
+        self.assertIsNone(s["labor_pct"])
+        self.assertEqual(pl["sales_error"], "Square timed out")
+
+
+class InvoiceEditPriceDownAndRemoval(Base):
+    def _post(self, num, date, items):
+        return self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_number": num, "invoice_date": date,
+            "total": sum(i["total"] for i in items), "line_items": items}).get_json()["id"]
+
+    def _gin(self, name="Gin", price=0.0):
+        return [{"name": name, "unit_cost": price, "qty": 1, "total": price}]
+
+    def _price(self):
+        r = get_db().execute("SELECT last_purchase_price FROM vendor_items "
+                             "WHERE lower(vendor_item_name)='gin'").fetchone()
+        return r["last_purchase_price"] if r else None
+
+    def test_lowering_latest_price_propagates_down(self):
+        self._post("D1", "2026-06-01", self._gin(price=20.0))
+        rid = self._post("D2", "2026-06-10", self._gin(price=26.0))
+        with flask_app.app_context():
+            self.assertEqual(self._price(), 26.0)
+        # correct the latest invoice DOWN (AI overstated the cost)
+        self.client.put(f"/api/invoices/{rid}", json={
+            "vendor": "Acme", "invoice_number": "D2", "invoice_date": "2026-06-10",
+            "total": 14, "line_items": self._gin(price=14.0)})
+        with flask_app.app_context():
+            self.assertEqual(self._price(), 14.0)
+
+    def test_removing_latest_sku_reverts_to_older_delivery(self):
+        self._post("R1", "2026-06-01", self._gin(price=20.0))
+        rid = self._post("R2", "2026-06-10", self._gin(price=26.0))
+        # edit the newest invoice to drop the Gin line entirely; an older 20.0 remains
+        self.client.put(f"/api/invoices/{rid}", json={
+            "vendor": "Acme", "invoice_number": "R2", "invoice_date": "2026-06-10",
+            "total": 5, "line_items": self._gin(name="Tonic", price=5.0)})
+        with flask_app.app_context():
+            self.assertEqual(self._price(), 20.0)   # reverts to the surviving older delivery
 
 
 if __name__ == "__main__":

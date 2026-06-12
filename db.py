@@ -547,14 +547,19 @@ def active_location_id():
         return override
     v = get_setting("active_location_id")
     try:
-        return int(v)
+        lid = int(v)
     except (TypeError, ValueError):
-        # Fall back to the lowest store. A real id is always present (the seed
-        # creates DC/NYC), so this never returns None in practice — and the
-        # location backfill leaves no NULL-location rows for a stray None to
-        # match, so `location_id IS ?` can't leak orphans.
-        row = get_db().execute("SELECT MIN(id) AS id FROM locations WHERE archived=0").fetchone()
-        return row["id"] if row and row["id"] is not None else 1
+        lid = None
+    # Honor the persisted default only if it still points at an ACTIVE store. If
+    # that store was later archived (or the setting is missing/garbage), fall
+    # through to the lowest active store so we never act on an archived tenant —
+    # matching the header-override and MIN() branches, both of which filter
+    # archived=0. A real id is always present (the seed creates DC/NYC).
+    if lid is not None and get_db().execute(
+            "SELECT 1 FROM locations WHERE id=? AND archived=0", (lid,)).fetchone():
+        return lid
+    row = get_db().execute("SELECT MIN(id) AS id FROM locations WHERE archived=0").fetchone()
+    return row["id"] if row and row["id"] is not None else 1
 
 
 def set_setting(key, value):
