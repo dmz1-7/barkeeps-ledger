@@ -11,6 +11,9 @@ Run:  python app.py    (see README for configuration)
 import hashlib
 import hmac
 import os
+import secrets
+import threading
+import time
 import uuid
 
 # Load .env before importing modules that read the environment at import time.
@@ -36,18 +39,46 @@ ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.teardown_appcontext(db.close_db)
+# Cap uploads so a giant (or malicious) file can't exhaust memory/disk. 32 MB
+# covers a full-resolution phone photo while still bounding abuse.
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
+
+
+@app.errorhandler(413)
+def _too_large(_e):
+    mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
+    return jsonify({"error": f"That file is too large (max {mb} MB)."}), 413
 
 
 # --- auth -------------------------------------------------------------------
 # Single shared passcode for a personal tool. Set APP_PASSWORD to enable it;
 # leave it unset to run open (fine on a private LAN, noted in the README).
 
+def _app_secret():
+    """The key the session token is signed with. Prefer an explicit APP_SECRET;
+    otherwise use a random per-install secret persisted in the DB. Never a shipped
+    constant — a known signing key would let anyone forge a session token."""
+    env = os.environ.get("APP_SECRET", "").strip()
+    if env:
+        return env
+    s = db.get_setting("app_secret")
+    if not s:
+        # Insert-if-absent then re-read, so concurrent first-boot requests all
+        # converge on whichever random secret landed first (no token churn).
+        db.set_setting_default("app_secret", secrets.token_hex(32))
+        s = db.get_setting("app_secret")
+    return s
+
+
+def _token_for(pw):
+    return hmac.new(_app_secret().encode(), pw.encode(), hashlib.sha256).hexdigest()
+
+
 def _expected_token():
     pw = os.environ.get("APP_PASSWORD", "")
     if not pw:
         return None
-    secret = os.environ.get("APP_SECRET", "barkeep-secret")
-    return hmac.new(secret.encode(), pw.encode(), hashlib.sha256).hexdigest()
+    return _token_for(pw)
 
 
 def _authed():
@@ -72,16 +103,51 @@ def _guard():
             return jsonify({"error": "unauthorized"}), 401
 
 
+# Throttle passcode guessing. In-memory (single-process dev server).
+_LOGIN_FAILS = {}          # key -> [recent failure timestamps]
+_LOGIN_MAX = 8             # per-key failures per window before lockout
+_LOGIN_GLOBAL_MAX = 50     # backstop across ALL keys, immune to header spoofing
+_LOGIN_WINDOW = 300        # seconds
+
+
+def _login_key():
+    # Trust the forwarded client IP only from the tunnel's loopback origin; on a
+    # direct connection CF-Connecting-IP is attacker-controlled, so key on the
+    # real socket address (which can't be spoofed per request) instead.
+    addr = request.remote_addr or "?"
+    if addr in ("127.0.0.1", "::1"):
+        return request.headers.get("CF-Connecting-IP") or addr
+    return addr
+
+
+def _login_blocked(key):
+    now = time.monotonic()
+    total = 0
+    for k in list(_LOGIN_FAILS.keys()):          # sweep: prune stale, count live
+        live = [t for t in _LOGIN_FAILS[k] if now - t < _LOGIN_WINDOW]
+        if live:
+            _LOGIN_FAILS[k] = live
+            total += len(live)
+        else:
+            del _LOGIN_FAILS[k]                   # don't leak keys for one-off IPs
+    # Per-key lockout, plus a global cap that a rotated CF-Connecting-IP can't escape.
+    return len(_LOGIN_FAILS.get(key, [])) >= _LOGIN_MAX or total >= _LOGIN_GLOBAL_MAX
+
+
 @app.post("/api/login")
 def login():
     expected = _expected_token()
     if expected is None:
         return jsonify({"token": "", "auth_required": False})
+    key = _login_key()
+    if _login_blocked(key):
+        return jsonify({"error": "Too many attempts. Wait a few minutes and try again."}), 429
     pw = (request.json or {}).get("password", "")
-    secret = os.environ.get("APP_SECRET", "barkeep-secret")
-    token = hmac.new(secret.encode(), pw.encode(), hashlib.sha256).hexdigest()
+    token = _token_for(pw)
     if hmac.compare_digest(token, expected):
+        _LOGIN_FAILS.pop(key, None)   # clear on success
         return jsonify({"token": token, "auth_required": True})
+    _LOGIN_FAILS.setdefault(key, []).append(time.monotonic())
     return jsonify({"error": "Wrong passcode."}), 401
 
 
@@ -133,6 +199,15 @@ def save_settings():
     if data.get("square_token"):
         db.set_setting("square_token", data["square_token"].strip())
     return jsonify({"ok": True})
+
+
+@app.post("/api/backup")
+def backup_now():
+    """Snapshot the database on demand (also runs at startup and periodically)."""
+    path = db.backup()
+    if not path:
+        return jsonify({"error": "No database to back up yet."}), 400
+    return jsonify({"ok": True, "file": os.path.basename(path)})
 
 
 @app.get("/api/square-locations")
@@ -213,6 +288,14 @@ def invoice_create():
     inv_date = d.get("invoice_date", "")
     database = db.get_db()
     loc = db.active_location_id()
+    # Guard against logging the same delivery twice (a re-snapped photo or a
+    # double-tap), which would silently double-count purchases and inflate COGS.
+    # The client can re-submit with confirm_duplicate=true to override.
+    if not d.get("confirm_duplicate"):
+        dup = _find_duplicate_invoice(
+            database, loc, vendor, d.get("invoice_number", ""), inv_date, _f(d.get("total")))
+        if dup:
+            return jsonify({"error": "duplicate", "duplicate": dup}), 409
     cur = database.execute(
         "INSERT INTO invoices(location_id, vendor, invoice_date, invoice_number, category, "
         "subtotal, tax, total, image_path, notes, raw_json, status, payment_account) "
@@ -265,7 +348,8 @@ def invoice_list():
 @app.get("/api/invoices/<int:inv_id>")
 def invoice_get(inv_id):
     db_ = db.get_db()
-    row = db_.execute("SELECT * FROM invoices WHERE id=?", (inv_id,)).fetchone()
+    row = db_.execute("SELECT * FROM invoices WHERE id=? AND location_id IS ?",
+                      (inv_id, db.active_location_id())).fetchone()
     if not row:
         abort(404)
     items = db_.execute(
@@ -273,21 +357,66 @@ def invoice_get(inv_id):
     ).fetchall()
     out = dict(row)
     out["line_items"] = [dict(i) for i in items]
+    out["reconciliation"] = _reconcile(
+        row["subtotal"], row["tax"], row["total"], out["line_items"])
     return jsonify(out)
 
 
 @app.delete("/api/invoices/<int:inv_id>")
 def invoice_delete(inv_id):
     db_ = db.get_db()
-    row = db_.execute("SELECT image_path FROM invoices WHERE id=?", (inv_id,)).fetchone()
-    db_.execute("DELETE FROM invoices WHERE id=?", (inv_id,))
+    loc = db.active_location_id()
+    row = db_.execute("SELECT image_path FROM invoices WHERE id=? AND location_id IS ?",
+                      (inv_id, loc)).fetchone()
+    if not row:
+        abort(404)
+    db_.execute("DELETE FROM invoices WHERE id=? AND location_id IS ?", (inv_id, loc))
     db_.commit()
-    if row and row["image_path"]:
+    if row["image_path"]:
         try:
             os.remove(os.path.join(UPLOAD_DIR, row["image_path"]))
         except OSError:
             pass
     return jsonify({"ok": True})
+
+
+@app.put("/api/invoices/<int:inv_id>")
+def invoice_update(inv_id):
+    """Edit a saved invoice: update the header and replace its line items. Lets
+    the owner fix an AI misparse instead of delete-and-re-enter. The image and
+    the original AI audit (raw_json) are preserved."""
+    d = request.json or {}
+    database = db.get_db()
+    loc = db.active_location_id()
+    if not database.execute(
+        "SELECT 1 FROM invoices WHERE id=? AND location_id IS ?", (inv_id, loc)
+    ).fetchone():
+        abort(404)
+    vendor = d.get("vendor", "")
+    inv_date = d.get("invoice_date", "")
+    database.execute(
+        "UPDATE invoices SET vendor=?, invoice_date=?, invoice_number=?, category=?, "
+        "subtotal=?, tax=?, total=?, notes=?, status=?, payment_account=? "
+        "WHERE id=? AND location_id IS ?",
+        (vendor, inv_date, d.get("invoice_number", ""), d.get("category"),
+         _f(d.get("subtotal")), _f(d.get("tax")), _f(d.get("total")),
+         d.get("notes", ""), d.get("status", "closed"), d.get("payment_account"),
+         inv_id, loc),
+    )
+    items = d.get("line_items") or []
+    database.execute("DELETE FROM invoice_items WHERE invoice_id=?", (inv_id,))
+    for it in items:
+        vi_id, cat_id = _resolve_vendor_item(database, vendor, inv_date, it, loc)
+        database.execute(
+            "INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, "
+            "vendor_item_id, category_id) VALUES(?,?,?,?,?,?,?,?)",
+            (inv_id, it.get("name", ""), _f(it.get("qty")), it.get("unit"),
+             _f(it.get("unit_cost")), _f(it.get("total")), vi_id, cat_id),
+        )
+    database.commit()
+    return jsonify({"id": inv_id,
+                    "reconciliation": _reconcile(d.get("subtotal"), d.get("tax"),
+                                                 d.get("total"), items)})
 
 
 # --- inventory --------------------------------------------------------------
@@ -327,15 +456,22 @@ def inventory_update(item_id):
             vals.append(d[key])
     if not sets:
         return jsonify({"ok": True})
-    vals.append(item_id)
-    db.get_db().execute(f"UPDATE inventory_items SET {','.join(sets)} WHERE id=?", vals)
+    vals += [item_id, db.active_location_id()]
+    cur = db.get_db().execute(
+        f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
 
 @app.delete("/api/inventory/<int:item_id>")
 def inventory_delete(item_id):
-    db.get_db().execute("UPDATE inventory_items SET archived=1 WHERE id=?", (item_id,))
+    cur = db.get_db().execute(
+        "UPDATE inventory_items SET archived=1 WHERE id=? AND location_id IS ?",
+        (item_id, db.active_location_id()))
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -362,17 +498,21 @@ def count_save():
     d = request.json or {}
     lines = d.get("lines") or []
     database = db.get_db()
+    loc = db.active_location_id()
     cur = database.execute(
         "INSERT INTO counts(location_id, note, value) VALUES(?, ?, 0)",
-        (db.active_location_id(), d.get("note", "")),
+        (loc, d.get("note", "")),
     )
     count_id = cur.lastrowid
     total_value = 0.0
     for ln in lines:
         item = database.execute(
-            "SELECT unit_cost FROM inventory_items WHERE id=?", (ln.get("item_id"),)
+            "SELECT unit_cost FROM inventory_items WHERE id=? AND location_id IS ?",
+            (ln.get("item_id"), loc),
         ).fetchone()
-        unit_cost = (item["unit_cost"] if item else 0) or 0
+        if not item:
+            continue  # ignore items that don't belong to the active store
+        unit_cost = item["unit_cost"] or 0
         qty = _f(ln.get("qty"), 0) or 0
         total_value += qty * unit_cost
         database.execute(
@@ -380,7 +520,8 @@ def count_save():
             (count_id, ln.get("item_id"), qty, unit_cost),
         )
         database.execute(
-            "UPDATE inventory_items SET last_count=? WHERE id=?", (qty, ln.get("item_id"))
+            "UPDATE inventory_items SET last_count=? WHERE id=? AND location_id IS ?",
+            (qty, ln.get("item_id"), loc),
         )
     database.execute("UPDATE counts SET value=? WHERE id=?", (round(total_value, 2), count_id))
     database.commit()
@@ -477,7 +618,8 @@ def vendor_create():
 @app.get("/api/vendors/<int:vid>")
 def vendor_get(vid):
     db_ = db.get_db()
-    v = db_.execute("SELECT * FROM vendors WHERE id=?", (vid,)).fetchone()
+    v = db_.execute("SELECT * FROM vendors WHERE id=? AND location_id IS ?",
+                    (vid, db.active_location_id())).fetchone()
     if not v:
         abort(404)
     out = dict(v)
@@ -509,15 +651,22 @@ def vendor_update(vid):
             vals.append(d[key])
     if not sets:
         return jsonify({"ok": True})
-    vals.append(vid)
-    db.get_db().execute(f"UPDATE vendors SET {','.join(sets)} WHERE id=?", vals)
+    vals += [vid, db.active_location_id()]
+    cur = db.get_db().execute(
+        f"UPDATE vendors SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
 
 @app.delete("/api/vendors/<int:vid>")
 def vendor_delete(vid):
-    db.get_db().execute("UPDATE vendors SET archived=1 WHERE id=?", (vid,))
+    cur = db.get_db().execute(
+        "UPDATE vendors SET archived=1 WHERE id=? AND location_id IS ?",
+        (vid, db.active_location_id()))
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -660,8 +809,11 @@ def product_new_item_accept(vid):
         sets.append("category_id=?"); vals.append(d["category_id"])
     if "product_id" in d:
         sets.append("product_id=?"); vals.append(d["product_id"])
-    vals.append(vid)
-    db.get_db().execute(f"UPDATE vendor_items SET {','.join(sets)} WHERE id=?", vals)
+    vals += [vid, db.active_location_id()]
+    cur = db.get_db().execute(
+        f"UPDATE vendor_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -672,7 +824,7 @@ def product_get(pid):
     row = d.execute(
         "SELECT p.*, c.name AS category_name, c.category_type "
         "FROM inventory_items p LEFT JOIN categories c ON c.id = p.category_id "
-        "WHERE p.id=?", (pid,),
+        "WHERE p.id=? AND p.location_id IS ?", (pid, db.active_location_id()),
     ).fetchone()
     if not row:
         abort(404)
@@ -695,15 +847,22 @@ def product_update(pid):
         if key in d:
             sets.append(f"{key}=?"); vals.append(d[key])
     if sets:
-        vals.append(pid)
-        db.get_db().execute(f"UPDATE inventory_items SET {','.join(sets)} WHERE id=?", vals)
+        vals += [pid, db.active_location_id()]
+        cur = db.get_db().execute(
+            f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+        if cur.rowcount == 0:
+            abort(404)
         db.get_db().commit()
     return jsonify({"ok": True})
 
 
 @app.delete("/api/products/<int:pid>")
 def product_delete(pid):
-    db.get_db().execute("UPDATE inventory_items SET archived=1 WHERE id=?", (pid,))
+    cur = db.get_db().execute(
+        "UPDATE inventory_items SET archived=1 WHERE id=? AND location_id IS ?",
+        (pid, db.active_location_id()))
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -758,15 +917,22 @@ def vendor_item_update(vid):
         if key in d:
             sets.append(f"{key}=?"); vals.append(d[key])
     if sets:
-        vals.append(vid)
-        db.get_db().execute(f"UPDATE vendor_items SET {','.join(sets)} WHERE id=?", vals)
+        vals += [vid, db.active_location_id()]
+        cur = db.get_db().execute(
+            f"UPDATE vendor_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+        if cur.rowcount == 0:
+            abort(404)
         db.get_db().commit()
     return jsonify({"ok": True})
 
 
 @app.delete("/api/vendor-items/<int:vid>")
 def vendor_item_delete(vid):
-    db.get_db().execute("UPDATE vendor_items SET archived=1 WHERE id=?", (vid,))
+    cur = db.get_db().execute(
+        "UPDATE vendor_items SET archived=1 WHERE id=? AND location_id IS ?",
+        (vid, db.active_location_id()))
+    if cur.rowcount == 0:
+        abort(404)
     db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -848,6 +1014,64 @@ def _category_id_by_name(database, name):
     return r["id"] if r else None
 
 
+def _reconcile(subtotal, tax, total, line_items):
+    """Sanity-check that the line items represent the invoice, so an AI misparse
+    (a missing or mis-keyed line) is visible instead of silently skewing the
+    category breakdown that feeds the reports.
+
+    Vendors print line totals either tax-exclusive (summing to the subtotal) or
+    tax-inclusive (summing to the grand total), so a match to EITHER base counts
+    as reconciled. Returns {line_sum, expected, delta, ok}; ok is None when
+    there's nothing to compare (no amounts, or a header-only invoice with no
+    line items)."""
+    items = line_items or []
+    line_sum = round(sum((_f(li.get("total"), 0) or 0) for li in items), 2)
+    sub, tot, tx = _f(subtotal), _f(total), (_f(tax) or 0)
+    targets = []
+    if sub is not None:
+        targets.append(round(sub, 2))
+    if tot is not None:
+        targets.append(round(tot, 2))
+        if tx:
+            targets.append(round(tot - tx, 2))   # pre-tax base when lines exclude tax
+    if not targets or not items:
+        return {"line_sum": line_sum, "expected": (targets[0] if targets else None),
+                "delta": None, "ok": None}
+    expected = min(targets, key=lambda t: abs(line_sum - t))   # whichever convention fits
+    delta = round(line_sum - expected, 2)
+    tol = max(0.02, abs(expected) * 0.005)   # tolerate penny rounding; flag a real gap
+    return {"line_sum": line_sum, "expected": expected, "delta": delta, "ok": abs(delta) <= tol}
+
+
+def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, total):
+    """Return a brief {id, vendor, invoice_date, invoice_number, total} for an
+    existing invoice in this location that looks like the same one, else None.
+
+    Strong signal: same vendor + a non-empty invoice number. Fallback when there's
+    no number: same vendor + date + total (within a cent)."""
+    vendor = (vendor or "").strip()
+    num = (invoice_number or "").strip()
+    cols = "id, vendor, invoice_date, invoice_number, total"
+    if vendor and num:
+        row = database.execute(
+            f"SELECT {cols} FROM invoices WHERE location_id IS ? AND lower(vendor)=lower(?) "
+            "AND invoice_number <> '' AND lower(invoice_number)=lower(?) ORDER BY id DESC LIMIT 1",
+            (loc, vendor, num),
+        ).fetchone()
+        if row:
+            return dict(row)
+    if vendor and inv_date and total is not None:
+        row = database.execute(
+            f"SELECT {cols} FROM invoices WHERE location_id IS ? AND lower(vendor)=lower(?) "
+            "AND invoice_date=? AND total IS NOT NULL AND ABS(total - ?) < 0.01 "
+            "ORDER BY id DESC LIMIT 1",
+            (loc, vendor, inv_date, total),
+        ).fetchone()
+        if row:
+            return dict(row)
+    return None
+
+
 def _resolve_vendor_item(database, vendor, inv_date, line, loc):
     """Match an invoice line to a vendor_item within this location (creating a
     'new' one if unseen), refresh its last price/date, return (vi_id, cat_id)."""
@@ -863,10 +1087,14 @@ def _resolve_vendor_item(database, vendor, inv_date, line, loc):
         (loc, vendor or "", name),
     ).fetchone()
     if row:
+        # Only advance the last-purchase price/date when this invoice is at least
+        # as recent as what's recorded, so editing (or backfilling) an OLDER
+        # invoice can't roll the latest price backwards.
         database.execute(
             "UPDATE vendor_items SET last_purchase_date=?, last_purchase_price=?, "
-            "category_id=COALESCE(category_id, ?) WHERE id=?",
-            (inv_date, price, cat_id, row["id"]),
+            "category_id=COALESCE(category_id, ?) "
+            "WHERE id=? AND (last_purchase_date IS NULL OR last_purchase_date <= ?)",
+            (inv_date, price, cat_id, row["id"], inv_date),
         )
         return row["id"], (row["category_id"] or cat_id)
     vrow = database.execute(
@@ -900,11 +1128,31 @@ with app.app_context():
     db.init_db()
 
 
+def _backup_loop(every_hours=6):
+    while True:
+        time.sleep(every_hours * 3600)
+        try:
+            db.backup()
+        except Exception as e:   # a failure must never take the server down...
+            print(f"  [!] Periodic backup failed: {e}")   # ...but don't fail silently
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8088"))
     host = os.environ.get("HOST", "0.0.0.0")
     if not os.environ.get("APP_PASSWORD"):
         print("\n  [!] APP_PASSWORD is not set — the ledger is open to anyone on "
               "your network.\n      Set it before exposing this beyond localhost.\n")
+    debug = bool(os.environ.get("DEBUG"))
+    # In debug Werkzeug's reloader runs this block in both parent and child; do
+    # the backup work only in the worker (or always, when the reloader is off).
+    if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        try:
+            snap = db.backup()
+            if snap:
+                print(f"  Backed up to {os.path.relpath(snap, BASE_DIR)}")
+        except Exception as e:
+            print(f"  [!] Startup backup failed: {e}")
+        threading.Thread(target=_backup_loop, daemon=True).start()
     print(f"  Barkeep's Ledger running at http://{host}:{port}\n")
-    app.run(host=host, port=port, debug=bool(os.environ.get("DEBUG")))
+    app.run(host=host, port=port, debug=debug)

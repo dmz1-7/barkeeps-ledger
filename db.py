@@ -4,6 +4,8 @@ Self-contained: the database is a single file under data/ledger.db and the
 schema is created on first run. No migrations tool needed for a personal app —
 schema changes are additive and guarded by `CREATE TABLE IF NOT EXISTS`.
 """
+import datetime as dt
+import glob
 import os
 import sqlite3
 from flask import g
@@ -444,6 +446,51 @@ def set_setting(key, value):
     db.commit()
 
 
+def set_setting_default(key, value):
+    """Insert a setting only if the key is absent (atomic; concurrent callers
+    converge on the first value written)."""
+    db = get_db()
+    db.execute(
+        "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING",
+        (key, "" if value is None else str(value)),
+    )
+    db.commit()
+
+
 def all_settings():
     rows = get_db().execute("SELECT key, value FROM settings").fetchall()
     return {r["key"]: r["value"] for r in rows}
+
+
+# --- backups ----------------------------------------------------------------
+
+def backup(keep=14):
+    """Snapshot the live DB to data/backups/ledger-<stamp>.db and keep the most
+    recent `keep`. Uses SQLite's online backup API, so it's safe to run against a
+    live database. Returns the backup path, or None if there's no DB yet.
+
+    The single ledger.db file is the only copy of everything, so this is the
+    safety net against an accidental wipe."""
+    if not os.path.exists(DB_PATH):
+        return None
+    bdir = os.path.join(os.path.dirname(DB_PATH), "backups")
+    os.makedirs(bdir, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    dest = os.path.join(bdir, f"ledger-{stamp}.db")
+    src = dst = None
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(dest)
+        with dst:
+            src.backup(dst)
+    finally:
+        if src:
+            src.close()
+        if dst:
+            dst.close()
+    for old in sorted(glob.glob(os.path.join(bdir, "ledger-*.db")))[:-keep]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return dest
