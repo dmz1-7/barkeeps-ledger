@@ -1337,7 +1337,9 @@ class RecipeCosting(Base):
         r = self._create(name="Garnish", menu_price=1.0, yield_qty=1,
                          items=[{"product_id": lime, "qty": 2, "unit": "each"}])
         self.assertEqual(r["batch_cost"], 0.5)              # 2 * $0.25
-        self.assertEqual(r["unconverted_lines"], 1)
+        # A no-size product priced in its own unit is correct by design — NOT a
+        # conversion failure, so it must not be flagged (only genuine mismatches are).
+        self.assertEqual(r["unconverted_lines"], 0)
 
     def test_product_stores_size_fields(self):
         pid = self.client.post("/api/products", json={
@@ -2716,17 +2718,25 @@ class SquareErroredAggregators(Base):
     def test_summary_and_pl_surface_square_errors_without_fake_zero(self):
         soft_sales = {"sales": 0, "orders": 0, "error": "Square timed out"}
         soft_labor = {"labor": 0, "hours": 0, "error": "Square timed out"}
-        with flask_app.app_context(), \
-                mock.patch.object(square_client, "is_configured", return_value=True), \
-                mock.patch.object(square_client, "get_sales", return_value=soft_sales), \
-                mock.patch.object(square_client, "get_labor", return_value=soft_labor):
-            s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
-            pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-05',300)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',300)", (iid,))
+            d.commit()
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "get_sales", return_value=soft_sales), \
+                    mock.patch.object(square_client, "get_labor", return_value=soft_labor):
+                s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+                pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
         self.assertEqual(s["sales_error"], "Square timed out")
         self.assertEqual(s["labor_error"], "Square timed out")
         self.assertIsNone(s["cogs_pct"])    # no dividing real COGS by a spurious 0 sales
         self.assertIsNone(s["labor_pct"])
         self.assertEqual(pl["sales_error"], "Square timed out")
+        # P&L profit headlines must NOT read as a real -$300 loss under a sales outage
+        self.assertIsNone(pl["gross_profit"])
+        self.assertIsNone(pl["controllable_profit"])
 
 
 class InvoiceEditPriceDownAndRemoval(Base):
@@ -3122,6 +3132,128 @@ class ParseInvoiceEndToEnd(Base):
             out = invoice_ai.parse_invoice(b"img", "image/png")
         self.assertEqual(out["vendor"], "Beta")
         self.assertEqual(out["total"], 50.0)
+
+
+# ============================================================================
+# Twelfth audit-fix regression tests (2026-06-12, 12th re-audit)
+# ============================================================================
+
+class InventoryCreateNameRequired(Base):
+    def test_blank_name_rejected(self):
+        for payload in ({}, {"name": ""}, {"name": ["x"]}):
+            r = self.client.post("/api/inventory", json=payload)
+            self.assertEqual(r.status_code, 400, payload)
+        # a valid name still works
+        self.assertEqual(self.client.post("/api/inventory", json={"name": "Gin"}).status_code, 200)
+
+
+class InvoiceListDateValidation(Base):
+    def test_garbage_start_date_is_400(self):
+        self.assertEqual(self.client.get("/api/invoices?start=notadate").status_code, 400)
+        self.assertEqual(self.client.get("/api/invoices?end=2026-13-99").status_code, 400)
+        self.assertEqual(self.client.get("/api/invoices?start=2026-06-01").status_code, 200)
+
+
+class ListLocationsMalformed(Base):
+    def test_non_object_body_fails_soft(self):
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return ["not", "an", "object"]   # 200 but wrong shape
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "get", return_value=FakeResp()):
+                out = square_client.list_locations()
+        self.assertEqual(out["locations"], [])      # soft envelope, not a 500
+        self.assertIsNotNone(out["error"])
+
+
+class OpenModeProxyGuard(Base):
+    def test_forwarded_for_header_refused_in_open_mode(self):
+        r = self.client.get("/api/health", headers={"X-Forwarded-For": "8.8.8.8"},
+                            environ_overrides={"REMOTE_ADDR": "127.0.0.1"})
+        self.assertEqual(r.status_code, 403)        # loopback peer but proxied -> refuse
+
+
+class SettingsSquareTokenNoClobber(Base):
+    def test_blank_token_does_not_wipe_existing(self):
+        with flask_app.app_context():
+            db.set_setting("square_token", "live-tok")
+        self.client.post("/api/settings", json={"square_token": "", "target_cogs_pct": 28})
+        with flask_app.app_context():
+            self.assertEqual(db.get_setting("square_token"), "live-tok")   # preserved
+            self.assertEqual(db.get_setting("target_cogs_pct"), "28")      # other settings still saved
+
+    def test_nonblank_token_persists(self):
+        self.client.post("/api/settings", json={"square_token": "new-tok"})
+        with flask_app.app_context():
+            self.assertEqual(db.get_setting("square_token"), "new-tok")
+
+
+class SquareEnvBaseUrl(Base):
+    def _capture_url(self):
+        captured = {}
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return {"orders": [], "cursor": None}
+
+        def fake_post(url, **kw):
+            captured["url"] = url
+            return FakeResp()
+        return captured, fake_post
+
+    def test_sandbox_vs_production_base(self):
+        for env, base in (("sandbox", square_client.SANDBOX_BASE),
+                          ("production", square_client.PROD_BASE)):
+            cap, fake_post = self._capture_url()
+            with flask_app.app_context():
+                db.set_setting("square_token", "tok")
+                db.set_setting("square_env", env)
+                with mock.patch.object(square_client.requests, "post", side_effect=fake_post):
+                    square_client.get_sales(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+            self.assertTrue(cap["url"].startswith(base), f"{env}: {cap['url']}")
+
+
+class SameDateLastPriceTieBreak(Base):
+    def _post(self, num, price):
+        return self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_number": num, "invoice_date": "2026-06-10",
+            "total": price, "line_items": [{"name": "Gin", "unit_cost": price, "qty": 1, "total": price}]})
+
+    def test_last_posted_same_date_price_wins(self):
+        self._post("S1", 20.0)
+        self._post("S2", 23.0)        # second delivery, same date — last writer wins on the tie
+        with flask_app.app_context():
+            p = get_db().execute("SELECT last_purchase_price FROM vendor_items "
+                                 "WHERE lower(vendor_item_name)='gin'").fetchone()
+        self.assertEqual(p["last_purchase_price"], 23.0)
+
+
+class RedundantIndexDropped(Base):
+    def test_date_only_invoice_index_is_gone(self):
+        with flask_app.app_context():
+            idx = {r["name"] for r in get_db().execute("PRAGMA index_list(invoices)")}
+        self.assertNotIn("idx_invoices_date", idx)         # dropped; composite covers it
+        self.assertIn("idx_invoices_loc_date", idx)
+
+
+class RecipeUnconvertedOnlyGenuineMismatch(Base):
+    def _sized(self, name, cost, sq, su):
+        with flask_app.app_context():
+            d = get_db()
+            pid = d.execute("INSERT INTO inventory_items(location_id,name,unit_cost,size_qty,size_unit) "
+                            "VALUES(1,?,?,?,?)", (name, cost, sq, su)).lastrowid
+            d.commit()
+            return pid
+
+    def test_each_line_not_flagged_mismatch_is(self):
+        lime = self._sized("Lime", 0.25, None, None)        # no size -> raw qty correct
+        gin = self._sized("Gin", 20.0, 750, "ml")           # sized; 'g' can't convert to ml
+        r = self.client.post("/api/recipes", json={
+            "name": "Mix", "menu_price": 10, "yield_qty": 1,
+            "items": [{"product_id": lime, "qty": 2, "unit": "each"},
+                      {"product_id": gin, "qty": 2, "unit": "g"}]}).get_json()
+        self.assertEqual(r["unconverted_lines"], 1)         # only the gin g->ml mismatch, not the lime
 
 
 if __name__ == "__main__":

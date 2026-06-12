@@ -160,6 +160,13 @@ def _open_mode_loopback_only():
     if not (addr in _LOOPBACK or addr.startswith("127.")):
         return jsonify({"error": "Running without authentication; serving localhost "
                         "only. Set APP_PASSWORD to allow remote access."}), 403
+    # remote_addr is loopback even when a reverse proxy / tunnel fronts us from
+    # localhost, so the check above can't tell a real local client from a proxied
+    # remote one. A forwarded-for header (or a multi-hop access_route) means we're
+    # behind a proxy — refuse to serve open mode rather than trust a spoofable hop.
+    if request.headers.get("X-Forwarded-For") or len(request.access_route) > 1:
+        return jsonify({"error": "Running without authentication and detected behind "
+                        "a proxy; refusing to serve. Set APP_PASSWORD."}), 403
 
 
 @app.before_request
@@ -465,9 +472,11 @@ def invoice_list():
     """The Orders view. Optional filters: start, end, vendor, status, q (search)."""
     where, params = ["location_id IS ?"], [db.active_location_id()]
     if request.args.get("start"):
-        where.append("invoice_date >= ?"); params.append(request.args["start"])
+        # Validate like the report endpoints (400 on garbage) instead of binding a
+        # bad string into a lexical comparison that silently returns nothing.
+        where.append("invoice_date >= ?"); params.append(str(cogs._iso_or_400(request.args["start"])))
     if request.args.get("end"):
-        where.append("invoice_date <= ?"); params.append(request.args["end"])
+        where.append("invoice_date <= ?"); params.append(str(cogs._iso_or_400(request.args["end"])))
     if request.args.get("vendor"):
         where.append("lower(vendor) = lower(?)"); params.append(request.args["vendor"])
     if request.args.get("status"):
@@ -591,6 +600,8 @@ def inventory_list():
 @app.post("/api/inventory")
 def inventory_create():
     d = body()
+    if not _s(d.get("name")):   # name is NOT NULL; reject a blank like every sibling create does
+        return jsonify({"error": "Name is required."}), 400
     cur = db.get_db().execute(
         "INSERT INTO inventory_items(location_id, name, category, unit, par_level, last_count, "
         "unit_cost, vendor, sort_order) VALUES(?,?,?,?,?,?,?,?,?)",

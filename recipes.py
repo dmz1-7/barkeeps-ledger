@@ -83,11 +83,15 @@ def _summary(rec, items):
         "margin": money.normalize(price - per) if price else None,
         "item_count": len(items),
         "missing_products": sum(1 for i in items if i["missing_product"]),
-        # Lines costed by the raw-qty fallback (no product size, or the recipe
-        # unit doesn't convert to it) — their cost is only right if qty was given
-        # in the product's own unit. Surfaced so the UI can flag them.
+        # Lines where a conversion was EXPECTED — the product carries a size, the
+        # line gave a unit — but that unit didn't convert to the product's size
+        # unit (e.g. weight against a volume-sized bottle), so the cost silently
+        # fell back to raw qty * unit_cost and is probably wrong. A no-size product
+        # priced in its own unit (e.g. limes "each") is NOT flagged: its raw-qty
+        # cost is correct by design, so flagging it would just be noise.
         "unconverted_lines": sum(
-            1 for i in items if not i["converted"] and not i["missing_product"] and i["qty"]),
+            1 for i in items if not i["converted"] and not i["missing_product"]
+            and i["qty"] and i["size_qty"] and i["size_unit"]),
     }
 
 

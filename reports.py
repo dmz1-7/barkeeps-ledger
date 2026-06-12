@@ -175,11 +175,16 @@ def controllable_pl(start, end):
         })
 
     total_cogs = round(total_cogs_c / 100.0, 2)
-    gross = _r(total_income - total_cogs)
-    controllable = _r(gross - labor)
+    # When Square sales failed soft (sales=0, error set) total_income is a phantom
+    # 0, so gross/controllable would read as a real multi-hundred-dollar LOSS.
+    # Null the profit headlines instead (mirrors cogs.summary nulling cogs_pct on
+    # a zero denominator) so a degraded P&L can't masquerade as a real loss.
+    sales_failed = bool(sales_info.get("error"))
+    gross = None if sales_failed else _r(total_income - total_cogs)
+    controllable = None if sales_failed else _r((gross or 0) - labor)
 
     def pct(part):
-        return _r(part / total_income * 100) if total_income else None
+        return _r(part / total_income * 100) if total_income and part is not None else None
 
     return {
         "period": {"start": start.isoformat(), "end": end.isoformat()},
