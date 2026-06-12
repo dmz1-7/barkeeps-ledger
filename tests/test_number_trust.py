@@ -1468,22 +1468,33 @@ class UsageCogsDenominator(Base):
                              (iid, total))
             get_db().commit()
 
+    @staticmethod
+    def _full_interval(per_day):
+        # complete daily-sales cache covering every day of [b, e] (the basis is
+        # only trusted when the cache is complete)
+        def f(b, e):
+            n = (e - b).days + 1
+            return {(b + dt.timedelta(days=i)).isoformat(): per_day for i in range(n)}
+        return f
+
     def test_cogs_pct_uses_interval_sales_not_range_sales(self):
         self._count("2026-05-30", 1000.0)        # opening, just before the range
         self._count("2026-07-02", 800.0)         # closing, just after
         self._invoice("2026-06-15", 700.0)       # in-interval -> usage = 1000+700-800 = 900
+        # interval [05-30, 07-02] = 34 days; $100/day -> interval sales = 3400
         with flask_app.app_context(), \
                 mock.patch.object(square_client, "is_configured", return_value=True), \
                 mock.patch.object(square_client, "get_sales",
                                   return_value={"sales": 1000.0, "orders": 1, "error": None}), \
                 mock.patch.object(square_client, "get_labor", return_value=dict(_LABOR0)), \
                 mock.patch.object(square_client, "daily_sales_cached",
-                                  return_value={"a": 1500.0, "b": 1500.0}):   # interval sales = 3000
+                                  side_effect=self._full_interval(100.0)):
             s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
         self.assertEqual(s["cogs_method"], "usage")
         self.assertEqual(s["cogs"], 900.0)
-        self.assertEqual(s["cogs_sales"], 3000.0)
-        self.assertEqual(s["cogs_pct"], 30.0)    # 900/3000, NOT the inflated 900/1000=90
+        self.assertEqual(s["cogs_sales"], 3400.0)
+        self.assertEqual(s["cogs_pct"], round(900 / 3400 * 100, 1))   # interval basis, not 900/1000
+        self.assertEqual(s["cogs_sales_basis"], "interval")
         self.assertEqual(s["sales"], 1000.0)      # labor% still uses range sales
 
 
@@ -1775,34 +1786,46 @@ class PrimePctUsageMode(Base):
             get_db().execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',?)",
                              (iid, t)); get_db().commit()
 
-    def _summary(self, interval_cache):
+    def _summary(self, daily_fn):
         labor = dict(_LABOR0); labor["labor"] = 300.0
         with flask_app.app_context(), \
                 mock.patch.object(square_client, "is_configured", return_value=True), \
                 mock.patch.object(square_client, "get_sales",
                                   return_value={"sales": 1000.0, "orders": 1, "error": None}), \
                 mock.patch.object(square_client, "get_labor", return_value=labor), \
-                mock.patch.object(square_client, "daily_sales_cached", return_value=interval_cache):
+                mock.patch.object(square_client, "daily_sales_cached", side_effect=daily_fn):
             return cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
 
     def test_prime_pct_is_sum_of_correctly_based_parts(self):
         self._count("2026-05-30", 1000.0)
         self._count("2026-07-02", 800.0)
         self._invoice("2026-06-15", 700.0)            # usage = 900
-        s = self._summary({"a": 1500.0, "b": 1500.0})  # interval sales = 3000
+        # complete interval cache: 34 days x $100 -> interval sales 3400
+        s = self._summary(lambda b, e: {(b + dt.timedelta(days=i)).isoformat(): 100.0
+                                        for i in range((e - b).days + 1)})
         self.assertEqual(s["cogs_sales_basis"], "interval")
-        self.assertEqual(s["cogs_pct"], 30.0)          # 900/3000
+        cogs_pct = round(900 / 3400 * 100, 1)
+        self.assertEqual(s["cogs_pct"], cogs_pct)
         self.assertEqual(s["labor_pct"], 30.0)         # 300/1000 (range)
-        self.assertEqual(s["prime_pct"], 60.0)         # sum, not 1200/3000=40 or 1200/1000=120
+        self.assertEqual(s["prime_pct"], round(cogs_pct + 30.0, 1))   # sum of correctly-based parts
 
     def test_empty_interval_cache_falls_back_to_range_sales(self):
         self._count("2026-05-30", 1000.0)
         self._count("2026-07-02", 800.0)
         self._invoice("2026-06-15", 700.0)
-        s = self._summary({})                          # Square-down / no cache
+        s = self._summary(lambda b, e: {})             # Square-down / cold cache
         self.assertEqual(s["cogs_sales_basis"], "range")
         self.assertEqual(s["cogs_sales"], 1000.0)
         self.assertEqual(s["cogs_pct"], 90.0)          # 900/1000
+
+    def test_partial_cache_falls_back_to_range_sales(self):
+        self._count("2026-05-30", 1000.0)
+        self._count("2026-07-02", 800.0)
+        self._invoice("2026-06-15", 700.0)
+        # only 2 of 34 interval days cached -> incomplete -> fall back to range
+        s = self._summary(lambda b, e: {b.isoformat(): 100.0, e.isoformat(): 100.0})
+        self.assertEqual(s["cogs_sales_basis"], "range")
+        self.assertEqual(s["cogs_pct"], 90.0)
 
 
 class RecipeSubCent(Base):
@@ -2046,13 +2069,25 @@ class InvoiceParseEndpoint(Base):
             content_type="multipart/form-data").status_code, 400)
 
     def test_parse_failure_is_422(self):
+        if not invoice_ai.HAVE_PIL:
+            self.skipTest("PIL not installed")
+        buf = io.BytesIO()
+        invoice_ai.Image.new("RGB", (2, 2)).save(buf, "PNG")   # a real image -> passes the bytes check
+        png = buf.getvalue()
         with mock.patch.object(app_module, "parse_invoice",
                                side_effect=app_module.InvoiceError("nope")):
             r = self.client.post("/api/invoices/parse", data={
-                "image": (io.BytesIO(b"realbytes"), "p.jpg")},
+                "image": (io.BytesIO(png), "p.png")},
                 content_type="multipart/form-data")
         self.assertEqual(r.status_code, 422)
         self.assertIn("error", r.get_json())
+
+    def test_non_image_bytes_rejected(self):
+        r = self.client.post("/api/invoices/parse", data={
+            "image": (io.BytesIO(b"not an image"), "p.png")},
+            content_type="multipart/form-data")
+        # 400 when PIL is present (bytes rejected); 422 if PIL absent (parse fails)
+        self.assertIn(r.status_code, (400, 422))
 
 
 class ListEndpointScoping(Base):
@@ -2194,6 +2229,107 @@ class UsageCogsIntervalPerStore(Base):
         self.assertEqual(s["cogs_method"], "usage")
         self.assertEqual(s["cogs_sales_basis"], "interval")
         self.assertEqual(s["cogs_sales"], 1200.0)            # DC: 12 days * $100, NOT NYC's $999
+
+
+# ============================================================================
+# Fifth audit-fix regression tests (2026-06-12, 5th re-audit)
+# ============================================================================
+
+class ImagePathTraversal(Base):
+    def test_traversal_image_path_cannot_delete_outside_uploads(self):
+        # Post an invoice with a traversal image_path; it must be stored as a bare
+        # basename so delete can't os.remove outside UPLOAD_DIR.
+        rid = self.client.post("/api/invoices", json={
+            "vendor": "V", "invoice_number": "", "invoice_date": "2026-06-01", "total": 1,
+            "image_path": "../../data/ledger.db", "line_items": []}).get_json()["id"]
+        with flask_app.app_context():
+            stored = get_db().execute("SELECT image_path FROM invoices WHERE id=?", (rid,)).fetchone()
+        self.assertNotIn("/", stored["image_path"] or "")
+        self.assertNotIn("..", stored["image_path"] or "")
+        # delete must succeed and (critically) not touch the real DB file
+        self.assertEqual(self.client.delete(f"/api/invoices/{rid}").status_code, 200)
+        self.assertTrue(os.path.exists(self.db_path))
+
+
+class WindowBounds(Base):
+    def test_window_applies_day_start_and_tz_to_utc(self):
+        with flask_app.app_context():
+            db.set_setting("tz", "America/New_York")
+            db.set_setting("day_start_hour", "5")
+            # 2026-03-07 5am EST = 10:00 UTC; 2026-03-09 5am EDT (after spring-forward)
+            # = 09:00 UTC — the exclusive upper bound is end+1 day at day_start.
+            s, e = square_client._window(dt.date(2026, 3, 7), dt.date(2026, 3, 8))
+        self.assertEqual(s, "2026-03-07T10:00:00Z")
+        self.assertEqual(e, "2026-03-09T09:00:00Z")   # DST: EDT, so 09:00 not 10:00
+
+
+class GetLaborWindow(Base):
+    def test_get_labor_posts_business_day_window(self):
+        captured = {}
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return {"shifts": [], "cursor": None}
+
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            db.set_setting("tz", "America/New_York")
+            db.set_setting("day_start_hour", "5")
+            with mock.patch.object(square_client.requests, "post",
+                                   side_effect=lambda url, **kw: (captured.update(kw.get("json", {})), FakeResp())[1]):
+                square_client.get_labor(dt.date(2026, 6, 10), dt.date(2026, 6, 10))
+        start = captured["query"]["filter"]["start"]
+        self.assertEqual(start["start_at"], "2026-06-10T09:00:00Z")   # 5am EDT = 09:00 UTC
+        self.assertEqual(start["end_at"], "2026-06-11T09:00:00Z")     # next day 5am EDT
+
+
+class ConfigTokenHidden(Base):
+    def test_config_never_returns_raw_token(self):
+        with flask_app.app_context():
+            db.set_setting("square_token", "super-secret-token")
+        j = self.client.get("/api/config").get_json()
+        self.assertIn("has_square_token", j)
+        self.assertTrue(j["has_square_token"])
+        self.assertNotIn("square_token", j)
+        self.assertNotIn("super-secret-token", str(j))
+
+
+class ImporterBreadth(Base):
+    def _imp(self):
+        import import_marginedge
+        return import_marginedge.Importer(get_db(), 1)
+
+    def test_import_products_upserts_cost(self):
+        with flask_app.app_context():           # import_products takes a list of DICT rows
+            self._imp().import_products([{"Name": "Tito's", "Category": "Liquor",
+                                          "Latest Price": "$24.50"}])
+            get_db().commit()
+            row = get_db().execute("SELECT unit_cost FROM inventory_items WHERE name=\"Tito's\"").fetchone()
+        self.assertEqual(row["unit_cost"], 24.5)
+
+    def test_import_vendor_items_sets_last_price(self):
+        with flask_app.app_context():
+            self._imp().import_vendor_items([{"Vendor Item Name": "Gin 750", "Vendor": "Acme",
+                                              "Last Purch $": "$18.75", "Item Code": "G750"}])
+            get_db().commit()
+            row = get_db().execute(
+                "SELECT last_purchase_price FROM vendor_items WHERE vendor_item_name='Gin 750'").fetchone()
+        self.assertEqual(row["last_purchase_price"], 18.75)
+
+    def test_split_category_attributes_to_dominant(self):
+        with flask_app.app_context():
+            cid = self._imp().category_id("Liquor (80%), Beer (20%)")
+            name = get_db().execute("SELECT name FROM categories WHERE id=?", (cid,)).fetchone()["name"]
+        self.assertEqual(name, "Liquor")          # dominant share wins
+
+    def test_missing_total_column_errors_clearly(self):
+        path = os.path.join(self.tmpdir, "bad.csv")
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            csv.writer(fh).writerows([["Invoice Date", "Invoice #", "Vendor"],   # no "Total"
+                                      ["06/01/2026", "X", "Acme"]])
+        with flask_app.app_context():
+            with self.assertRaises(KeyError):
+                self._imp().import_invoices(path)
 
 
 if __name__ == "__main__":

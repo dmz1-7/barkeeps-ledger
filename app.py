@@ -36,6 +36,7 @@ import money
 import recipes
 import reports
 import square_client
+import invoice_ai
 from invoice_ai import parse_invoice, InvoiceError
 
 BASE_DIR = os.path.dirname(__file__)
@@ -334,6 +335,14 @@ def invoice_parse():
     raw = f.read()
     if not raw:
         return jsonify({"error": "Empty image."}), 400
+    # Don't trust the client extension alone — confirm the bytes are a real image
+    # before persisting (a renamed payload shouldn't land in uploads/).
+    if invoice_ai.HAVE_PIL:
+        import io as _io
+        try:
+            invoice_ai.Image.open(_io.BytesIO(raw)).verify()
+        except Exception:
+            return jsonify({"error": "That file isn't a readable image."}), 400
 
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     fname = f"{uuid.uuid4().hex}{ext}"
@@ -372,7 +381,7 @@ def invoice_create():
         (
             loc, vendor, inv_date, _s(d.get("invoice_number")),
             _s(d.get("category")) or None, money.normalize(d.get("subtotal")), money.normalize(d.get("tax")),
-            money.normalize(d.get("total")), _s(d.get("image_path")) or None, _s(d.get("notes")),
+            money.normalize(d.get("total")), _image_name(d.get("image_path")), _s(d.get("notes")),
             _s(d.get("raw_json")), _s(d.get("status")) or "closed", _s(d.get("payment_account")) or None,
         ),
     )
@@ -452,7 +461,9 @@ def invoice_delete(inv_id):
     db_.commit()
     if row["image_path"]:
         try:
-            os.remove(os.path.join(UPLOAD_DIR, row["image_path"]))
+            # basename-guard even on read: never let a stored traversal value
+            # reach os.remove outside UPLOAD_DIR.
+            os.remove(os.path.join(UPLOAD_DIR, os.path.basename(row["image_path"])))
         except OSError:
             pass
     return jsonify({"ok": True})
@@ -809,7 +820,10 @@ def category_update(cid):
             sets.append(f"{key}=?"); vals.append(_coerce_col(key, d[key]))
     if sets:
         vals.append(cid)
-        db.get_db().execute(f"UPDATE categories SET {','.join(sets)} WHERE id=?", vals)
+        try:
+            db.get_db().execute(f"UPDATE categories SET {','.join(sets)} WHERE id=?", vals)
+        except Exception:
+            return jsonify({"error": "That category already exists."}), 400   # UNIQUE(name)
         db.get_db().commit()
     return jsonify({"ok": True})
 
@@ -1408,6 +1422,14 @@ _NUM_REAL = {"par_level", "last_count", "unit_cost", "size_qty", "menu_price",
              "yield_qty", "pct"}
 _NUM_INT = {"sort_order", "on_inventory", "tax_exempt", "archived", "category_id",
             "product_id", "vendor_id", "order_guide"}
+
+
+def _image_name(v):
+    """A stored image filename reduced to its basename — never a path. Prevents a
+    traversal value like '../../data/ledger.db' from escaping UPLOAD_DIR on the
+    delete (os.remove) path."""
+    name = os.path.basename(_s(v))
+    return name or None
 
 
 def _coerce_col(key, v):

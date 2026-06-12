@@ -291,9 +291,10 @@ def daily_sales_cached(start, end):
             # write zeros — overwriting good cached days with 0 would silently
             # and permanently corrupt the Sales history.
             return cached
-        d = fetch_start
-        while d <= end:
-            ds = d.isoformat()
+        # Write ONLY the days we set out to refresh (missing or stale). A day that
+        # was already cached and not in `need` is left untouched, so a partial
+        # fetch that omits a historical day can't zero it out.
+        for ds in need:
             val = round(fresh.get(ds, 0.0), 2)
             dbc.execute(
                 "INSERT INTO daily_sales(square_location_id, date, net_sales, fetched_at) "
@@ -303,7 +304,6 @@ def daily_sales_cached(start, end):
                 (sqid, ds, val),
             )
             cached[ds] = val
-            d += dt.timedelta(days=1)
         dbc.commit()
     return cached
 

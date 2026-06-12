@@ -269,8 +269,8 @@ function buildNav() {
   const tb = $("#tabbar");
   if (tb) {
     tb.innerHTML = NAV.map((n) =>
-      `<a href="${n.href}" class="${n.tab === section ? "active" : ""}">
-        <span class="ic">${n.icon}</span><b>${esc(n.label)}</b></a>`).join("");
+      `<a href="${esc(n.href)}" class="${n.tab === section ? "active" : ""}">
+        <span class="ic">${esc(n.icon)}</span><b>${esc(n.label)}</b></a>`).join("");
   }
 }
 
@@ -992,8 +992,8 @@ async function showOrderList() {
       // One card per vendor, so each is a ready-to-send order.
       g.vendors.forEach((vd) => {
         const card = el(`<div class="card"><div class="card-band">${esc(vd.vendor)}
-          <span>${money(vd.subtotal)}</span></div><div class="card-body" id="ord"></div></div>`);
-        const ord = card.querySelector("#ord");
+          <span>${money(vd.subtotal)}</span></div><div class="card-body"></div></div>`);
+        const ord = card.querySelector(".card-body");
         vd.items.forEach((it) => ord.appendChild(el(
           `<div class="kv"><span>${esc(it.name)} <span class="muted">need ${fmtQty(it.order_qty)} ${esc(it.unit || "")}
             &middot; on hand ${fmtQty(it.on_hand)}/${fmtQty(it.par)}</span></span>

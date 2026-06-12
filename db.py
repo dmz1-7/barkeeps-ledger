@@ -263,8 +263,10 @@ def get_db():
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        # Self-heal once per process: a server started before a migration must
-        # not 500 on reads of a column init_db would have added. Cheap + idempotent.
+        # Self-heal once per process: re-run ONLY _ensure_columns (column adds) so
+        # a server started before a column migration doesn't 500 on reads. Full
+        # migration — POST_INDEXES, the sales_mix rebuild, data backfills — is
+        # handled by init_db() at import (see the bottom of app.py), not here.
         if DB_PATH not in _SCHEMA_READY:
             try:
                 _ensure_columns(conn)
