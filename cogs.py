@@ -129,14 +129,22 @@ def summary(start, end):
     # range sales — otherwise COGS%/prime% are inflated by up to ~2x. Labor%
     # always stays on the requested-range sales.
     cogs_sales = sales
+    cogs_sales_basis = "range"
     if (usage_cogs is not None and square_client.is_configured()
             and (b_date != start or e_date != end)):
         daily = square_client.daily_sales_cached(b_date, e_date)
         interval_sales = round(sum(daily.values()), 2) if daily else 0.0
         if interval_sales:
-            cogs_sales = interval_sales
+            cogs_sales, cogs_sales_basis = interval_sales, "interval"
 
     prime = round(cogs_amount + labor, 2)
+    # COGS% and Labor% use different sales bases in usage mode (interval vs
+    # range), so prime% is the SUM of the two correctly-based percentages — never
+    # prime/cogs_sales, which would divide range labor by interval sales.
+    cogs_pct = pct_of(cogs_amount, cogs_sales)
+    labor_pct = pct_of(labor, sales)
+    prime_pct = (round(cogs_pct + labor_pct, 1)
+                 if cogs_pct is not None and labor_pct is not None else None)
 
     return {
         "range": {"start": start.isoformat(), "end": end.isoformat()},
@@ -145,7 +153,7 @@ def summary(start, end):
         "sales_error": sales_info.get("error"),
         "labor": labor,
         "labor_hours": labor_info.get("hours", 0),
-        "labor_pct": pct_of(labor, sales),
+        "labor_pct": labor_pct,
         "labor_error": labor_info.get("error"),
         "labor_warning": labor_info.get("warning"),
         "unwaged_hours": labor_info.get("unwaged_hours", 0),
@@ -154,12 +162,13 @@ def summary(start, end):
         "purchases_by_category": purch["by_category"],
         "invoice_count": purch["count"],
         "cogs": cogs_amount,
-        "cogs_pct": pct_of(cogs_amount, cogs_sales),
+        "cogs_pct": cogs_pct,
         "cogs_method": cogs_method,
         "cogs_sales": cogs_sales,
+        "cogs_sales_basis": cogs_sales_basis,
         "usage_period": usage_period,
         "prime": prime,
-        "prime_pct": pct_of(prime, cogs_sales),
+        "prime_pct": prime_pct,
         "begin_inventory": begin,
         "end_inventory": end_inv,
         "targets": {

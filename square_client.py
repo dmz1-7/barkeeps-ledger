@@ -246,11 +246,12 @@ def get_daily_sales(start, end):
                 day = _business_day(o.get("closed_at"))
                 if not day:
                     continue
-                by_day[day] = by_day.get(day, 0.0) + _net_sales_cents(o) / 100.0
+                # accumulate integer cents (matches get_sales), convert once below
+                by_day[day] = by_day.get(day, 0) + _net_sales_cents(o)
             cursor = data.get("cursor")
             if not cursor:
                 break
-        return {d: round(v, 2) for d, v in by_day.items()}
+        return {d: round(c / 100.0, 2) for d, c in by_day.items()}
     except requests.RequestException:
         return None
 

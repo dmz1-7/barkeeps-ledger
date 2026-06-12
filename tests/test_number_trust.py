@@ -402,14 +402,14 @@ class LoginRateLimit(Base):
         self.assertEqual(
             self.client.post("/api/login", json={"password": "nope"}).status_code, 429)
 
-    def test_correct_passcode_is_never_locked_out(self):
-        # The key property: a flood of wrong guesses must NOT lock out the real
-        # owner — the correct passcode is checked first and always wins.
-        for _ in range(app_module._LOGIN_MAX + 5):
+    def test_throttle_short_circuits_before_evaluating_guess(self):
+        # A real rate limit: once the window budget is spent, requests are refused
+        # with 429 BEFORE the guess is evaluated (not a cosmetic message swap).
+        # Deliberate tradeoff: a flood also makes the owner wait out the short window.
+        for _ in range(app_module._LOGIN_MAX):
             self.client.post("/api/login", json={"password": "nope"})
         r = self.client.post("/api/login", json={"password": "secret"})
-        self.assertEqual(r.status_code, 200)
-        self.assertIn("token", r.get_json())
+        self.assertEqual(r.status_code, 429)
 
     def test_success_clears_failures(self):
         for _ in range(app_module._LOGIN_MAX - 1):
@@ -1732,6 +1732,177 @@ class ImporterParsing(Base):
         by_cat = {r["cat"]: r["total"] for r in lines}
         self.assertEqual(by_cat.get("Liquor"), 100.0)
         self.assertEqual(by_cat.get("Wine"), 50.0)
+
+
+# ============================================================================
+# Second audit-fix regression tests (2026-06-12 re-audit, 24 findings)
+# ============================================================================
+
+def _product(name, unit_cost, loc=1, **extra):
+    with flask_app.app_context():
+        cols = "location_id,name,unit_cost" + ("," + ",".join(extra) if extra else "")
+        marks = "?,?,?" + ("," + ",".join("?" * len(extra)) if extra else "")
+        pid = get_db().execute(f"INSERT INTO inventory_items({cols}) VALUES({marks})",
+                               (loc, name, unit_cost, *extra.values())).lastrowid
+        get_db().commit()
+        return pid
+
+
+class PrimePctUsageMode(Base):
+    """Re-audit HIGH: in usage mode prime% = cogs% + labor% (each correctly
+    based), not prime / interval-sales."""
+
+    def _count(self, d, v):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO counts(location_id, taken_at, value) VALUES(1,?,?)",
+                             (f"{d} 12:00:00", v)); get_db().commit()
+
+    def _invoice(self, d, t):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                             "VALUES(1,'V',?,?)", (d, t)); get_db().commit()
+
+    def _summary(self, interval_cache):
+        labor = dict(_LABOR0); labor["labor"] = 300.0
+        with flask_app.app_context(), \
+                mock.patch.object(square_client, "is_configured", return_value=True), \
+                mock.patch.object(square_client, "get_sales",
+                                  return_value={"sales": 1000.0, "orders": 1, "error": None}), \
+                mock.patch.object(square_client, "get_labor", return_value=labor), \
+                mock.patch.object(square_client, "daily_sales_cached", return_value=interval_cache):
+            return cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+
+    def test_prime_pct_is_sum_of_correctly_based_parts(self):
+        self._count("2026-05-30", 1000.0)
+        self._count("2026-07-02", 800.0)
+        self._invoice("2026-06-15", 700.0)            # usage = 900
+        s = self._summary({"a": 1500.0, "b": 1500.0})  # interval sales = 3000
+        self.assertEqual(s["cogs_sales_basis"], "interval")
+        self.assertEqual(s["cogs_pct"], 30.0)          # 900/3000
+        self.assertEqual(s["labor_pct"], 30.0)         # 300/1000 (range)
+        self.assertEqual(s["prime_pct"], 60.0)         # sum, not 1200/3000=40 or 1200/1000=120
+
+    def test_empty_interval_cache_falls_back_to_range_sales(self):
+        self._count("2026-05-30", 1000.0)
+        self._count("2026-07-02", 800.0)
+        self._invoice("2026-06-15", 700.0)
+        s = self._summary({})                          # Square-down / no cache
+        self.assertEqual(s["cogs_sales_basis"], "range")
+        self.assertEqual(s["cogs_sales"], 1000.0)
+        self.assertEqual(s["cogs_pct"], 90.0)          # 900/1000
+
+
+class RecipeSubCent(Base):
+    def test_sub_cent_pours_sum_not_zeroed(self):
+        pid = _product("Bitters", 1.0)                 # $1 per "each"
+        items = [{"product_id": pid, "qty": 0.004} for _ in range(10)]   # each $0.004
+        r = self.client.post("/api/recipes", json={"name": "R", "menu_price": 1,
+                                                   "yield_qty": 1, "items": items}).get_json()
+        self.assertEqual(r["batch_cost"], 0.04)        # 10 * 0.004, not 0.00
+
+
+class MoneyNonFinite(unittest.TestCase):
+    def test_inf_nan_rejected(self):
+        self.assertEqual(money.to_cents(float("inf")), 0)
+        self.assertEqual(money.to_cents(float("nan")), 0)
+        self.assertEqual(money.to_cents("Infinity"), 0)
+        self.assertIsNone(money.cents_or_none(float("inf")))
+        self.assertIsNone(money.normalize(float("inf")))
+
+
+class ApiHardening2(Base):
+    def test_f_rejects_non_finite(self):
+        self.assertEqual(app_module._f(float("inf"), 0), 0)
+        self.assertEqual(app_module._f("Infinity", 0), 0)
+        self.assertEqual(app_module._f(float("nan"), 0), 0)
+
+    def test_product_array_field_does_not_500(self):
+        self.assertNotEqual(
+            self.client.post("/api/products", json={"name": "X", "unit_cost": ["x"]}).status_code, 500)
+
+    def test_count_non_scalar_item_id_does_not_500(self):
+        self.assertNotEqual(
+            self.client.post("/api/counts", json={"lines": [{"item_id": [1], "qty": 1}]}).status_code, 500)
+
+    def test_active_location_non_scalar_is_400(self):
+        self.assertEqual(self.client.put("/api/active-location", json={"location_id": [1]}).status_code, 400)
+
+
+class VendorItemForeignProduct(Base):
+    def test_create_drops_foreign_product(self):
+        pid2 = _product("NYConly", 5.0, loc=2)
+        rid = self.client.post("/api/vendor-items", headers={"X-Location-Id": "1"},
+                               json={"vendor_item_name": "x", "product_id": pid2}).get_json()["id"]
+        with flask_app.app_context():
+            row = get_db().execute("SELECT product_id FROM vendor_items WHERE id=?", (rid,)).fetchone()
+        self.assertIsNone(row["product_id"])
+
+
+class InvoiceDeleteRecompute(Base):
+    def test_deleting_newest_invoice_reverts_last_price(self):
+        def post(date, cost):
+            return self.client.post("/api/invoices", json={
+                "vendor": "Acme", "invoice_number": "", "invoice_date": date, "total": cost,
+                "confirm_duplicate": True,
+                "line_items": [{"name": "Gin", "unit_cost": cost, "qty": 1, "total": cost}]})
+        post("2026-06-01", 20.0)
+        newest = post("2026-06-10", 24.0).get_json()["id"]
+        with flask_app.app_context():
+            p = get_db().execute("SELECT last_purchase_price FROM vendor_items "
+                                 "WHERE lower(vendor_item_name)='gin'").fetchone()
+            self.assertEqual(p["last_purchase_price"], 24.0)
+        self.assertEqual(self.client.delete(f"/api/invoices/{newest}").status_code, 200)
+        with flask_app.app_context():
+            p = get_db().execute("SELECT last_purchase_price FROM vendor_items "
+                                 "WHERE lower(vendor_item_name)='gin'").fetchone()
+        self.assertEqual(p["last_purchase_price"], 20.0)   # recomputed from the remaining line
+
+
+class InvoiceEditPricePropagation(Base):
+    def test_editing_latest_invoice_updates_last_price(self):
+        rid = self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_number": "E1", "invoice_date": "2026-06-10", "total": 20,
+            "line_items": [{"name": "Gin", "unit_cost": 20.0, "qty": 1, "total": 20.0}]}).get_json()["id"]
+        self.client.put(f"/api/invoices/{rid}", json={
+            "vendor": "Acme", "invoice_number": "E1", "invoice_date": "2026-06-10", "total": 26,
+            "line_items": [{"name": "Gin", "unit_cost": 26.0, "qty": 1, "total": 26.0}]})
+        with flask_app.app_context():
+            p = get_db().execute("SELECT last_purchase_price FROM vendor_items "
+                                 "WHERE lower(vendor_item_name)='gin'").fetchone()
+        self.assertEqual(p["last_purchase_price"], 26.0)
+
+
+class SquareErrorSoft(Base):
+    def test_get_sales_and_labor_soften_request_errors(self):
+        import requests as rq
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post",
+                                   side_effect=rq.RequestException("boom")):
+                s = square_client.get_sales(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+                lab = square_client.get_labor(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertEqual(s["sales"], 0.0)
+        self.assertIsNotNone(s["error"])
+        self.assertEqual(lab["labor"], 0.0)
+        self.assertIsNotNone(lab["error"])
+
+
+class DupInvoiceCrossDate(Base):
+    def test_same_vendor_and_number_different_date_still_flagged(self):
+        base = {"vendor": "Acme", "invoice_number": "INV1", "total": 10, "line_items": []}
+        self.client.post("/api/invoices", json={**base, "invoice_date": "2026-06-01"})
+        r = self.client.post("/api/invoices", json={**base, "invoice_date": "2026-07-01"})
+        self.assertEqual(r.status_code, 409)           # strong signal is vendor+number
+
+
+class SchemaColumns(Base):
+    def test_added_columns_present_after_init(self):
+        with flask_app.app_context():
+            ri = {r["name"] for r in get_db().execute("PRAGMA table_info(recipe_items)")}
+            inv = {r["name"] for r in get_db().execute("PRAGMA table_info(inventory_items)")}
+        self.assertIn("unit", ri)
+        self.assertIn("size_qty", inv)
+        self.assertIn("size_unit", inv)
 
 
 if __name__ == "__main__":
