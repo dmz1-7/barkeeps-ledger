@@ -11,14 +11,20 @@ Pure stdlib unittest — no pytest needed:
     .venv/bin/python -m unittest discover -s tests
 """
 import datetime as dt
+import glob
 import os
+import shutil
+import sqlite3
 import tempfile
 import unittest
 
 # Point at a throwaway DB and disable the auth gate BEFORE importing the app, so
 # we never touch the real data/ledger.db and the test client isn't challenged.
+# Clear APP_SECRET too so the persisted-random-secret path is exercised (the
+# user's real .env sets one, which load_dotenv would otherwise import).
 os.environ["LEDGER_DB"] = tempfile.mktemp(suffix=".db")
 os.environ["APP_PASSWORD"] = ""
+os.environ["APP_SECRET"] = ""
 
 import db                       # noqa: E402
 import square_client            # noqa: E402
@@ -31,18 +37,16 @@ flask_app = app_module.app
 class Base(unittest.TestCase):
     def setUp(self):
         os.environ["APP_PASSWORD"] = ""
-        fd, self.db_path = tempfile.mkstemp(suffix=".db")
-        os.close(fd)
+        os.environ["APP_SECRET"] = ""
+        self.tmpdir = tempfile.mkdtemp()          # own dir so backups stay isolated
+        self.db_path = os.path.join(self.tmpdir, "ledger.db")
         db.DB_PATH = self.db_path                 # get_db() reads this at call time
         with flask_app.app_context():
             db.init_db()                          # creates schema + seeds DC(1)/NYC(2)
         self.client = flask_app.test_client()
 
     def tearDown(self):
-        try:
-            os.unlink(self.db_path)
-        except OSError:
-            pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
 class NetSalesBasis(Base):
@@ -329,6 +333,110 @@ class InvoiceEdit(Base):
         recon = self.client.get(f"/api/invoices/{iid}").get_json()["reconciliation"]
         self.assertFalse(recon["ok"])
         self.assertEqual(recon["delta"], -40.0)
+
+
+class Backups(Base):
+    def test_backup_creates_valid_snapshot_and_prunes(self):
+        with flask_app.app_context():
+            db.backup(keep=2)
+            db.backup(keep=2)
+            last = db.backup(keep=2)
+        self.assertTrue(last and os.path.exists(last))
+        files = sorted(glob.glob(os.path.join(self.tmpdir, "backups", "ledger-*.db")))
+        self.assertEqual(len(files), 2)          # pruned to keep=2
+        con = sqlite3.connect(files[-1])         # snapshot is a usable DB
+        try:
+            n = con.execute("SELECT COUNT(*) FROM locations").fetchone()[0]
+        finally:
+            con.close()
+        self.assertGreaterEqual(n, 2)            # seeded DC + NYC carried over
+
+
+class AppSecret(Base):
+    def test_persisted_random_secret_when_env_blank(self):
+        os.environ["APP_SECRET"] = ""
+        with flask_app.app_context():
+            s1 = app_module._app_secret()
+            s2 = app_module._app_secret()
+        self.assertEqual(s1, s2)                  # stable across calls (persisted)
+        self.assertEqual(len(s1), 64)            # secrets.token_hex(32)
+        self.assertNotEqual(s1, "barkeep-secret")  # not the old shipped default
+
+    def test_env_override_wins(self):
+        os.environ["APP_SECRET"] = "explicit-secret"
+        try:
+            with flask_app.app_context():
+                self.assertEqual(app_module._app_secret(), "explicit-secret")
+        finally:
+            os.environ["APP_SECRET"] = ""
+
+
+class LoginRateLimit(Base):
+    def setUp(self):
+        super().setUp()
+        os.environ["APP_PASSWORD"] = "secret"
+        os.environ["APP_SECRET"] = "testsecret"
+        app_module._LOGIN_FAILS.clear()
+
+    def tearDown(self):
+        os.environ["APP_PASSWORD"] = ""
+        os.environ["APP_SECRET"] = ""
+        app_module._LOGIN_FAILS.clear()
+        super().tearDown()
+
+    def test_lockout_after_max_failures(self):
+        for _ in range(app_module._LOGIN_MAX):
+            self.assertEqual(
+                self.client.post("/api/login", json={"password": "nope"}).status_code, 401)
+        # Even the RIGHT passcode is refused once locked out.
+        r = self.client.post("/api/login", json={"password": "secret"})
+        self.assertEqual(r.status_code, 429)
+
+    def test_success_clears_failures(self):
+        for _ in range(app_module._LOGIN_MAX - 1):
+            self.client.post("/api/login", json={"password": "nope"})
+        r = self.client.post("/api/login", json={"password": "secret"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("token", r.get_json())
+        # The counter reset, so a later wrong attempt is a plain 401, not a lockout.
+        self.assertEqual(
+            self.client.post("/api/login", json={"password": "nope"}).status_code, 401)
+
+    def test_spoofed_forwarded_header_on_direct_path_is_ignored(self):
+        # Direct LAN connection (real remote_addr): a rotated CF-Connecting-IP
+        # must NOT create fresh buckets, so the per-IP lockout still trips.
+        for i in range(app_module._LOGIN_MAX):
+            r = self.client.post("/api/login", json={"password": "nope"},
+                                 headers={"CF-Connecting-IP": f"1.2.3.{i}"},
+                                 environ_base={"REMOTE_ADDR": "10.0.0.5"})
+            self.assertEqual(r.status_code, 401)
+        r = self.client.post("/api/login", json={"password": "secret"},
+                             headers={"CF-Connecting-IP": "9.9.9.9"},
+                             environ_base={"REMOTE_ADDR": "10.0.0.5"})
+        self.assertEqual(r.status_code, 429)
+
+    def test_global_cap_catches_distributed_spray(self):
+        # Through the tunnel (loopback remote_addr) each distinct CF-Connecting-IP
+        # is its own bucket, so per-IP never trips — the global cap still bounds it.
+        for i in range(app_module._LOGIN_GLOBAL_MAX):
+            self.client.post("/api/login", json={"password": "nope"},
+                             headers={"CF-Connecting-IP": f"203.0.113.{i}"})
+        r = self.client.post("/api/login", json={"password": "secret"},
+                             headers={"CF-Connecting-IP": "203.0.113.250"})
+        self.assertEqual(r.status_code, 429)
+
+
+class UploadCap(Base):
+    def test_oversized_request_returns_413_json(self):
+        old = flask_app.config["MAX_CONTENT_LENGTH"]
+        flask_app.config["MAX_CONTENT_LENGTH"] = 1000
+        try:
+            r = self.client.post("/api/settings", data=b"x" * 2000,
+                                  content_type="application/json")
+            self.assertEqual(r.status_code, 413)
+            self.assertIn("too large", r.get_json()["error"])
+        finally:
+            flask_app.config["MAX_CONTENT_LENGTH"] = old
 
 
 if __name__ == "__main__":

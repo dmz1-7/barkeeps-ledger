@@ -11,6 +11,9 @@ Run:  python app.py    (see README for configuration)
 import hashlib
 import hmac
 import os
+import secrets
+import threading
+import time
 import uuid
 
 # Load .env before importing modules that read the environment at import time.
@@ -36,18 +39,46 @@ ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.teardown_appcontext(db.close_db)
+# Cap uploads so a giant (or malicious) file can't exhaust memory/disk. 32 MB
+# covers a full-resolution phone photo while still bounding abuse.
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
+
+
+@app.errorhandler(413)
+def _too_large(_e):
+    mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
+    return jsonify({"error": f"That file is too large (max {mb} MB)."}), 413
 
 
 # --- auth -------------------------------------------------------------------
 # Single shared passcode for a personal tool. Set APP_PASSWORD to enable it;
 # leave it unset to run open (fine on a private LAN, noted in the README).
 
+def _app_secret():
+    """The key the session token is signed with. Prefer an explicit APP_SECRET;
+    otherwise use a random per-install secret persisted in the DB. Never a shipped
+    constant — a known signing key would let anyone forge a session token."""
+    env = os.environ.get("APP_SECRET", "").strip()
+    if env:
+        return env
+    s = db.get_setting("app_secret")
+    if not s:
+        # Insert-if-absent then re-read, so concurrent first-boot requests all
+        # converge on whichever random secret landed first (no token churn).
+        db.set_setting_default("app_secret", secrets.token_hex(32))
+        s = db.get_setting("app_secret")
+    return s
+
+
+def _token_for(pw):
+    return hmac.new(_app_secret().encode(), pw.encode(), hashlib.sha256).hexdigest()
+
+
 def _expected_token():
     pw = os.environ.get("APP_PASSWORD", "")
     if not pw:
         return None
-    secret = os.environ.get("APP_SECRET", "barkeep-secret")
-    return hmac.new(secret.encode(), pw.encode(), hashlib.sha256).hexdigest()
+    return _token_for(pw)
 
 
 def _authed():
@@ -72,16 +103,51 @@ def _guard():
             return jsonify({"error": "unauthorized"}), 401
 
 
+# Throttle passcode guessing. In-memory (single-process dev server).
+_LOGIN_FAILS = {}          # key -> [recent failure timestamps]
+_LOGIN_MAX = 8             # per-key failures per window before lockout
+_LOGIN_GLOBAL_MAX = 50     # backstop across ALL keys, immune to header spoofing
+_LOGIN_WINDOW = 300        # seconds
+
+
+def _login_key():
+    # Trust the forwarded client IP only from the tunnel's loopback origin; on a
+    # direct connection CF-Connecting-IP is attacker-controlled, so key on the
+    # real socket address (which can't be spoofed per request) instead.
+    addr = request.remote_addr or "?"
+    if addr in ("127.0.0.1", "::1"):
+        return request.headers.get("CF-Connecting-IP") or addr
+    return addr
+
+
+def _login_blocked(key):
+    now = time.monotonic()
+    total = 0
+    for k in list(_LOGIN_FAILS.keys()):          # sweep: prune stale, count live
+        live = [t for t in _LOGIN_FAILS[k] if now - t < _LOGIN_WINDOW]
+        if live:
+            _LOGIN_FAILS[k] = live
+            total += len(live)
+        else:
+            del _LOGIN_FAILS[k]                   # don't leak keys for one-off IPs
+    # Per-key lockout, plus a global cap that a rotated CF-Connecting-IP can't escape.
+    return len(_LOGIN_FAILS.get(key, [])) >= _LOGIN_MAX or total >= _LOGIN_GLOBAL_MAX
+
+
 @app.post("/api/login")
 def login():
     expected = _expected_token()
     if expected is None:
         return jsonify({"token": "", "auth_required": False})
+    key = _login_key()
+    if _login_blocked(key):
+        return jsonify({"error": "Too many attempts. Wait a few minutes and try again."}), 429
     pw = (request.json or {}).get("password", "")
-    secret = os.environ.get("APP_SECRET", "barkeep-secret")
-    token = hmac.new(secret.encode(), pw.encode(), hashlib.sha256).hexdigest()
+    token = _token_for(pw)
     if hmac.compare_digest(token, expected):
+        _LOGIN_FAILS.pop(key, None)   # clear on success
         return jsonify({"token": token, "auth_required": True})
+    _LOGIN_FAILS.setdefault(key, []).append(time.monotonic())
     return jsonify({"error": "Wrong passcode."}), 401
 
 
@@ -133,6 +199,15 @@ def save_settings():
     if data.get("square_token"):
         db.set_setting("square_token", data["square_token"].strip())
     return jsonify({"ok": True})
+
+
+@app.post("/api/backup")
+def backup_now():
+    """Snapshot the database on demand (also runs at startup and periodically)."""
+    path = db.backup()
+    if not path:
+        return jsonify({"error": "No database to back up yet."}), 400
+    return jsonify({"ok": True, "file": os.path.basename(path)})
 
 
 @app.get("/api/square-locations")
@@ -1053,11 +1128,31 @@ with app.app_context():
     db.init_db()
 
 
+def _backup_loop(every_hours=6):
+    while True:
+        time.sleep(every_hours * 3600)
+        try:
+            db.backup()
+        except Exception as e:   # a failure must never take the server down...
+            print(f"  [!] Periodic backup failed: {e}")   # ...but don't fail silently
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8088"))
     host = os.environ.get("HOST", "0.0.0.0")
     if not os.environ.get("APP_PASSWORD"):
         print("\n  [!] APP_PASSWORD is not set — the ledger is open to anyone on "
               "your network.\n      Set it before exposing this beyond localhost.\n")
+    debug = bool(os.environ.get("DEBUG"))
+    # In debug Werkzeug's reloader runs this block in both parent and child; do
+    # the backup work only in the worker (or always, when the reloader is off).
+    if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        try:
+            snap = db.backup()
+            if snap:
+                print(f"  Backed up to {os.path.relpath(snap, BASE_DIR)}")
+        except Exception as e:
+            print(f"  [!] Startup backup failed: {e}")
+        threading.Thread(target=_backup_loop, daemon=True).start()
     print(f"  Barkeep's Ledger running at http://{host}:{port}\n")
-    app.run(host=host, port=port, debug=bool(os.environ.get("DEBUG")))
+    app.run(host=host, port=port, debug=debug)

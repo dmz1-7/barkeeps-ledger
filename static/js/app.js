@@ -981,6 +981,11 @@ async function renderSettings() {
       <p class="muted" style="font-size:.78rem">Opus is most accurate; Sonnet &amp; Haiku are cheaper per invoice.</p>
     </div></div>
 
+    <div class="card"><div class="card-band">Data &amp; Backups</div><div class="card-body">
+      <p class="muted" style="font-size:.82rem;margin-top:0">The ledger backs up automatically at startup and every few hours to <code>data/backups/</code> (the last 14 are kept). Snapshot on demand here.</p>
+      <button class="btn btn-ghost btn-block" id="backup-now">Back Up Now</button>
+    </div></div>
+
     <button class="btn btn-brass btn-block" id="save-settings">Save Settings</button>
     <button class="btn btn-ghost btn-block" id="logout" style="margin-top:.6rem">Sign Out</button>
     <p class="center muted" style="margin-top:1rem;font-size:.75rem">Barkeep&rsquo;s Ledger · self-hosted</p>`));
@@ -1048,6 +1053,15 @@ async function renderSettings() {
       toast("Settings saved.");
       renderSettings();  // re-render so the status badges & location refresh
     } catch (e) { toast(e.message); btn.disabled = false; }
+  });
+
+  $("#backup-now").addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    try {
+      const r = await api("POST", "/api/backup");
+      toast(`Backed up — ${r.file}`);
+    } catch (err) { toast(err.message); }
+    e.target.disabled = false;
   });
 
   $("#logout").addEventListener("click", () => { localStorage.removeItem(TOKEN_KEY); location.reload(); });
