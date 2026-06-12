@@ -388,6 +388,24 @@ async function loadDash() {
     body.appendChild(el(`<div class="note">${esc(d.labor_warning)}</div>`));
   }
 
+  // Proactive price-increase alerts, fetched separately so a hiccup here never
+  // breaks the dashboard. Only shown when there's something to flag.
+  try {
+    const pa = await api("GET", "/api/alerts/price-increases");
+    if (pa.count) {
+      const ac = el(`<div class="card"><div class="card-band">⚠ Price Increases
+        <span>${pa.count}</span></div><div class="card-body" id="pa"></div></div>`);
+      const box = ac.querySelector("#pa");
+      box.appendChild(el(`<p class="muted" style="font-size:.82rem;margin:0 0 .4rem">Vendor items up
+        ${pct(pa.min_pct)}+ vs their prior price, purchased in the last ${pa.lookback_days} days.</p>`));
+      pa.alerts.forEach((a) => box.appendChild(el(
+        `<div class="kv"><span>${esc(a.name)} <span class="muted">&middot; ${esc(a.vendor)}</span></span>
+          <b class="bad">${money(a.old_price)} &rarr; ${money(a.new_price)}
+          <span class="muted">(+${pct(a.change_pct)})</span></b></div>`)));
+      body.appendChild(ac);
+    }
+  } catch (e) { /* best-effort: alerts never block the dashboard */ }
+
   body.appendChild(el(`
     <div class="stat-grid">
       <div class="stat wide accent-ind">
@@ -964,8 +982,11 @@ async function renderSettings() {
         <label class="fld"><span>Target COGS %</span><input type="number" id="s-cogs" value="${esc(cfg.target_cogs_pct)}"></label>
         <label class="fld"><span>Target Labor %</span><input type="number" id="s-labor" value="${esc(cfg.target_labor_pct)}"></label>
       </div>
-      <label class="fld"><span>Default Hourly Wage $</span><input type="number" step="0.01" id="s-wage" value="${esc(cfg.default_hourly_wage)}"></label>
-      <p class="muted" style="font-size:.82rem;margin:.3rem 0 0">Applied to Square shifts with no wage recorded (e.g. tipped staff) so Labor% isn&rsquo;t understated. 0 leaves them at $0.</p>
+      <div class="row2">
+        <label class="fld"><span>Default Hourly Wage $</span><input type="number" step="0.01" id="s-wage" value="${esc(cfg.default_hourly_wage)}"></label>
+        <label class="fld"><span>Price Alert Threshold %</span><input type="number" step="0.5" id="s-palert" value="${esc(cfg.price_alert_pct)}"></label>
+      </div>
+      <p class="muted" style="font-size:.82rem;margin:.3rem 0 0">Wage is applied to Square shifts with no wage recorded (e.g. tipped staff) so Labor% isn&rsquo;t understated (0 = leave at $0). The alert threshold flags a vendor item on the dashboard when its price jumps that much.</p>
     </div></div>
 
     <div class="card"><div class="card-band">Sales Mix &middot; per period</div><div class="card-body">
@@ -1067,7 +1088,7 @@ async function renderSettings() {
   $("#save-settings").addEventListener("click", async () => {
     const payload = {
       target_cogs_pct: $("#s-cogs").value, target_labor_pct: $("#s-labor").value,
-      default_hourly_wage: $("#s-wage").value,
+      default_hourly_wage: $("#s-wage").value, price_alert_pct: $("#s-palert").value,
       square_env: $("#s-env").value, square_version: $("#s-ver").value,
       square_location_id: $("#s-loc").value, ai_model: $("#s-model").value,
     };

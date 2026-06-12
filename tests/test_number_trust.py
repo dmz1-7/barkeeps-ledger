@@ -825,5 +825,97 @@ class MoneyWriteNormalization(Base):
         self.assertEqual(t, 0.3)                            # 0.30000000000000004 cleaned
 
 
+class PriceAlerts(Base):
+    """Proactive price-increase alerts: the latest price jumped >= threshold over
+    the prior price, and that purchase is recent. Built on the same stable
+    (vendor, item) SKU keying as price_movers."""
+
+    def _d(self, days_ago):
+        with flask_app.app_context():
+            return (square_client.business_today() - dt.timedelta(days=days_ago)).isoformat()
+
+    def _inv(self, vendor, date, lines):
+        """lines: [(name, unit_cost, qty)] at location 1 (the test default)."""
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute(
+                "INSERT INTO invoices(location_id, vendor, invoice_date, status) "
+                "VALUES(1, ?, ?, 'closed')", (vendor, date)).lastrowid
+            for name, price, qty in lines:
+                d.execute("INSERT INTO invoice_items(invoice_id, name, unit_cost, qty, total) "
+                          "VALUES(?,?,?,?,?)", (iid, name, price, qty, (price or 0) * (qty or 0)))
+            d.commit()
+
+    def _alerts(self, **kw):
+        with flask_app.app_context():
+            return reports.price_alerts(**kw)
+
+    def test_increase_above_threshold_alerts_with_impact(self):
+        self._inv("Acme", self._d(10), [("Gin", 20.00, 2)])
+        self._inv("Acme", self._d(2), [("Gin", 24.00, 3)])      # +20%
+        res = self._alerts(min_pct=10)
+        self.assertEqual(res["count"], 1)
+        a = res["alerts"][0]
+        self.assertEqual((a["old_price"], a["new_price"], a["change_pct"]), (20.0, 24.0, 20.0))
+        self.assertEqual(a["qty"], 3.0)
+        self.assertEqual(a["impact"], 12.0)                     # (24-20) * 3
+
+    def test_increase_below_threshold_ignored(self):
+        self._inv("Acme", self._d(10), [("Gin", 20.0, 1)])
+        self._inv("Acme", self._d(2), [("Gin", 21.0, 1)])      # +5%
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_price_drop_not_alerted(self):
+        self._inv("Acme", self._d(10), [("Gin", 24.0, 1)])
+        self._inv("Acme", self._d(2), [("Gin", 20.0, 1)])
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_recent_jump_but_latest_purchase_stale_ignored(self):
+        self._inv("Acme", self._d(80), [("Gin", 20.0, 1)])
+        self._inv("Acme", self._d(60), [("Gin", 24.0, 1)])     # jump, but newest is 60d ago
+        self.assertEqual(self._alerts(min_pct=10, lookback_days=30)["count"], 0)
+
+    def test_same_item_different_vendor_not_merged(self):
+        # Each vendor has only one purchase -> no prior price -> no false alert,
+        # proving the (vendor, item) key doesn't merge a hike across vendors.
+        self._inv("Acme", self._d(10), [("Gin", 20.0, 1)])
+        self._inv("Beta", self._d(2), [("Gin", 24.0, 1)])
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_same_day_correction_is_not_a_price_change(self):
+        # Two differently-priced lines for the same SKU on the SAME day (an
+        # intra-day correction / split) must NOT look like a hike over time.
+        self._inv("Acme", self._d(2), [("Gin", 20.00, 1), ("Gin", 24.00, 3)])
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_mixed_prices_on_latest_date_suppressed_as_ambiguous(self):
+        # Latest date carries two different prices for the SKU -> the current
+        # price is undeterminable, so we suppress rather than risk a wrong alert
+        # (conservative: never alert on an ambiguous current price).
+        self._inv("Acme", self._d(20), [("Gin", 20.00, 1)])
+        self._inv("Acme", self._d(2), [("Gin", 24.00, 2), ("Gin", 20.00, 1)])
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_oscillation_back_to_baseline_not_alerted(self):
+        # $20 -> $24 -> $20: newest is a return to baseline, not an increase.
+        self._inv("Acme", self._d(20), [("Gin", 20.0, 1)])
+        self._inv("Acme", self._d(10), [("Gin", 24.0, 1)])
+        self._inv("Acme", self._d(2), [("Gin", 20.0, 1)])
+        self.assertEqual(self._alerts(min_pct=10)["count"], 0)
+
+    def test_endpoint_uses_configured_threshold(self):
+        self._inv("Acme", self._d(10), [("Gin", 20.0, 1)])
+        self._inv("Acme", self._d(2), [("Gin", 23.0, 1)])      # +15%
+        with flask_app.app_context():
+            db.set_setting("price_alert_pct", "20")
+        self.assertEqual(self.client.get("/api/alerts/price-increases").get_json()["count"], 0)
+        with flask_app.app_context():
+            db.set_setting("price_alert_pct", "10")
+        self.assertEqual(self.client.get("/api/alerts/price-increases").get_json()["count"], 1)
+
+    def test_threshold_exposed_in_config(self):
+        self.assertEqual(self.client.get("/api/config").get_json()["price_alert_pct"], "10")
+
+
 if __name__ == "__main__":
     unittest.main()

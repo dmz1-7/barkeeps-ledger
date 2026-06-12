@@ -208,14 +208,15 @@ def config():
         "target_cogs_pct": s.get("target_cogs_pct", "30"),
         "target_labor_pct": s.get("target_labor_pct", "25"),
         "default_hourly_wage": s.get("default_hourly_wage", "0"),
+        "price_alert_pct": s.get("price_alert_pct", "10"),
     })
 
 
 @app.post("/api/settings")
 def save_settings():
     data = request.json or {}
-    for key in ("square_env", "square_version", "ai_model",
-                "target_cogs_pct", "target_labor_pct", "default_hourly_wage"):
+    for key in ("square_env", "square_version", "ai_model", "target_cogs_pct",
+                "target_labor_pct", "default_hourly_wage", "price_alert_pct"):
         if key in data:
             db.set_setting(key, data[key])
     # The Square location is per-store now: write it onto the active store's row,
@@ -1033,6 +1034,22 @@ def report_sales():
 def report_price_movers():
     start, end = cogs.parse_range(request.args.get("start"), request.args.get("end"))
     return jsonify(reports.price_movers(start, end))
+
+
+@app.get("/api/alerts/price-increases")
+def alerts_price_increases():
+    """Proactive: vendor items whose latest price recently jumped >= the
+    configured threshold. Surfaced on the dashboard so the owner sees a silent
+    price hike without opening the Price Movers report."""
+    try:
+        min_pct = float(db.get_setting("price_alert_pct") or 10)
+    except (TypeError, ValueError):
+        min_pct = 10.0
+    try:
+        days = int(request.args.get("days", 30))
+    except (TypeError, ValueError):
+        days = 30
+    return jsonify(reports.price_alerts(lookback_days=days, min_pct=min_pct))
 
 
 # --- helpers ----------------------------------------------------------------

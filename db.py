@@ -214,6 +214,7 @@ DEFAULT_SETTINGS = {
     "target_cogs_pct": "30",      # % of sales
     "target_labor_pct": "25",     # % of sales
     "default_hourly_wage": "0",   # $/hr applied to Square shifts with no wage (0 = off)
+    "price_alert_pct": "10",      # flag a vendor item when its price jumps >= this %
     "square_env": "production",   # production | sandbox
     "square_version": "2025-01-23",
     "ai_model": os.environ.get("LEDGER_AI_MODEL", "claude-opus-4-8"),
