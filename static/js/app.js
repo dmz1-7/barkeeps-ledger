@@ -312,17 +312,26 @@ function effectiveTheme() {
   if (set) return set;
   return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
+// stored preference: "light" | "dark" | null (follow OS)
+function themePref() {
+  try { return localStorage.getItem(THEME_KEY); } catch (e) { return null; }
+}
 function applyThemeToggleIcon() {
   const dark = effectiveTheme() === "dark";
   const btn = $("#theme-toggle");
-  if (btn) btn.textContent = dark ? "◐" : "◑";
+  // ◑ light, ◐ dark, ◓ following the OS (no explicit override)
+  if (btn) btn.textContent = themePref() === null ? "◓" : (dark ? "◐" : "◑");
   const meta = $("#theme-color-meta");
   if (meta) meta.setAttribute("content", dark ? "#141414" : "#fbfaf7");
 }
+// cycle light -> dark -> follow-OS, so 'follow the OS preference' stays reachable
 $("#theme-toggle").addEventListener("click", () => {
-  const next = effectiveTheme() === "dark" ? "light" : "dark";
-  document.documentElement.setAttribute("data-theme", next);
-  try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
+  const cur = themePref();
+  const next = cur === "light" ? "dark" : cur === "dark" ? null : "light";
+  try {
+    if (next === null) { localStorage.removeItem(THEME_KEY); document.documentElement.removeAttribute("data-theme"); }
+    else { localStorage.setItem(THEME_KEY, next); document.documentElement.setAttribute("data-theme", next); }
+  } catch (e) {}
   applyThemeToggleIcon();
 });
 applyThemeToggleIcon();
@@ -1043,9 +1052,9 @@ async function renderCount() {
         <div class="grow"><div class="ttl">${esc(it.name)}</div>
           <div class="meta">par ${fmtQty(it.par_level)} ${esc(it.unit || "")}</div></div>
         <div class="stepper">
-          <button class="dec" type="button">&minus;</button>
-          <input class="cval" inputmode="decimal" value="${fmtQty(it.last_count)}">
-          <button class="inc" type="button">+</button>
+          <button class="dec" type="button" aria-label="Decrease ${esc(it.name)}">&minus;</button>
+          <input class="cval" inputmode="decimal" aria-label="Count for ${esc(it.name)}" value="${fmtQty(it.last_count)}">
+          <button class="inc" type="button" aria-label="Increase ${esc(it.name)}">+</button>
         </div></div>`);
       const input = row.querySelector(".cval");
       const sync = (val) => { state[it.id] = val; input.value = fmtQty(val);

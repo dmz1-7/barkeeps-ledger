@@ -1481,7 +1481,8 @@ class UsageCogsDenominator(Base):
         self._count("2026-05-30", 1000.0)        # opening, just before the range
         self._count("2026-07-02", 800.0)         # closing, just after
         self._invoice("2026-06-15", 700.0)       # in-interval -> usage = 1000+700-800 = 900
-        # interval [05-30, 07-02] = 34 days; $100/day -> interval sales = 3400
+        # interval [05-30, 07-02] = 34 days; $100/day, opening day excluded from the
+        # denominator (matches the (b_date, e_date] purchase window) -> 33*100 = 3300
         with flask_app.app_context(), \
                 mock.patch.object(square_client, "is_configured", return_value=True), \
                 mock.patch.object(square_client, "get_sales",
@@ -1492,8 +1493,8 @@ class UsageCogsDenominator(Base):
             s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
         self.assertEqual(s["cogs_method"], "usage")
         self.assertEqual(s["cogs"], 900.0)
-        self.assertEqual(s["cogs_sales"], 3400.0)
-        self.assertEqual(s["cogs_pct"], round(900 / 3400 * 100, 1))   # interval basis, not 900/1000
+        self.assertEqual(s["cogs_sales"], 3300.0)
+        self.assertEqual(s["cogs_pct"], round(900 / 3300 * 100, 1))   # interval basis, not 900/1000
         self.assertEqual(s["cogs_sales_basis"], "interval")
         self.assertEqual(s["sales"], 1000.0)      # labor% still uses range sales
 
@@ -1800,11 +1801,11 @@ class PrimePctUsageMode(Base):
         self._count("2026-05-30", 1000.0)
         self._count("2026-07-02", 800.0)
         self._invoice("2026-06-15", 700.0)            # usage = 900
-        # complete interval cache: 34 days x $100 -> interval sales 3400
+        # complete cache: 34 days x $100, opening day excluded -> 33*100 = 3300
         s = self._summary(lambda b, e: {(b + dt.timedelta(days=i)).isoformat(): 100.0
                                         for i in range((e - b).days + 1)})
         self.assertEqual(s["cogs_sales_basis"], "interval")
-        cogs_pct = round(900 / 3400 * 100, 1)
+        cogs_pct = round(900 / 3300 * 100, 1)
         self.assertEqual(s["cogs_pct"], cogs_pct)
         self.assertEqual(s["labor_pct"], 30.0)         # 300/1000 (range)
         self.assertEqual(s["prime_pct"], round(cogs_pct + 30.0, 1))   # sum of correctly-based parts
@@ -2228,7 +2229,7 @@ class UsageCogsIntervalPerStore(Base):
                 s = cogs.summary(dt.date(2026, 2, 5), dt.date(2026, 2, 14))
         self.assertEqual(s["cogs_method"], "usage")
         self.assertEqual(s["cogs_sales_basis"], "interval")
-        self.assertEqual(s["cogs_sales"], 1200.0)            # DC: 12 days * $100, NOT NYC's $999
+        self.assertEqual(s["cogs_sales"], 1100.0)            # DC: 11 days (opening excl) * $100, NOT NYC's $999
 
 
 # ============================================================================
@@ -2330,6 +2331,94 @@ class ImporterBreadth(Base):
         with flask_app.app_context():
             with self.assertRaises(KeyError):
                 self._imp().import_invoices(path)
+
+
+# ============================================================================
+# Sixth audit-fix regression tests (2026-06-12, 6th re-audit)
+# ============================================================================
+
+class VendorSpendReports(Base):
+    def _inv(self, vendor, total, loc=1, date="2026-06-05"):
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(?,?,?,?)", (loc, vendor, date, total)).lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',?)", (iid, total))
+            d.commit()
+
+    def test_summary_sums_per_store_only(self):
+        self._inv("Acme", 100.0, loc=1)
+        self._inv("Acme", 999.0, loc=2)          # other store, must be excluded
+        out = self.client.get("/api/vendors/summary", headers={"X-Location-Id": "1"}).get_json()
+        self.assertEqual(out["total_purchased"], 100.0)
+
+    def test_vendor_spend_is_case_insensitive(self):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO vendors(location_id,name) VALUES(1,'Acme')")
+            get_db().commit()
+        self._inv("Acme", 100.0)
+        self._inv("acme", 50.0)                  # different case, same vendor
+        vendors = self.client.get("/api/vendors", headers={"X-Location-Id": "1"}).get_json()
+        acme = [v for v in vendors if v["name"].lower() == "acme"][0]
+        self.assertEqual(acme["spend"], 150.0)
+
+
+class SalesReportShape(Base):
+    def test_weekly_and_ptd_totals(self):
+        cache = {"2026-02-16": 100.0, "2026-02-17": 200.0, "2026-02-18": 50.0}   # Mon/Tue/Wed
+        with flask_app.app_context(), \
+                mock.patch.object(square_client, "daily_sales_cached", return_value=cache):
+            rep = reports.sales_report(today=dt.date(2026, 2, 18))   # Wed of that week
+        self.assertEqual(rep["totals"]["this_week"], 350.0)          # Mon+Tue+Wed
+        self.assertEqual(rep["period_to_date"], 350.0)               # month-to-date
+
+
+class ControllablePLSplitMix(Base):
+    def test_split_mix_income_sums_to_sales(self):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO sales_mix(location_id,period_start,period_end,category_type,pct) "
+                             "VALUES(1,'2026-06-01','2026-06-30','Wine',60)")
+            get_db().execute("INSERT INTO sales_mix(location_id,period_start,period_end,category_type,pct) "
+                             "VALUES(1,'2026-06-01','2026-06-30','Beer',40)")
+            get_db().commit()
+            with mock.patch.object(square_client, "get_sales",
+                                   return_value={"sales": 1000.0, "orders": 1, "error": None}), \
+                    mock.patch.object(square_client, "get_labor", return_value=dict(_LABOR0)), \
+                    mock.patch.object(square_client, "is_configured", return_value=True):
+                pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        inc = {i["category_type"]: i["amt"] for i in pl["income"]}
+        self.assertEqual(inc["Wine"], 600.0)
+        self.assertEqual(inc["Beer"], 400.0)
+        self.assertEqual(round(sum(inc.values()), 2), 1000.0)        # income sums to sales
+
+
+class GetSalesWindow(Base):
+    def test_get_sales_posts_business_day_window(self):
+        captured = {}
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return {"orders": [], "cursor": None}
+
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            db.set_setting("tz", "America/New_York")
+            db.set_setting("day_start_hour", "5")
+            with mock.patch.object(square_client.requests, "post",
+                                   side_effect=lambda url, **kw: (captured.update(kw.get("json", {})), FakeResp())[1]):
+                square_client.get_sales(dt.date(2026, 6, 10), dt.date(2026, 6, 10))
+        closed = captured["query"]["filter"]["date_time_filter"]["closed_at"]
+        self.assertEqual(closed["start_at"], "2026-06-10T09:00:00Z")   # 5am EDT
+        self.assertEqual(closed["end_at"], "2026-06-11T09:00:00Z")
+
+
+class CountTimestampBusinessDay(Base):
+    def test_count_dated_on_business_day(self):
+        self.client.post("/api/counts", json={"note": "n", "lines": []})
+        with flask_app.app_context():
+            taken = get_db().execute("SELECT taken_at FROM counts ORDER BY id DESC LIMIT 1").fetchone()["taken_at"]
+            today = square_client.business_today().isoformat()
+        self.assertTrue(taken.startswith(today))
 
 
 if __name__ == "__main__":

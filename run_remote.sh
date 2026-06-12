@@ -7,6 +7,13 @@
 set -e
 cd "$(dirname "$0")"
 
+# Refuse to open a PUBLIC tunnel to an unauthenticated app. APP_PASSWORD may be
+# set in .env or the environment.
+if [ -z "${APP_PASSWORD:-}" ] && ! grep -qE '^APP_PASSWORD=.+' .env 2>/dev/null; then
+  echo "Refusing to expose a public tunnel: set APP_PASSWORD in .env (or the environment) first." >&2
+  exit 1
+fi
+
 # Fetch cloudflared if it's not here yet.
 if [ ! -x ./cloudflared ]; then
   curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
