@@ -67,9 +67,13 @@ def purchases(start, end):
     by_cat_c = {}
     for r, amt in _pretax_line_rows(rows):
         by_cat_c[r["ctype"]] = by_cat_c.get(r["ctype"], 0) + money.to_cents(amt)
+    # Count only invoices that actually contribute a costed line in range, so the
+    # surfaced invoice_count can't imply more spend than `total` reflects (a header
+    # logged with no line items adds $0 to total and shouldn't inflate the count).
     n = db.execute(
-        "SELECT COUNT(*) AS n FROM invoices "
-        "WHERE location_id IS ? AND invoice_date >= ? AND invoice_date <= ?",
+        "SELECT COUNT(DISTINCT inv.id) AS n "
+        "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
+        "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ?",
         (loc, start.isoformat(), end.isoformat()),
     ).fetchone()["n"]
     by_cat = {k: round(v / 100.0, 2) for k, v in by_cat_c.items() if v}
@@ -133,6 +137,10 @@ def summary(start, end):
 
     sales = sales_info["sales"]
     labor = labor_info["labor"]
+    # A labor-only Square outage returns labor=0 with an error set. Treating that 0
+    # as a genuine $0 would drop labor from prime/prime% and inflate the headline,
+    # so null the labor-derived figures when labor errored (mirrors the sales guard).
+    labor_failed = bool(labor_info.get("error"))
 
     def pct_of(part, den):
         return round(part / den * 100, 1) if den else None
@@ -202,7 +210,7 @@ def summary(start, end):
     # range), so prime% is the SUM of the two correctly-based percentages — never
     # prime/cogs_sales, which would divide range labor by interval sales.
     cogs_pct = pct_of(cogs_amount, cogs_sales)
-    labor_pct = pct_of(labor, sales)
+    labor_pct = None if labor_failed else pct_of(labor, sales)
     prime_pct = (round(cogs_pct + labor_pct, 1)
                  if cogs_pct is not None and labor_pct is not None else None)
     # Prime DOLLARS: in interval mode scale COGS to the requested range before
@@ -214,7 +222,8 @@ def summary(start, end):
     prime_cogs = cogs_amount
     if cogs_sales_basis == "interval" and cogs_sales:
         prime_cogs = money.normalize(cogs_amount * sales / cogs_sales) or 0.0
-    prime = round((prime_cogs or 0.0) + labor, 2)
+    # Prime needs labor; null it on a labor outage rather than report COGS-only as prime.
+    prime = None if labor_failed else round((prime_cogs or 0.0) + labor, 2)
 
     return {
         "range": {"start": start.isoformat(), "end": end.isoformat()},

@@ -182,8 +182,13 @@ def controllable_pl(start, end):
     # Null the profit headlines instead (mirrors cogs.summary nulling cogs_pct on
     # a zero denominator) so a degraded P&L can't masquerade as a real loss.
     sales_failed = bool(sales_info.get("error"))
+    # A labor-only outage returns labor=0 with an error: controllable_profit =
+    # gross - labor would then read as an inflated real profit. Null it (and the
+    # Labor expense amount) on a labor error too, not just a sales error.
+    labor_failed = bool(labor_info.get("error"))
     gross = None if sales_failed else _r(total_income - total_cogs)
-    controllable = None if sales_failed else _r((gross or 0) - labor)
+    controllable = None if (sales_failed or labor_failed) else _r((gross or 0) - labor)
+    labor_amt = None if labor_failed else labor
 
     def pct(part):
         return _r(part / total_income * 100) if total_income and part is not None else None
@@ -198,8 +203,8 @@ def controllable_pl(start, end):
         "total_cogs_pct": pct(total_cogs),
         "gross_profit": gross,
         "gross_pct": pct(gross),
-        "expenses": [{"name": "Labor", "amt": labor, "pct": pct(labor)}],
-        "total_expenses": labor,
+        "expenses": [{"name": "Labor", "amt": labor_amt, "pct": pct(labor_amt)}],
+        "total_expenses": labor_amt,
         "controllable_profit": controllable,
         "controllable_pct": pct(controllable),
         "labor_hours": labor_info.get("hours", 0),

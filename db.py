@@ -226,24 +226,32 @@ DROP INDEX IF EXISTS idx_invoices_date;
 # IntegrityError (not OperationalError) if a legacy/corrupt DB already holds a
 # duplicate. That must NOT abort the rest of the migration or crash startup —
 # it's a safety-net constraint, so on a pre-existing dup we log and carry on.
-POST_UNIQUE = (
+POST_UNIQUE = [
     # One Square location id per store: the daily_sales cache + sales/labor pulls
     # key on it, so a duplicate would cross-pollute two stores' Square numbers.
     # Partial, so blank/NULL ids (stores not yet wired to Square) don't collide.
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_locations_sqid ON locations(square_location_id) "
-    "WHERE COALESCE(square_location_id, '') <> ''"
-)
+    ("uq_locations_sqid",
+     "CREATE UNIQUE INDEX IF NOT EXISTS uq_locations_sqid ON locations(square_location_id) "
+     "WHERE COALESCE(square_location_id, '') <> ''"),
+    # One product name per store (case-insensitive): the importer's relink/upsert
+    # resolve products by name, so a duplicate name would re-link an ingredient or
+    # merge two products' prices to an arbitrary row. Enforces that assumption.
+    ("uq_inv_loc_name",
+     "CREATE UNIQUE INDEX IF NOT EXISTS uq_inv_loc_name "
+     "ON inventory_items(location_id, name COLLATE NOCASE)"),
+]
 
 
 def _apply_post_indexes(conn):
-    """Run the functional index migration, then the unique constraint guardedly so
+    """Run the functional index migration, then each unique constraint guardedly so
     a pre-existing duplicate can't brick the app (see POST_UNIQUE)."""
     conn.executescript(POST_INDEXES)
-    try:
-        conn.execute(POST_UNIQUE)
-    except sqlite3.IntegrityError:
-        print("  [!] uq_locations_sqid not applied: a duplicate square_location_id "
-              "already exists. Fix the duplicate to restore Square-number isolation.")
+    for name, sql in POST_UNIQUE:
+        try:
+            conn.execute(sql)
+        except sqlite3.IntegrityError:
+            print(f"  [!] {name} not applied: a pre-existing duplicate exists. "
+                  "Resolve the duplicate to enforce this uniqueness constraint.")
 
 # The seeded two-level taxonomy: {Category Type: [Category, ...]}. Order within
 # each list is the display sort order. Drives the Category Report, Purchase
@@ -644,8 +652,15 @@ def backup(keep=14):
     safety net against an accidental wipe."""
     if not os.path.exists(DB_PATH):
         return None
+    # Restrict perms: the DB holds the app_secret (session-token signing key) and
+    # the Square token in plaintext, so backups must not be world-readable on a
+    # multi-user host (the live DB is the documented filesystem-perms trust model).
     bdir = os.path.join(os.path.dirname(DB_PATH), "backups")
-    os.makedirs(bdir, exist_ok=True)
+    os.makedirs(bdir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(bdir, 0o700)   # tighten even if the dir pre-existed with a looser mode
+    except OSError:
+        pass
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     dest = os.path.join(bdir, f"ledger-{stamp}.db")
     src = dst = None
@@ -654,6 +669,10 @@ def backup(keep=14):
         dst = sqlite3.connect(dest)
         with dst:
             src.backup(dst)
+        try:
+            os.chmod(dest, 0o600)   # owner-only: the snapshot carries the same secrets
+        except OSError:
+            pass
     finally:
         if src:
             src.close()
