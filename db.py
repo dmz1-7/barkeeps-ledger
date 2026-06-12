@@ -213,6 +213,7 @@ CREATE INDEX IF NOT EXISTS idx_items_invitem ON invoice_items(inventory_item_id)
 -- referencing rows instead of full-scanning count_lines / recipe_items.
 CREATE INDEX IF NOT EXISTS idx_countlines_item ON count_lines(item_id);
 CREATE INDEX IF NOT EXISTS idx_recipeitems_product ON recipe_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_items_vendoritem ON invoice_items(vendor_item_id);
 -- Case-insensitive product-name seek: the MarginEdge importer resolves each row
 -- with lower(name)=lower(?) per store; without this, every row is a per-store scan.
 CREATE INDEX IF NOT EXISTS idx_inv_loc_name ON inventory_items(location_id, name COLLATE NOCASE);

@@ -241,25 +241,29 @@ def sales_report(today=None):
         return sales.get(d.isoformat(), 0.0)
 
     def rng(a, b):
-        s, d = 0.0, a
+        # Sum the penny-exact daily floats via money.sum_dollars (integer cents),
+        # matching the codebase's money discipline instead of float += drift.
+        vals, d = [], a
         while d <= b:
-            s += sales.get(d.isoformat(), 0.0)
+            vals.append(sales.get(d.isoformat(), 0.0))
             d += dt.timedelta(days=1)
-        return s
+        return money.sum_dollars(vals)
 
     days = []
     labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    tw_tot = lw_tot = ly_tot = 0.0
+    tw_vals, lw_vals, ly_vals = [], [], []
     for i, label in enumerate(labels):
         d_tw = this_mon + dt.timedelta(days=i)
         tw = g(d_tw) if d_tw <= today else None
         lw = g(last_mon + dt.timedelta(days=i))
         ly = g(ly_mon + dt.timedelta(days=i))
         if tw:
-            tw_tot += tw
-        lw_tot += lw
-        ly_tot += ly
+            tw_vals.append(tw)
+        lw_vals.append(lw)
+        ly_vals.append(ly)
         days.append({"day": label, "this_week": tw, "last_week": _r(lw), "last_year": _r(ly)})
+    tw_tot, lw_tot, ly_tot = (money.sum_dollars(tw_vals), money.sum_dollars(lw_vals),
+                              money.sum_dollars(ly_vals))
 
     ptd = rng(month_start, today)
     ytd = rng(year_start, today)
@@ -319,16 +323,22 @@ def price_movers(start, end):
             groups[(r["vkey"], r["nkey"])] = g = {
                 "vendor": r["vendor"], "name": r["name"], "cat": r["cat"],
                 "new_price": None, "earliest_price": None, "qty": 0.0,
+                "epoch_ended": False,
             }
         if g["new_price"] is None and r["price"] is not None:
             g["new_price"] = r["price"]      # newest-first, so this is the latest price
         if r["price"] is not None:
             g["earliest_price"] = r["price"]  # newest-first: last write = oldest in-window price
-        # Impact = price delta x qty bought AT the new price; only count units at
-        # the latest price so units bought earlier in the window at the old price
-        # don't get charged the full delta (which overstated impact).
-        if r["price"] == g["new_price"]:
-            g["qty"] += (r["qty"] or 0)
+        # Impact = price delta x qty bought AT the new price. Count only the
+        # CONTIGUOUS newest run at new_price (the latest price epoch). Match on the
+        # epoch, not value equality: once the price changes, the epoch is over, so a
+        # later dip-and-return to the SAME value can't fold those earlier units in
+        # (which charged the full delta on pre-dip units and overstated impact).
+        if not g["epoch_ended"]:
+            if r["price"] == g["new_price"]:
+                g["qty"] += (r["qty"] or 0)
+            elif r["price"] is not None:
+                g["epoch_ended"] = True
 
     pvkey = _PM_VENDOR.format(vi="v", inv="xi")
     pnkey = _PM_NAME.format(vi="v", ii="x")

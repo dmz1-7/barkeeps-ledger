@@ -297,10 +297,12 @@ function go(hash) {
 function closeDrawer() {
   $("#sidebar").classList.remove("open");
   $("#scrim").classList.add("hidden");
+  $("#navtoggle")?.focus();                 // return focus to the trigger
 }
 function openDrawer() {
   $("#sidebar").classList.add("open");
   $("#scrim").classList.remove("hidden");
+  $("#sidebar").querySelector("a,button,[tabindex]")?.focus();   // move focus into the drawer
 }
 $("#navtoggle").addEventListener("click", openDrawer);
 $("#scrim").addEventListener("click", closeDrawer);
@@ -1835,10 +1837,12 @@ async function recipeEditor(id) {
     const p = pid ? prodById(pid) : null;
     if (!p) return { dollars: 0, missing: true, unconverted: false };
     const uc = p.unit_cost || 0;
-    if (p.size_qty > 0 && unit && p.size_unit) {
-      const used = convertUnit(qty, unit, p.size_unit);
-      if (used !== null) return { dollars: uc * (used / p.size_qty), missing: false, unconverted: false };
-      return { dollars: 0, missing: false, unconverted: !!qty };   // size set but unit didn't convert: $0, flagged
+    if (p.size_qty > 0 && p.size_unit) {
+      if (unit) {
+        const used = convertUnit(qty, unit, p.size_unit);
+        if (used !== null) return { dollars: uc * (used / p.size_qty), missing: false, unconverted: false };
+      }
+      return { dollars: 0, missing: false, unconverted: !!qty };   // sized but unit blank/won't convert: $0, flagged
     }
     return { dollars: qty * uc, missing: false, unconverted: false };     // no size: raw qty is correct
   };

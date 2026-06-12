@@ -3717,5 +3717,80 @@ class BackupPermissions(Base):
         self.assertEqual(mode & 0o077, 0)           # no group/other access (0600-ish)
 
 
+# ============================================================================
+# Seventeenth audit-fix regression tests (2026-06-12, 17th re-audit)
+# ============================================================================
+
+class DuplicateNameApi(Base):
+    def test_duplicate_product_create_is_400_not_500(self):
+        self.assertEqual(self.client.post("/api/products", json={"name": "Gin"}).status_code, 200)
+        r = self.client.post("/api/products", json={"name": "gin"})   # case-insensitive dup
+        self.assertEqual(r.status_code, 400)
+        self.assertNotIn("Internal server error", r.get_json()["error"])
+
+    def test_duplicate_inventory_create_is_400(self):
+        self.assertEqual(self.client.post("/api/inventory", json={"name": "Tonic"}).status_code, 200)
+        self.assertEqual(self.client.post("/api/inventory", json={"name": "Tonic"}).status_code, 400)
+
+    def test_rename_collision_is_400(self):
+        self.client.post("/api/products", json={"name": "Rum"})
+        pid = self.client.post("/api/products", json={"name": "Whiskey"}).get_json()["id"]
+        r = self.client.put(f"/api/products/{pid}", json={"name": "Rum"})   # collide on rename
+        self.assertEqual(r.status_code, 400)
+
+
+class PriceMoverOscillation(Base):
+    def _line(self, date, price, qty):
+        d = get_db()
+        iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                        "VALUES(1,'Acme',?,?)", (date, price * qty)).lastrowid
+        d.execute("INSERT INTO invoice_items(invoice_id,name,unit_cost,qty,total) "
+                  "VALUES(?,'Gin',?,?,?)", (iid, price, qty, price * qty))
+
+    def test_dip_and_return_counts_only_newest_epoch(self):
+        with flask_app.app_context():
+            self._line("2026-05-15", 6.0, 1)     # prior price (before window)
+            self._line("2026-06-10", 10.0, 7)    # earlier in-window $10 epoch (must NOT count)
+            self._line("2026-06-15", 8.0, 3)     # dip
+            self._line("2026-06-20", 10.0, 5)    # newest $10 epoch
+            get_db().commit()
+            res = reports.price_movers(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        gin = [m for m in res["movers"] if m["name"] == "Gin"][0]
+        self.assertEqual(gin["new_price"], 10.0)
+        self.assertEqual(gin["qty"], 5.0)        # only the contiguous newest run, not 5+7
+        self.assertEqual(gin["impact"], 20.0)    # (10-6) * 5, not * 12
+
+
+class RecipeBlankUnitSizedProduct(Base):
+    def test_blank_unit_on_sized_product_costs_zero(self):
+        with flask_app.app_context():
+            d = get_db()
+            gin = d.execute("INSERT INTO inventory_items(location_id,name,unit_cost,size_qty,size_unit) "
+                            "VALUES(1,'Gin',20,750,'ml')").lastrowid
+            d.commit()
+        r = self.client.post("/api/recipes", json={
+            "name": "Pour", "menu_price": 10, "yield_qty": 1,
+            "items": [{"product_id": gin, "qty": 1.5, "unit": ""}]}).get_json()   # blank unit
+        self.assertEqual(r["batch_cost"], 0.0)   # not 1.5 * $20 = $30
+        self.assertEqual(r["unconverted_lines"], 1)
+
+
+class VendorItemUpdateForeignProduct(Base):
+    def test_put_drops_foreign_store_product_id(self):
+        with flask_app.app_context():
+            d = get_db()
+            store2_prod = d.execute("INSERT INTO inventory_items(location_id,name) "
+                                    "VALUES(2,'NycGin')").lastrowid
+            vi = d.execute("INSERT INTO vendor_items(location_id,vendor_item_name) "
+                           "VALUES(1,'Gin case')").lastrowid
+            d.commit()
+        # store-1 vendor item must not be able to point at a store-2 product
+        self.client.put(f"/api/vendor-items/{vi}", headers={"X-Location-Id": "1"},
+                        json={"product_id": store2_prod})
+        with flask_app.app_context():
+            pid = get_db().execute("SELECT product_id FROM vendor_items WHERE id=?", (vi,)).fetchone()["product_id"]
+        self.assertIsNone(pid)
+
+
 if __name__ == "__main__":
     unittest.main()

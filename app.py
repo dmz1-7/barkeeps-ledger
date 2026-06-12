@@ -13,6 +13,7 @@ import hmac
 import math
 import os
 import secrets
+import sqlite3
 import threading
 import time
 import uuid
@@ -628,13 +629,16 @@ def inventory_create():
     d = body()
     if not _s(d.get("name")):   # name is NOT NULL; reject a blank like every sibling create does
         return jsonify({"error": "Name is required."}), 400
-    cur = db.get_db().execute(
-        "INSERT INTO inventory_items(location_id, name, category, unit, par_level, last_count, "
-        "unit_cost, vendor, sort_order) VALUES(?,?,?,?,?,?,?,?,?)",
-        (db.active_location_id(), _s(d.get("name")), _s(d.get("category")) or "other", _s(d.get("unit")),
-         _f(d.get("par_level"), 0), _f(d.get("last_count"), 0),
-         _f(d.get("unit_cost"), 0), _s(d.get("vendor")), _i(d.get("sort_order"), 0)),
-    )
+    try:
+        cur = db.get_db().execute(
+            "INSERT INTO inventory_items(location_id, name, category, unit, par_level, last_count, "
+            "unit_cost, vendor, sort_order) VALUES(?,?,?,?,?,?,?,?,?)",
+            (db.active_location_id(), _s(d.get("name")), _s(d.get("category")) or "other", _s(d.get("unit")),
+             _f(d.get("par_level"), 0), _f(d.get("last_count"), 0),
+             _f(d.get("unit_cost"), 0), _s(d.get("vendor")), _i(d.get("sort_order"), 0)),
+        )
+    except sqlite3.IntegrityError:   # UNIQUE(location_id, name) — clean 400, not a 500
+        return jsonify({"error": "That name already exists in this store."}), 400
     db.get_db().commit()
     return jsonify({"id": cur.lastrowid})
 
@@ -654,8 +658,11 @@ def inventory_update(item_id):
     if not sets:
         return jsonify({"ok": True})
     vals += [item_id, db.active_location_id()]
-    cur = db.get_db().execute(
-        f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+    try:
+        cur = db.get_db().execute(
+            f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+    except sqlite3.IntegrityError:   # renamed to a name already used in this store
+        return jsonify({"error": "That name already exists in this store."}), 400
     if cur.rowcount == 0:
         abort(404, description="Not found.")
     db.get_db().commit()
@@ -1005,9 +1012,12 @@ def product_create():
     vals = [name if k == "name" else (db.active_location_id() if k == "location_id"
                                       else _coerce_col(k, d.get(k))) for k in cols]
     placeholders = ",".join("?" * len(cols))
-    cur = db.get_db().execute(
-        f"INSERT INTO inventory_items({','.join(cols)}) VALUES({placeholders})", vals
-    )
+    try:
+        cur = db.get_db().execute(
+            f"INSERT INTO inventory_items({','.join(cols)}) VALUES({placeholders})", vals
+        )
+    except sqlite3.IntegrityError:   # UNIQUE(location_id, name) — clean 400, not a 500
+        return jsonify({"error": "That name already exists in this store."}), 400
     db.get_db().commit()
     return jsonify({"id": cur.lastrowid})
 
@@ -1097,8 +1107,11 @@ def product_update(pid):
             sets.append(f"{key}=?"); vals.append(_coerce_col(key, d[key]))
     if sets:
         vals += [pid, db.active_location_id()]
-        cur = db.get_db().execute(
-            f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+        try:
+            cur = db.get_db().execute(
+                f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
+        except sqlite3.IntegrityError:   # renamed to a name already used in this store
+            return jsonify({"error": "That name already exists in this store."}), 400
         if cur.rowcount == 0:
             abort(404, description="Not found.")
         db.get_db().commit()
