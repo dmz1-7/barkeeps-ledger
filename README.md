@@ -7,9 +7,9 @@ levels** so you can walk the cellar and count fast. It spits out the two numbers
 that matter: **COGS %** and **Labor %** (plus prime cost).
 
 Phone-first, runs on your own machine or a cheap VPS, data stays in a single
-SQLite file. Aesthetic: a bright 1930s American diner — cherry red, turquoise,
-cream and chrome, a checkerboard trim, a neon-script sign over the door, and
-big, easy-to-read numbers.
+SQLite file. Design: a functional, typography-first minimalism — IBM Plex Sans
+and Mono, a single accent color, hairline borders, dense tables, and tabular
+numbers. Light and dark themes (follows your OS, with a manual toggle).
 
 ---
 

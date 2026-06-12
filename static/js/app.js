@@ -297,6 +297,25 @@ function openDrawer() {
 $("#navtoggle").addEventListener("click", openDrawer);
 $("#scrim").addEventListener("click", closeDrawer);
 
+/* ---------- theme toggle (light/dark, persisted per device) ---------- */
+const THEME_KEY = "ledger_theme";
+function effectiveTheme() {
+  const set = document.documentElement.getAttribute("data-theme");
+  if (set) return set;
+  return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+function applyThemeToggleIcon() {
+  const btn = $("#theme-toggle");
+  if (btn) btn.textContent = effectiveTheme() === "dark" ? "◐" : "◑";
+}
+$("#theme-toggle").addEventListener("click", () => {
+  const next = effectiveTheme() === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
+  applyThemeToggleIcon();
+});
+applyThemeToggleIcon();
+
 function loading() { view().innerHTML = '<div class="spinner"></div>'; }
 
 /* ============================================================
@@ -757,7 +776,7 @@ function catOptionsHTML(selected) {
 }
 
 function lineRow(li) {
-  const r = el(`<div class="lrow" style="display:grid;grid-template-columns:1fr auto;gap:.4rem;align-items:start;margin-bottom:.6rem;border-bottom:1px dotted var(--line);padding-bottom:.5rem">
+  const r = el(`<div class="lrow" style="display:grid;grid-template-columns:1fr auto;gap:.4rem;align-items:start;margin-bottom:.6rem;border-bottom:1px solid var(--border);padding-bottom:.5rem">
     <input class="li-name" placeholder="Item" value="${esc(li.name || "")}">
     <button class="btn btn-sm btn-ghost li-del" title="remove">&times;</button>
     <div class="row3" style="grid-column:1 / -1">
@@ -1213,7 +1232,7 @@ async function renderVendors(parts) {
     box.innerHTML = "";
     if (!list.length) { box.appendChild(el(`<p class="empty">No vendors yet.<br>Add your distributors and reps here.</p>`)); return; }
     box.appendChild(dataTable([
-      { key: "name", label: "Vendor", cls: "strong", fmt: (r) => `<a href="#/vendor/${r.id}" style="color:var(--red);text-decoration:none">${esc(r.name)}</a>` },
+      { key: "name", label: "Vendor", cls: "strong", fmt: (r) => `<a href="#/vendor/${r.id}" style="color:var(--accent);text-decoration:none">${esc(r.name)}</a>` },
       { key: "item_count", label: "Items", align: "right" },
       { key: "period_purchases", label: "This Period", align: "right", fmt: (r) => money(r.period_purchases) },
       { key: "last_period_purchases", label: "Last Period", align: "right", fmt: (r) => money(r.last_period_purchases) },
@@ -1298,7 +1317,7 @@ async function renderVendorDetail(parts) {
   $("#back-vendors").addEventListener("click", () => { location.hash = "#/vendors"; });
 
   function row(label, val) {
-    return `<div class="kv"><span>${label}</span><b style="font-family:var(--f-body);font-weight:600">${esc(val || "—")}</b></div>`;
+    return `<div class="kv"><span>${label}</span><b style="font-family:var(--f-ui);font-weight:600">${esc(val || "—")}</b></div>`;
   }
 }
 
@@ -1553,7 +1572,7 @@ async function renderAllProducts() {
       const list = await api("GET", "/api/products?" + qs.toString());
       box.innerHTML = "";
       box.appendChild(dataTable([
-        { key: "name", label: "Name", cls: "strong", fmt: (r) => `<a href="#/product/${r.id}" style="color:var(--red);text-decoration:none">${esc(r.name)}</a>` },
+        { key: "name", label: "Name", cls: "strong", fmt: (r) => `<a href="#/product/${r.id}" style="color:var(--accent);text-decoration:none">${esc(r.name)}</a>` },
         { key: "category_name", label: "Category", fmt: (r) => r.category_type ? typePill(r.category_type) + " " + esc(r.category_name || "") : "—" },
         { key: "report_by_unit", label: "Report By", fmt: (r) => esc(r.report_by_unit || r.unit || "—") },
         { key: "on_inventory", label: "On Inv", fmt: (r) => (r.on_inventory ? "Yes" : "No") },
