@@ -81,8 +81,12 @@ def _json_error(_e):
 def body():
     """request.json coerced to a dict. A syntactically valid but non-object body
     (a JSON array/string/number) would pass `or {}` and then AttributeError on
-    .get(); this returns {} for anything that isn't an object."""
+    .get(); this returns {} for anything that isn't an object. A body that is
+    present but UNPARSEABLE is a client error — reject it with 400 rather than
+    silently treating corrupt JSON as {} and creating an all-defaults row."""
     j = request.get_json(silent=True)
+    if j is None and request.data:
+        abort(400, description="Invalid JSON body.")
     return j if isinstance(j, dict) else {}
 
 
@@ -134,7 +138,10 @@ def _authed():
     sent = request.headers.get("Authorization", "")
     if sent.startswith("Bearer "):
         sent = sent[7:]
-    return hmac.compare_digest(sent, expected)
+    # Compare as bytes: Werkzeug decodes headers as latin-1, so a non-ASCII
+    # Authorization value would make compare_digest raise TypeError (-> 500)
+    # instead of returning a clean False. Bytes comparison tolerates any input.
+    return hmac.compare_digest(sent.encode("utf-8", "ignore"), expected.encode())
 
 
 @app.before_request
@@ -834,6 +841,8 @@ def category_create():
     ctype = _s(d.get("category_type"))
     if not name or not ctype:
         return jsonify({"error": "Category needs a name and a type."}), 400
+    if ctype not in reports.CATEGORY_TYPES:
+        return jsonify({"error": "Unknown category type."}), 400
     try:
         cur = db.get_db().execute(
             "INSERT INTO categories(name, category_type, sort_order) VALUES(?,?,?)",
@@ -848,6 +857,15 @@ def category_create():
 @app.put("/api/categories/<int:cid>")
 def category_update(cid):
     d = body()
+    # Guard the NOT NULL / taxonomy columns up front so a malformed value yields a
+    # precise 400 instead of falling through to the broad except below, which would
+    # mislabel a NOT NULL violation as "That category already exists."
+    if "name" in d and not _s(d["name"]):
+        return jsonify({"error": "Category needs a name."}), 400
+    if "category_type" in d:
+        ct = _s(d["category_type"])
+        if not ct or ct not in reports.CATEGORY_TYPES:
+            return jsonify({"error": "Unknown category type."}), 400
     sets, vals = [], []
     for key in ("name", "category_type", "sort_order", "archived"):
         if key in d:
@@ -1119,6 +1137,11 @@ def sales_mix_put():
     mix = body().get("mix") or {}
     if not isinstance(mix, dict):
         abort(400, description="mix must be an object of category_type -> percent.")
+    # Reject a non-numeric/non-finite percent rather than silently coercing it to
+    # 0 (which would slip past the 100% total guard and store a wrong 0% split).
+    for t in reports.CATEGORY_TYPES:
+        if t in mix and _f(mix[t]) is None:
+            abort(400, description=f"{t} percent must be a number.")
     # A mix that doesn't total ~100% would make Income (sales x mix%) not reconcile
     # to total sales and skew every per-type COGS%. Allow all-zero (clearing).
     total = round(sum(_f(mix[t], 0) or 0 for t in reports.CATEGORY_TYPES if t in mix), 2)
@@ -1550,6 +1573,25 @@ def _backup_loop(every_hours=6):
             print(f"  [!] Periodic backup failed: {e}")   # ...but don't fail silently
 
 
+def _start_backups():
+    """Take a startup snapshot and launch the periodic backup thread. Called at
+    IMPORT time (not just under `python app.py`) so the documented gunicorn deploy
+    — which imports `app:app` and never hits __main__ — still gets its safety-net
+    backups. Opt out in tests/tooling via LEDGER_DISABLE_BACKUPS."""
+    if os.environ.get("LEDGER_DISABLE_BACKUPS"):
+        return
+    try:
+        snap = db.backup()
+        if snap:
+            print(f"  Backed up to {os.path.relpath(snap, BASE_DIR)}")
+    except Exception as e:
+        print(f"  [!] Startup backup failed: {e}")
+    threading.Thread(target=_backup_loop, daemon=True).start()
+
+
+_start_backups()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8088"))
     host = os.environ.get("HOST", "0.0.0.0")
@@ -1568,15 +1610,7 @@ if __name__ == "__main__":
     debug = bool(os.environ.get("DEBUG")) and host in ("127.0.0.1", "localhost", "::1")
     if os.environ.get("DEBUG") and not debug:
         print("  [!] DEBUG ignored: refusing the interactive debugger on a non-loopback bind.")
-    # In debug Werkzeug's reloader runs this block in both parent and child; do
-    # the backup work only in the worker (or always, when the reloader is off).
-    if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-        try:
-            snap = db.backup()
-            if snap:
-                print(f"  Backed up to {os.path.relpath(snap, BASE_DIR)}")
-        except Exception as e:
-            print(f"  [!] Startup backup failed: {e}")
-        threading.Thread(target=_backup_loop, daemon=True).start()
+    # Startup snapshot + periodic backup thread already started at import time
+    # (see _start_backups), so they run under gunicorn too — nothing to do here.
     print(f"  Barkeep's Ledger running at http://{host}:{port}\n")
     app.run(host=host, port=port, debug=debug)

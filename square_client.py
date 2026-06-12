@@ -133,7 +133,10 @@ def list_locations():
 
 
 def _amt(m):
-    return (m or {}).get("amount", 0)
+    # isinstance guard, not `m or {}`: a malformed-but-200 Square body can put a
+    # list/string/number where a money object belongs; .get() on that would raise
+    # inside a try that only catches RequestException, breaking fail-soft.
+    return (m if isinstance(m, dict) else {}).get("amount", 0)
 
 
 def _net_sales_cents(o):
@@ -150,6 +153,8 @@ def _net_sales_cents(o):
     net_amounts at all (e.g. Square Invoice-sourced orders) fall back to the
     order-level total_* fields — never mix the two.
     """
+    if not isinstance(o, dict):   # orders:[null] or a non-object order in a 200 body
+        return 0
     na = o.get("net_amounts")
     if na:
         return (_amt(na.get("total_money")) - _amt(na.get("tax_money"))
@@ -201,7 +206,10 @@ def get_sales(start, end):
             if not cursor:
                 break
         return {"sales": round(total_cents / 100.0, 2), "orders": order_count, "error": None}
-    except requests.RequestException as e:
+    except (requests.RequestException, AttributeError, TypeError, KeyError, ValueError) as e:
+        # Fail soft on BOTH transport errors and a valid-JSON-but-wrong-shape 200
+        # body (Square contract drift) — the module's contract is zeros + error,
+        # never a 500 of the headline Sales number.
         return {"sales": 0.0, "orders": 0, "error": _err(e)}
 
 
@@ -252,7 +260,9 @@ def get_daily_sales(start, end):
             if not cursor:
                 break
         return {d: round(c / 100.0, 2) for d, c in by_day.items()}
-    except requests.RequestException:
+    except (requests.RequestException, AttributeError, TypeError, KeyError, ValueError):
+        # Both transport errors and a malformed-shape 200 fail soft to None so the
+        # cache layer serves what it has rather than zeroing real history.
         return None
 
 
@@ -295,7 +305,16 @@ def daily_sales_cached(start, end):
         # was already cached and not in `need` is left untouched, so a partial
         # fetch that omits a historical day can't zero it out.
         for ds in need:
-            val = round(fresh.get(ds, 0.0), 2)
+            if ds in fresh:
+                val = round(fresh[ds], 2)
+            elif ds in cached:
+                # Stale day already has a real cached value but this successful
+                # fetch omitted it. get_daily_sales omits zero-order days, so we
+                # can't tell a genuine $0 day from a truncated/empty page — keep
+                # the cached value rather than risk zeroing real revenue.
+                continue
+            else:
+                val = 0.0   # a brand-new day with no sales caches as 0
             dbc.execute(
                 "INSERT INTO daily_sales(square_location_id, date, net_sales, fetched_at) "
                 "VALUES(?,?,?, datetime('now')) "
@@ -396,7 +415,8 @@ def get_labor(start, end):
             "warning": warning,
             "error": None,
         }
-    except requests.RequestException as e:
+    except (requests.RequestException, AttributeError, TypeError, KeyError, ValueError) as e:
+        # Fail soft on transport errors AND a malformed-shape 200 (see get_sales).
         return {"labor": 0.0, "hours": 0.0, "shifts": 0, "unwaged_hours": 0.0,
                 "unwaged_shifts": 0, "warning": None, "error": _err(e)}
 

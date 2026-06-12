@@ -126,8 +126,11 @@ class Importer:
             vals = (name, cat_name, cid, r.get("Report By Unit", "").strip(),
                     (r.get("Accounting Code") or "").strip(), _yn(r.get("On Inventory")),
                     _yn(r.get("Tax Exempt")), _price(r.get("Latest Price")) or 0)
+            # name = ? COLLATE NOCASE (not lower(name)=lower(?)) so the per-store
+            # idx_inv_loc_name index is seekable — avoids an O(N^2) scan over a
+            # large re-import.
             existing = self.c.execute(
-                "SELECT id FROM inventory_items WHERE location_id IS ? AND lower(name)=lower(?)",
+                "SELECT id FROM inventory_items WHERE location_id IS ? AND name = ? COLLATE NOCASE",
                 (self.loc, name)).fetchone()
             if existing:
                 self.c.execute(

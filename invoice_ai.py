@@ -8,6 +8,7 @@ with a plain-text-JSON fallback for older SDKs.
 import base64
 import io
 import json
+import math
 import os
 
 from db import get_setting, TAXONOMY
@@ -169,9 +170,12 @@ def _num(v):
     if v is None or v == "":
         return None
     try:
-        return round(float(v), 2)
+        c = round(float(v), 2)
     except (TypeError, ValueError):
         return None
+    # Reject inf/nan so a model that emits Infinity/NaN can't leak a non-finite
+    # number into the parse-preview payload — mirrors money._finite and app._f.
+    return c if math.isfinite(c) else None
 
 
 def _normalize(data):
