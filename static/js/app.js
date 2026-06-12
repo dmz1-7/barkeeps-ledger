@@ -376,18 +376,19 @@ function dataTable(columns, rows, opts = {}) {
   }
   function draw() {
     const r = view_rows();
+    const acls = (c) => (c.align === "right" ? "r" : c.align === "center" ? "c" : "");
     const head = columns.map((c) => {
       const sortable = c.sortable !== false;
       const aria = sortKey === c.key ? ` aria-sort="${sortDir > 0 ? "ascending" : "descending"}"` : "";
       // keep the implicit columnheader role (no role="button") so aria-sort is announced
-      return `<th class="${c.align === "right" ? "r" : ""} ${sortable ? "sortable" : ""}"${sortable ? ' tabindex="0"' : ""}${aria} data-k="${esc(c.key)}">${esc(c.label)}${sortKey === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>`;
+      return `<th class="${acls(c)} ${sortable ? "sortable" : ""}"${sortable ? ' tabindex="0"' : ""}${aria} data-k="${esc(c.key)}">${esc(c.label)}${sortKey === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>`;
     }).join("");
     const body = r.length ? r.map((row) =>
       `<tr ${row._href ? `data-href="${esc(row._href)}" tabindex="0" role="link"` : ""}>` + columns.map((c) =>
-        `<td class="${c.align === "right" ? "r" : ""} ${c.cls || ""}" data-label="${esc(c.label)}">${c.fmt ? c.fmt(row) : esc(row[c.key] ?? "")}</td>`).join("") + `</tr>`).join("")
+        `<td class="${acls(c)} ${c.cls || ""}" data-label="${esc(c.label)}">${c.fmt ? c.fmt(row) : esc(row[c.key] ?? "")}</td>`).join("") + `</tr>`).join("")
       : `<tr><td class="dt-empty" colspan="${columns.length}">${esc(empty)}</td></tr>`;
     const foot = footer ? `<tfoot><tr>${columns.map((c) =>
-      `<td class="${c.align === "right" ? "r" : ""}" data-label="${esc(c.label)}">${footer[c.key] != null ? footer[c.key] : ""}</td>`).join("")}</tr></tfoot>` : "";
+      `<td class="${acls(c)}" data-label="${esc(c.label)}">${footer[c.key] != null ? footer[c.key] : ""}</td>`).join("")}</tr></tfoot>` : "";
     host.innerHTML = `<table class="dtable"><thead><tr>${head}</tr></thead><tbody>${body}</tbody>${foot}</table>`;
     host.querySelectorAll("th.sortable").forEach((th) => {
       const sort = () => {
@@ -1781,7 +1782,7 @@ async function recipeList() {
       { key: "menu_price", label: "Price", align: "right", fmt: (r) => money(r.menu_price) },
       { key: "cost_pct", label: "Cost %", align: "right", fmt: (r) => pct(r.cost_pct) },
       { key: "margin", label: "Margin", align: "right", fmt: (r) => (r.margin == null ? "—" : money(r.margin)) },
-      { key: "_flags", label: "", align: "center", fmt: flagFmt },
+      { key: "_flags", label: "", align: "center", fmt: flagFmt, sortable: false },
     ];
     const rows = list.map((r) => ({ ...r, _href: `#/recipes/${r.id}` }));
     body.appendChild(dataTable(columns, rows, { search: true, initialSort: { key: "cost_pct", dir: -1 } }));

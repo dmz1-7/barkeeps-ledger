@@ -297,8 +297,9 @@ input:focus, select:focus, textarea:focus {
   border: 1px solid transparent;
 }
 /* category-type + status pills: data labels, tuned for AA text contrast.
-   Rendered as a soft tint + readable colored text + hairline (restrained). */
-.pill.wine, .pill[class*="type-"], .pill[class*="st-"] {
+   Rendered as a soft tint + readable colored text + hairline (restrained). The
+   bare `.pill` is included so plain status pills (Settings) match, not gray. */
+.pill, .pill.wine, .pill[class*="type-"], .pill[class*="st-"] {
   background: var(--surface-2); color: var(--text); border-color: var(--border);
 }
 .pill.type-Food   { color: var(--ok); }
@@ -442,6 +443,7 @@ table.dtable { width: 100%; border-collapse: collapse; font-size: .88rem; }
 .dtable th.sortable { cursor: pointer; user-select: none; }
 .dtable td { padding: 7px 10px; border-top: 1px solid var(--border); vertical-align: top; }
 .dtable td.r, .dtable th.r { text-align: right; white-space: nowrap; }
+.dtable td.c, .dtable th.c { text-align: center; }
 .dtable td.strong { font-weight: 600; }
 .dtable tbody tr[data-href] { cursor: pointer; }
 .dtable tbody tr:hover { background: var(--surface-2); }

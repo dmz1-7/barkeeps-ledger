@@ -14,27 +14,36 @@ import money
 import square_client
 
 
-def pretax_factor(subtotal, total, line_sum):
+def pretax_factor(subtotal, total, line_sum, tax=None):
     """Deflation factor to put an invoice's line totals on the PRE-TAX basis.
 
     Vendors print line totals either tax-exclusive (sum to the subtotal) or
     tax-inclusive (sum to the grand total) — `_reconcile` accepts both. COGS must
     be pre-tax to match the tax-stripped net-sales denominator, so when an
     invoice's lines reconcile to the tax-INCLUSIVE total, deflate them by
-    subtotal/total. Returns 1.0 when already pre-tax or undeterminable."""
-    if not subtotal or not total or subtotal <= 0 or total <= 0 or subtotal >= total:
+    base/total. Returns 1.0 when already pre-tax or undeterminable.
+
+    `base` is the recorded subtotal; when that's missing (a tax+total-only
+    invoice, common from AI/manual entry) it's derived as total - tax, so such an
+    invoice still deflates instead of silently counting the tax in COGS — matching
+    _reconcile's tot - tax target."""
+    base = subtotal
+    if (not base or base <= 0) and total and tax and tax > 0:
+        base = total - tax
+    if not base or not total or base <= 0 or total <= 0 or base >= total:
         return 1.0
-    return subtotal / total if abs(line_sum - total) < abs(line_sum - subtotal) else 1.0
+    return base / total if abs(line_sum - total) < abs(line_sum - base) else 1.0
 
 
 def _pretax_line_rows(rows):
-    """Given rows carrying (iid, sub, tot, amt[, ctype]), yield (row, deflated_amt)
-    with each line put on the pre-tax basis per its invoice's convention."""
+    """Given rows carrying (iid, sub, tot, tax, amt[, ctype]), yield (row,
+    deflated_amt) with each line put on the pre-tax basis per its invoice's
+    convention."""
     line_sum = {}
     for r in rows:
         line_sum[r["iid"]] = line_sum.get(r["iid"], 0.0) + (r["amt"] or 0)
     for r in rows:
-        f = pretax_factor(r["sub"], r["tot"], line_sum[r["iid"]])
+        f = pretax_factor(r["sub"], r["tot"], line_sum[r["iid"]], r["tax"])
         yield r, (r["amt"] or 0) * f
 
 
@@ -48,7 +57,7 @@ def purchases(start, end):
     db = get_db()
     loc = active_location_id()
     rows = db.execute(
-        "SELECT inv.id AS iid, inv.subtotal AS sub, inv.total AS tot, "
+        "SELECT inv.id AS iid, inv.subtotal AS sub, inv.total AS tot, inv.tax AS tax, "
         "       COALESCE(c.category_type,'Uncategorized') AS ctype, ii.total AS amt "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN categories c ON c.id = ii.category_id "
@@ -74,7 +83,7 @@ def _purchase_total(loc, after_date, through_date):
     usage-COGS, where purchases span the bracketing-count interval (the opening
     count subsumes its own day's deliveries, so the lower bound is exclusive)."""
     rows = get_db().execute(
-        "SELECT inv.id AS iid, inv.subtotal AS sub, inv.total AS tot, ii.total AS amt "
+        "SELECT inv.id AS iid, inv.subtotal AS sub, inv.total AS tot, inv.tax AS tax, ii.total AS amt "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "WHERE inv.location_id IS ? AND inv.invoice_date > ? AND inv.invoice_date <= ?",
         (loc, after_date, through_date),
@@ -136,7 +145,11 @@ def summary(start, end):
     usage_cogs = None
     usage_period = None
     b_date = e_date = None
-    if begin and end_inv:
+    # Require POSITIVE bracket values: a forgotten/empty count is stored as $0, and
+    # a $0 closing bracket would make usage COGS = begin + purchases (overstated by
+    # the whole opening inventory), a $0 opening would understate or go negative.
+    # Fall back to purchases-based COGS rather than trust a degenerate count.
+    if begin and end_inv and begin["value"] > 0 and end_inv["value"] > 0:
         b_date = dt.date.fromisoformat(begin["taken_at"][:10])
         e_date = dt.date.fromisoformat(end_inv["taken_at"][:10])
         # The usage cost spans [b_date, e_date] but cogs_pct divides by sales over
