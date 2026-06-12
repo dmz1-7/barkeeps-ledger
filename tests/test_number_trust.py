@@ -33,6 +33,7 @@ import square_client            # noqa: E402
 import cogs                     # noqa: E402
 import money                    # noqa: E402
 import reports                  # noqa: E402
+import units                    # noqa: E402
 from db import get_db           # noqa: E402
 import app as app_module        # noqa: E402
 
@@ -1296,6 +1297,53 @@ class RecipeCosting(Base):
                          items=[{"product_id": pid, "qty": 5}])
         self.assertEqual(r["batch_cost"], 0.0)        # NULL unit_cost -> $0, no crash
 
+    def _sized_product(self, name, unit_cost, size_qty, size_unit, loc=1, unit="bottle"):
+        with flask_app.app_context():
+            d = get_db()
+            pid = d.execute(
+                "INSERT INTO inventory_items(location_id, name, unit, unit_cost, size_qty, size_unit) "
+                "VALUES(?,?,?,?,?,?)", (loc, name, unit, unit_cost, size_qty, size_unit)).lastrowid
+            d.commit()
+            return pid
+
+    def test_conversion_costs_a_fraction_of_the_purchase_unit(self):
+        gin = self._sized_product("Gin", 20.0, 750, "ml")   # $20 / 750ml bottle
+        r = self._create(name="G&T", menu_price=12.0, yield_qty=1,
+                         items=[{"product_id": gin, "qty": 1.5, "unit": "oz"}])
+        self.assertEqual(r["batch_cost"], 1.18)             # 20 * (44.36/750)
+        self.assertTrue(r["items"][0]["converted"])
+        self.assertEqual(r["unconverted_lines"], 0)
+
+    def test_incompatible_unit_falls_back_and_flags(self):
+        gin = self._sized_product("Gin", 20.0, 750, "ml")
+        r = self._create(name="Bad", menu_price=12.0, yield_qty=1,
+                         items=[{"product_id": gin, "qty": 2, "unit": "g"}])  # g can't -> ml
+        self.assertEqual(r["batch_cost"], 40.0)             # fallback 2 * $20
+        self.assertFalse(r["items"][0]["converted"])
+        self.assertEqual(r["unconverted_lines"], 1)
+
+    def test_whole_purchase_unit_costs_full_price(self):
+        gin = self._sized_product("Gin", 20.0, 750, "ml")
+        r = self._create(name="WholeBottle", menu_price=30, yield_qty=1,
+                         items=[{"product_id": gin, "qty": 750, "unit": "ml"}])
+        self.assertEqual(r["batch_cost"], 20.0)             # 750ml of a 750ml bottle = full price
+
+    def test_no_size_uses_raw_qty_fallback(self):
+        lime = self._product("Lime", 0.25)                  # no size set
+        r = self._create(name="Garnish", menu_price=1.0, yield_qty=1,
+                         items=[{"product_id": lime, "qty": 2, "unit": "each"}])
+        self.assertEqual(r["batch_cost"], 0.5)              # 2 * $0.25
+        self.assertEqual(r["unconverted_lines"], 1)
+
+    def test_product_stores_size_fields(self):
+        pid = self.client.post("/api/products", json={
+            "name": "Gin", "unit": "bottle", "unit_cost": 20, "size_qty": 750,
+            "size_unit": "ml"}).get_json()["id"]
+        with flask_app.app_context():
+            row = get_db().execute(
+                "SELECT size_qty, size_unit FROM inventory_items WHERE id=?", (pid,)).fetchone()
+        self.assertEqual((row["size_qty"], row["size_unit"]), (750.0, "ml"))
+
     def test_recipes_csv(self):
         p = self._product("Gin", 20.0)
         self._create(name="Martini", menu_price=12.0, yield_qty=1,
@@ -1306,6 +1354,53 @@ class RecipeCosting(Base):
         self.assertEqual(rows[0], ["Recipe", "Menu Price", "Yield", "Batch Cost",
                                    "Cost/Serving", "Cost %", "Margin"])
         self.assertEqual((rows[1][0], rows[1][3], rows[1][6]), ("Martini", "2.0", "10.0"))
+
+
+class UnitConvert(unittest.TestCase):
+    def test_volume(self):
+        self.assertAlmostEqual(units.convert(1, "l", "ml"), 1000.0)
+        self.assertAlmostEqual(units.convert(1, "oz", "ml"), 29.5735, places=3)
+        self.assertAlmostEqual(units.convert(1, "gal", "oz"), 128.0, places=1)
+
+    def test_weight_and_count(self):
+        self.assertAlmostEqual(units.convert(1, "kg", "g"), 1000.0)
+        self.assertAlmostEqual(units.convert(1, "lb", "g"), 453.592, places=2)
+        self.assertEqual(units.convert(3, "each", "ea"), 3.0)
+
+    def test_cross_dimension_and_unknown_return_none(self):
+        self.assertIsNone(units.convert(1, "oz", "g"))      # volume vs weight
+        self.assertIsNone(units.convert(1, "oz", "each"))   # volume vs count
+        self.assertIsNone(units.convert(1, "blarg", "ml"))  # unknown unit
+
+    def test_case_insensitive_and_aliases(self):
+        self.assertAlmostEqual(units.convert(1, "OZ", "mL"), 29.5735, places=3)
+        self.assertAlmostEqual(units.convert(1, "Liter", "ml"), 1000.0)
+        self.assertTrue(units.known("tbsp"))
+        self.assertFalse(units.known("nonsense"))
+
+
+class UnitTableParity(unittest.TestCase):
+    """The JS conversion tables (live recipe-cost preview) must match units.py
+    exactly, or the preview disagrees with the saved cost for some aliases."""
+
+    def _js_keys(self, varname):
+        import re
+        path = os.path.join(os.path.dirname(__file__), "..", "static", "js", "app.js")
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        m = re.search(r"const " + varname + r"\s*=\s*\{(.*?)\};", src)
+        self.assertIsNotNone(m, f"{varname} not found in app.js")
+        pairs = re.findall(r'(?:"([^"]+)"|([A-Za-z][\w ]*?))\s*:', m.group(1))
+        return {(a or b).strip() for a, b in pairs}
+
+    def test_volume_parity(self):
+        self.assertEqual(self._js_keys("_UNIT_VOL"), set(units._VOLUME))
+
+    def test_weight_parity(self):
+        self.assertEqual(self._js_keys("_UNIT_WT"), set(units._WEIGHT))
+
+    def test_count_parity(self):
+        self.assertEqual(self._js_keys("_UNIT_CT"), set(units._COUNT))
 
 
 if __name__ == "__main__":

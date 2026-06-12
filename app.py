@@ -767,7 +767,8 @@ def category_delete(cid):
 
 _PRODUCT_COLS = ("name", "category", "category_id", "unit", "report_by_unit",
                  "accounting_code", "on_inventory", "tax_exempt", "par_level",
-                 "last_count", "unit_cost", "vendor", "sort_order", "archived")
+                 "last_count", "unit_cost", "vendor", "sort_order", "archived",
+                 "size_qty", "size_unit")
 
 
 @app.get("/api/products")
@@ -1091,8 +1092,9 @@ def _save_recipe_items(database, rid, items):
         ).fetchone():
             pid = None
         database.execute(
-            "INSERT INTO recipe_items(recipe_id, product_id, qty, note) VALUES(?,?,?,?)",
-            (rid, pid, _f(it.get("qty"), 0) or 0, (it.get("note") or "").strip()),
+            "INSERT INTO recipe_items(recipe_id, product_id, qty, unit, note) VALUES(?,?,?,?,?)",
+            (rid, pid, _f(it.get("qty"), 0) or 0,
+             (it.get("unit") or "").strip(), (it.get("note") or "").strip()),
         )
 
 
