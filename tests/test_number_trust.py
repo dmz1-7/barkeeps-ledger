@@ -10,8 +10,10 @@ Pure stdlib unittest — no pytest needed:
 
     .venv/bin/python -m unittest discover -s tests
 """
+import csv
 import datetime as dt
 import glob
+import io
 import os
 import shutil
 import sqlite3
@@ -915,6 +917,84 @@ class PriceAlerts(Base):
 
     def test_threshold_exposed_in_config(self):
         self.assertEqual(self.client.get("/api/config").get_json()["price_alert_pct"], "10")
+
+
+class CsvExports(Base):
+    """Bookkeeping CSV exports: location-scoped, date-filtered, properly quoted,
+    and summed exactly."""
+
+    def _inv(self, loc, vendor, date, num, lines):
+        # lines: [(item, qty, unit, unit_cost, total, category_name)]
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute(
+                "INSERT INTO invoices(location_id, vendor, invoice_date, invoice_number, status) "
+                "VALUES(?,?,?,?, 'closed')", (loc, vendor, date, num)).lastrowid
+            for item, qty, unit, uc, total, cat in lines:
+                row = d.execute("SELECT id FROM categories WHERE name=?", (cat,)).fetchone()
+                d.execute("INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, category_id) "
+                          "VALUES(?,?,?,?,?,?,?)",
+                          (iid, item, qty, unit, uc, total, row["id"] if row else None))
+            d.commit()
+
+    def _csv(self, path, loc=1):
+        r = self.client.get(path, headers={"X-Location-Id": str(loc)})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/csv", r.headers["Content-Type"])
+        self.assertIn("attachment", r.headers["Content-Disposition"])
+        return list(csv.reader(io.StringIO(r.get_data(as_text=True))))
+
+    def test_purchases_csv_header_and_quoted_fields(self):
+        self._inv(1, "Acme, Inc.", "2026-06-05", "INV9",
+                  [("Gin", 2, "btl", 20.0, 40.0, "Beer Keg")])
+        rows = self._csv("/api/export/purchases.csv?start=2026-06-01&end=2026-06-30")
+        self.assertEqual(rows[0], ["Invoice Date", "Vendor", "Invoice #", "Status",
+                                   "Category Type", "Category", "Item", "Qty", "Unit",
+                                   "Unit Cost", "Total"])
+        body = rows[1]
+        self.assertEqual(body[1], "Acme, Inc.")      # comma stays one field (quoted)
+        self.assertEqual(body[4], "Beer")            # category_type
+        self.assertEqual(body[5], "Beer Keg")        # category
+        self.assertEqual(body[6], "Gin")
+        self.assertEqual(body[10], "40.0")
+
+    def test_purchases_csv_scoped_by_range_and_location(self):
+        self._inv(1, "InRange", "2026-06-05", "A", [("X", 1, "ea", 10.0, 10.0, "Wine")])
+        self._inv(1, "OutOfRange", "2026-05-05", "B", [("Y", 1, "ea", 5.0, 5.0, "Wine")])
+        self._inv(2, "OtherStore", "2026-06-06", "C", [("Z", 1, "ea", 9.0, 9.0, "Wine")])
+        rows = self._csv("/api/export/purchases.csv?start=2026-06-01&end=2026-06-30", loc=1)
+        vendors = [r[1] for r in rows[1:]]
+        self.assertIn("InRange", vendors)
+        self.assertNotIn("OutOfRange", vendors)      # before the range
+        self.assertNotIn("OtherStore", vendors)      # different store
+
+    def test_category_summary_sums_exactly_with_grand_total(self):
+        self._inv(1, "V", "2026-06-05", "A",
+                  [("a", 1, "ea", 0.1, 0.1, "Wine"), ("b", 1, "ea", 0.1, 0.1, "Wine"),
+                   ("c", 1, "ea", 0.1, 0.1, "Wine")])
+        rows = self._csv("/api/export/category-summary.csv?start=2026-06-01&end=2026-06-30")
+        self.assertEqual(rows[0], ["Category Type", "Category", "Total"])
+        wine = [r for r in rows if len(r) >= 2 and r[1] == "Wine"][0]
+        self.assertEqual(wine[2], "0.3")             # 0.1*3 summed exactly, not 0.30000000000000004
+        total = [r for r in rows if len(r) >= 2 and r[1] == "TOTAL"][0]
+        self.assertEqual(total[2], "0.3")
+
+    def test_empty_range_returns_header_only(self):
+        purch = self._csv("/api/export/purchases.csv?start=2030-01-01&end=2030-01-31")
+        self.assertEqual(len(purch), 1)              # header, no data rows
+        summary = self._csv("/api/export/category-summary.csv?start=2030-01-01&end=2030-01-31")
+        self.assertEqual(summary[0], ["Category Type", "Category", "Total"])
+        self.assertEqual(summary[-1], ["", "TOTAL", "0.0"])   # grand total of nothing
+
+    def test_export_requires_auth(self):
+        # The Base harness runs with auth OFF; turn it on and confirm a tokenless
+        # request to an export is rejected (these return raw business data).
+        os.environ["APP_PASSWORD"] = "secret"
+        try:
+            for path in ("/api/export/purchases.csv", "/api/export/category-summary.csv"):
+                self.assertEqual(self.client.get(path).status_code, 401)
+        finally:
+            os.environ["APP_PASSWORD"] = ""
 
 
 if __name__ == "__main__":

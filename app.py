@@ -24,11 +24,12 @@ except ImportError:
     pass
 
 from flask import (
-    Flask, g, jsonify, request, send_from_directory, abort,
+    Flask, g, jsonify, request, send_from_directory, abort, Response,
 )
 
 import db
 import cogs
+import exports
 import money
 import reports
 import square_client
@@ -1034,6 +1035,27 @@ def report_sales():
 def report_price_movers():
     start, end = cogs.parse_range(request.args.get("start"), request.args.get("end"))
     return jsonify(reports.price_movers(start, end))
+
+
+def _csv_response(text, filename):
+    return Response(
+        text, mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/export/purchases.csv")
+def export_purchases():
+    start, end = cogs.parse_range(request.args.get("start"), request.args.get("end"))
+    return _csv_response(exports.purchases_csv(start, end),
+                         f"purchases_{start}_{end}.csv")
+
+
+@app.get("/api/export/category-summary.csv")
+def export_category_summary():
+    start, end = cogs.parse_range(request.args.get("start"), request.args.get("end"))
+    return _csv_response(exports.category_summary_csv(start, end),
+                         f"category-summary_{start}_{end}.csv")
 
 
 @app.get("/api/alerts/price-increases")

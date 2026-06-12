@@ -75,6 +75,26 @@ async function api(method, path, body, isForm) {
   return data;
 }
 
+// Fetch a file with the same auth + active-store headers as api() (a plain
+// <a download> link would carry neither), then save it via a Blob URL.
+async function download(path, filename) {
+  const headers = {};
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (token) headers.Authorization = "Bearer " + token;
+  if (ACTIVE_LOC) headers["X-Location-Id"] = String(ACTIVE_LOC);
+  const res = await fetch(path, { headers });
+  if (res.status === 401) { localStorage.removeItem(TOKEN_KEY); showGate(); throw new Error("unauthorized"); }
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const url = URL.createObjectURL(await res.blob());
+  try {
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+  } finally {
+    URL.revokeObjectURL(url);   // always release, even if the click path throws
+  }
+}
+
 /* ---------- date helpers ---------- */
 const iso = (d) => d.toISOString().slice(0, 10);
 function weekStart(d = new Date()) { const x = new Date(d); const day = (x.getDay() + 6) % 7; x.setDate(x.getDate() - day); return x; }
@@ -1317,6 +1337,18 @@ async function renderCategoryReport() {
   const body = el(`<div id="cr-body"><div class="spinner"></div></div>`);
   const filter = dateFilterBar(load);
   v.appendChild(filter.bar);
+  const expBar = el(`<div class="btn-row">
+    <button class="btn btn-ghost btn-sm" id="exp-lines">&#x2B07; Line items (CSV)</button>
+    <button class="btn btn-ghost btn-sm" id="exp-sum">&#x2B07; Summary (CSV)</button>
+  </div>`);
+  v.appendChild(expBar);
+  const dl = (endpoint, prefix) => {
+    const { start, end } = filter.get();
+    download(`/api/export/${endpoint}?start=${start}&end=${end}`, `${prefix}_${start}_${end}.csv`)
+      .catch((e) => toast("Export failed: " + e.message));
+  };
+  expBar.querySelector("#exp-lines").addEventListener("click", () => dl("purchases.csv", "purchases"));
+  expBar.querySelector("#exp-sum").addEventListener("click", () => dl("category-summary.csv", "category-summary"));
   v.appendChild(body);
   async function load() {
     body.innerHTML = '<div class="spinner"></div>';
