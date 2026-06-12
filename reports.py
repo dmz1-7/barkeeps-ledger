@@ -273,6 +273,7 @@ def price_movers(start, end):
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN vendor_items vi ON vi.id = ii.vendor_item_id "
         "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ? "
+        "  AND ii.unit_cost > 0 "   # only positive unit costs are real prices; credit/return lines aren't
         "  AND TRIM(COALESCE(vi.vendor_item_name, ii.name, '')) <> '' "
         "ORDER BY inv.invoice_date DESC, ii.id DESC",   # newest first -> first price seen is latest
         (loc, start.isoformat(), end.isoformat()),
@@ -301,7 +302,7 @@ def price_movers(start, end):
         prior = db.execute(
             "SELECT x.unit_cost AS p FROM invoice_items x JOIN invoices xi ON xi.id=x.invoice_id "
             "LEFT JOIN vendor_items v ON v.id = x.vendor_item_id "
-            "WHERE xi.location_id IS ? AND xi.invoice_date < ? AND x.unit_cost IS NOT NULL "
+            "WHERE xi.location_id IS ? AND xi.invoice_date < ? AND x.unit_cost > 0 "
             f"  AND {pvkey} = ? AND {pnkey} = ? "
             "ORDER BY xi.invoice_date DESC, x.id DESC LIMIT 1",
             (loc, start.isoformat(), gv, gn),
@@ -350,7 +351,7 @@ def price_alerts(lookback_days=30, min_pct=10.0):
         "       inv.invoice_date AS d "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN vendor_items vi ON vi.id = ii.vendor_item_id "
-        "WHERE inv.location_id IS ? AND ii.unit_cost IS NOT NULL "
+        "WHERE inv.location_id IS ? AND ii.unit_cost > 0 "   # credit/return lines aren't price signals
         "  AND inv.invoice_date IS NOT NULL AND TRIM(inv.invoice_date) <> '' "
         "  AND TRIM(COALESCE(vi.vendor_item_name, ii.name, '')) <> '' "
         "ORDER BY inv.invoice_date DESC, ii.id DESC",   # newest first

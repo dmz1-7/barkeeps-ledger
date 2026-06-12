@@ -67,6 +67,9 @@ PROMPT = (
     "- List every line item you can read. If a field is illegible, use null.\n"
     "- Categorize EACH line item into exactly one category. Available categories "
     f"(grouped by type) — {_TAXONOMY_HINT}. Use 'Uncategorized' only if nothing fits.\n"
+    "- A credit memo, return, or refund REDUCES what is owed: enter its amounts as "
+    "NEGATIVE dollars (e.g. a $30 keg-deposit refund is total -30.00). Keep a "
+    "deposit CHARGED on this invoice positive.\n"
     "- Do not invent values you cannot see."
 )
 
