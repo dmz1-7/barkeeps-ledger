@@ -27,14 +27,16 @@ def _line_cost(qty, line_unit, unit_cost, size_qty, size_unit):
     """
     # Return the RAW (unrounded) cost so legitimately sub-cent pours aren't zeroed
     # per-line; the batch total is rounded to the penny once (see _summary).
-    if size_qty and size_qty > 0 and line_unit and size_unit:
-        used = units.convert(qty, line_unit, size_unit)
-        if used is not None:
-            return unit_cost * (used / size_qty), True
-        # Size present but the recipe unit is a different dimension (won't convert).
-        # Multiplying qty (recipe unit) by unit_cost (per PURCHASE unit) would inflate
-        # the line ~size_qty-fold, so contribute $0 and flag it (converted=False)
+    if size_qty and size_qty > 0 and size_unit:
+        # Product carries a size, so qty is expected in a convertible recipe unit.
+        # A missing line_unit (or a different-dimension one that won't convert) would
+        # otherwise be charged as whole PURCHASE units (qty * unit_cost), inflating
+        # the line ~size_qty-fold — so contribute $0 and flag it (converted=False)
         # rather than feed a wildly wrong cost into batch_cost/cost%/margin.
+        if line_unit:
+            used = units.convert(qty, line_unit, size_unit)
+            if used is not None:
+                return unit_cost * (used / size_qty), True
         return 0.0, False
     return qty * unit_cost, False
 
