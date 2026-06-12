@@ -128,7 +128,9 @@ def list_locations():
                 for l in locs
             ]
         }
-    except requests.RequestException as e:
+    except (requests.RequestException, AttributeError, TypeError, KeyError, ValueError) as e:
+        # Fail soft on a malformed-shape 200 too (matches get_sales/get_labor), so a
+        # non-object Square body can't 500 instead of returning the error envelope.
         return {"error": _err(e), "locations": []}
 
 

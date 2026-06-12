@@ -191,7 +191,6 @@ CREATE TABLE IF NOT EXISTS daily_sales (
     PRIMARY KEY (square_location_id, date)
 );
 
-CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date);
 CREATE INDEX IF NOT EXISTS idx_items_invoice ON invoice_items(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_countlines_count ON count_lines(count_id);
 CREATE INDEX IF NOT EXISTS idx_recipeitems_recipe ON recipe_items(recipe_id);
@@ -222,6 +221,10 @@ CREATE INDEX IF NOT EXISTS idx_inv_loc_name ON inventory_items(location_id, name
 -- so blank/NULL ids (stores not yet wired to Square) don't collide.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_locations_sqid ON locations(square_location_id)
     WHERE COALESCE(square_location_id, '') <> '';
+-- Drop the redundant date-only invoice index: every invoice query also scopes by
+-- location_id, so idx_invoices_loc_date (location_id, invoice_date) already covers
+-- it and the single-column index only added write cost.
+DROP INDEX IF EXISTS idx_invoices_date;
 """
 
 # The seeded two-level taxonomy: {Category Type: [Category, ...]}. Order within

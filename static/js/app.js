@@ -1003,7 +1003,7 @@ async function showOrderList() {
       </div>`));
       $("#exp-order").addEventListener("click", () =>
         download("/api/export/order-guide.csv", "order-guide.csv")
-          .catch((e) => toast("Export failed: " + e.message)));
+          .catch((e) => { if (e.message !== "unauthorized") toast("Export failed: " + e.message); }));
       // One card per vendor, so each is a ready-to-send order.
       g.vendors.forEach((vd) => {
         const card = el(`<div class="card"><div class="card-band">${esc(vd.vendor)}
@@ -1280,13 +1280,14 @@ async function renderVendors(parts) {
     box.innerHTML = "";
     if (!list.length) { box.appendChild(el(`<p class="empty">No vendors yet.<br>Add your distributors and reps here.</p>`)); return; }
     box.appendChild(dataTable([
-      { key: "name", label: "Vendor", cls: "strong", fmt: (r) => `<a href="#/vendor/${r.id}" style="color:var(--accent);text-decoration:none">${esc(r.name)}</a>` },
+      { key: "name", label: "Vendor", cls: "strong", fmt: (r) => esc(r.name) },
       { key: "item_count", label: "Items", align: "right" },
       { key: "period_purchases", label: "This Period", align: "right", fmt: (r) => money(r.period_purchases) },
       { key: "last_period_purchases", label: "Last Period", align: "right", fmt: (r) => money(r.last_period_purchases) },
       { key: "year_purchases", label: "This Year", align: "right", fmt: (r) => money(r.year_purchases) },
       { key: "last_order", label: "Last Invoice", align: "right", fmt: (r) => esc(r.last_order || "—") },
-    ], list, { search: true, initialSort: { key: "name", dir: 1 } }));
+    ], list.map((v) => ({ ...v, _href: `#/vendor/${v.id}` })),
+       { search: true, initialSort: { key: "name", dir: 1 } }));
   } catch (e) { $("#vlist").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
 }
 
@@ -1454,7 +1455,7 @@ async function renderCategoryReport() {
   const dl = (endpoint, prefix) => {
     const { start, end } = filter.get();
     download(`/api/export/${endpoint}?start=${start}&end=${end}`, `${prefix}_${start}_${end}.csv`)
-      .catch((e) => toast("Export failed: " + e.message));
+      .catch((e) => { if (e.message !== "unauthorized") toast("Export failed: " + e.message); });
   };
   expBar.querySelector("#exp-lines").addEventListener("click", () => dl("purchases.csv", "purchases"));
   expBar.querySelector("#exp-sum").addEventListener("click", () => dl("category-summary.csv", "category-summary"));
@@ -1620,13 +1621,14 @@ async function renderAllProducts() {
       const list = await api("GET", "/api/products?" + qs.toString());
       box.innerHTML = "";
       box.appendChild(dataTable([
-        { key: "name", label: "Name", cls: "strong", fmt: (r) => `<a href="#/product/${r.id}" style="color:var(--accent);text-decoration:none">${esc(r.name)}</a>` },
+        { key: "name", label: "Name", cls: "strong", fmt: (r) => esc(r.name) },
         { key: "category_name", label: "Category", fmt: (r) => r.category_type ? typePill(r.category_type) + " " + esc(r.category_name || "") : "—" },
         { key: "report_by_unit", label: "Report By", fmt: (r) => esc(r.report_by_unit || r.unit || "—") },
         { key: "on_inventory", label: "On Inv", fmt: (r) => (r.on_inventory ? "Yes" : "No") },
         { key: "tax_exempt", label: "Tax Exempt", fmt: (r) => (r.tax_exempt ? "Yes" : "No") },
         { key: "unit_cost", label: "Last $", align: "right", fmt: (r) => money(r.unit_cost) },
-      ], list, { search: true, empty: "No products match.", initialSort: { key: "name", dir: 1 } }));
+      ], list.map((p) => ({ ...p, _href: `#/product/${p.id}` })),
+         { search: true, empty: "No products match.", initialSort: { key: "name", dir: 1 } }));
     } catch (e) { box.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
   }
   load();
@@ -1755,7 +1757,7 @@ async function recipeList() {
   </div>`));
   $("#rec-new").addEventListener("click", () => { location.hash = "#/recipes/new"; });
   $("#rec-exp").addEventListener("click", () =>
-    download("/api/export/recipes.csv", "recipe-costing.csv").catch((e) => toast("Export failed: " + e.message)));
+    download("/api/export/recipes.csv", "recipe-costing.csv").catch((e) => { if (e.message !== "unauthorized") toast("Export failed: " + e.message); }));
   const body = el(`<div><div class="spinner"></div></div>`);
   v.appendChild(body);
   try {
@@ -1765,12 +1767,21 @@ async function recipeList() {
       body.appendChild(el(`<p class="empty">No recipes yet. Add one to cost a menu item.</p>`));
       return;
     }
+    const flagFmt = (r) => {
+      const n = (r.missing_products || 0) + (r.unconverted_lines || 0);
+      if (!n) return "";
+      const why = [r.missing_products ? `${r.missing_products} uncosted (no product)` : "",
+                   r.unconverted_lines ? `${r.unconverted_lines} unit not converted` : ""]
+        .filter(Boolean).join("; ");
+      return `<span title="${esc(why)} — cost may be understated" style="color:var(--warn)">&#9888;</span>`;
+    };
     const columns = [
       { key: "name", label: "Recipe", cls: "strong", fmt: (r) => esc(r.name) },
       { key: "cost_per_serving", label: "Cost", align: "right", fmt: (r) => money(r.cost_per_serving) },
       { key: "menu_price", label: "Price", align: "right", fmt: (r) => money(r.menu_price) },
       { key: "cost_pct", label: "Cost %", align: "right", fmt: (r) => pct(r.cost_pct) },
       { key: "margin", label: "Margin", align: "right", fmt: (r) => (r.margin == null ? "—" : money(r.margin)) },
+      { key: "_flags", label: "", align: "center", fmt: flagFmt },
     ];
     const rows = list.map((r) => ({ ...r, _href: `#/recipes/${r.id}` }));
     body.appendChild(dataTable(columns, rows, { search: true, initialSort: { key: "cost_pct", dir: -1 } }));
@@ -1815,16 +1826,20 @@ async function recipeEditor(id) {
     return fl % 2 === 0 ? fl : fl + 1;
   };
   // Mirror recipes._line_cost: convert qty into the product's size unit and take
-  // the fraction of a purchase unit, else fall back to qty * unit_cost.
-  const lineCents = (pid, qty, unit) => {
-    const p = prodById(pid);
-    if (!p) return 0;
+  // the fraction of a purchase unit, else fall back to qty * unit_cost. Returns
+  // RAW (unrounded) dollars + the same flags the backend computes; the batch is
+  // rounded ONCE in recalc so sub-cent pours aren't zeroed per line.
+  const lineInfo = (pid, qty, unit) => {
+    if (!pid && !qty) return null;                     // empty starter row, ignore
+    const p = pid ? prodById(pid) : null;
+    if (!p) return { dollars: 0, missing: true, unconverted: false };
     const uc = p.unit_cost || 0;
     if (p.size_qty > 0 && unit && p.size_unit) {
       const used = convertUnit(qty, unit, p.size_unit);
-      if (used !== null) return bankers(uc * (used / p.size_qty) * 100);
+      if (used !== null) return { dollars: uc * (used / p.size_qty), missing: false, unconverted: false };
+      return { dollars: qty * uc, missing: false, unconverted: !!qty };   // size set but unit didn't convert
     }
-    return bankers(qty * uc * 100);
+    return { dollars: qty * uc, missing: false, unconverted: false };     // no size: raw qty is correct
   };
 
   const addRow = (it) => {
@@ -1848,21 +1863,31 @@ async function recipeEditor(id) {
 
   const preview = el(`<div class="note" id="r-preview"></div>`);
   v.appendChild(preview);
-  // Mirror the backend: cost each line in cents, sum, divide by yield.
+  // Mirror the backend: sum RAW per-line dollars, round the batch to cents ONCE,
+  // then divide by yield — so the live preview equals the saved cost to the penny.
   function recalc() {
-    let cents = 0;
+    let dollars = 0, missing = 0, unconverted = 0;
     linesEl.querySelectorAll(".rrow").forEach((row) => {
       const pid = row.querySelector(".ri-prod").value;
       const qty = Number(row.querySelector(".ri-qty").value) || 0;
-      const unit = row.querySelector(".ri-unit").value;
-      cents += lineCents(pid, qty, unit);
+      const info = lineInfo(pid, qty, row.querySelector(".ri-unit").value);
+      if (!info) return;
+      dollars += info.dollars;
+      if (info.missing) missing++;
+      else if (info.unconverted) unconverted++;
     });
+    const cents = bankers(dollars * 100);
     const batch = cents / 100;
     const yld = Number($("#r-yield").value) > 0 ? Number($("#r-yield").value) : 1;
     const per = bankers(cents / yld) / 100;
     const price = Number($("#r-price").value) || 0;
-    preview.innerHTML = `Batch ${money(batch)} &middot; per serving <b>${money(per)}</b>` +
+    let html = `Batch ${money(batch)} &middot; per serving <b>${money(per)}</b>` +
       (price ? ` &middot; cost ${pct((per / price) * 100)} &middot; margin ${money(price - per)}` : "");
+    const warns = [];
+    if (missing) warns.push(`${missing} line(s) have no linked product (costed $0)`);
+    if (unconverted) warns.push(`${unconverted} line(s) couldn't convert the unit — verify the cost`);
+    if (warns.length) html += `<div style="color:var(--warn);margin-top:.3rem">&#9888; ${warns.join(" &middot; ")} — cost may be off</div>`;
+    preview.innerHTML = html;
   }
   $("#r-price").addEventListener("input", recalc);
   $("#r-yield").addEventListener("input", recalc);
