@@ -422,3 +422,54 @@ def price_alerts(lookback_days=30, min_pct=10.0):
         "count": len(alerts),
         "alerts": alerts,
     }
+
+
+# --- Order guide ------------------------------------------------------------
+
+def order_guide():
+    """Products strictly below par for the active store, GROUPED BY VENDOR with a
+    suggested order quantity (par - on hand) and line cost — so the owner places
+    one order per distributor instead of reading a flat list. Vendors keep their
+    first-seen order (the query sorts by vendor, then name); a blank vendor is
+    bucketed as 'Unassigned'. Subtotals/total are summed exactly via money."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT name, COALESCE(NULLIF(TRIM(vendor), ''), 'Unassigned') AS vendor, "
+        "       unit, par_level, last_count, unit_cost "
+        "FROM inventory_items "
+        "WHERE archived = 0 AND location_id IS ? AND par_level > 0 "
+        "  AND COALESCE(last_count, 0) < par_level "   # par set but never counted -> still order
+        "ORDER BY vendor COLLATE NOCASE, name COLLATE NOCASE",
+        (active_location_id(),),
+    ).fetchall()
+
+    groups = {}
+    ordered = []
+    for r in rows:
+        need = _r((r["par_level"] or 0) - (r["last_count"] or 0))
+        if need <= 0:
+            continue
+        item = {
+            "name": r["name"], "unit": r["unit"],
+            "par": _r(r["par_level"]), "on_hand": _r(r["last_count"]),
+            "order_qty": need, "unit_cost": _r(r["unit_cost"]),
+            "line_cost": money.normalize(need * (r["unit_cost"] or 0)) or 0.0,
+        }
+        # Group case-insensitively (the rest of the app keys vendors on
+        # lower(name)), keeping the first-seen casing for display, so one
+        # distributor never splits into two order sheets.
+        key = (r["vendor"] or "").casefold()
+        g = groups.get(key)
+        if g is None:
+            groups[key] = g = {"vendor": r["vendor"], "items": [], "subtotal": 0.0}
+            ordered.append(g)
+        g["items"].append(item)
+
+    for g in ordered:
+        g["subtotal"] = money.sum_dollars(i["line_cost"] for i in g["items"])
+    return {
+        "vendors": ordered,
+        "item_count": sum(len(g["items"]) for g in ordered),
+        "grand_total": money.sum_dollars(
+            i["line_cost"] for g in ordered for i in g["items"]),
+    }

@@ -897,20 +897,31 @@ async function openItemEditor(it) {
 async function showOrderList() {
   loading();
   try {
-    const items = await api("GET", "/api/inventory/order-list");
+    const g = await api("GET", "/api/inventory/order-guide");
     const v = view();
-    v.innerHTML = `<h2 class="section section-head">Order List</h2>`;
-    if (!items.length) { v.appendChild(el(`<p class="empty">Everything&rsquo;s at or above par. Nothing to order.</p>`)); }
-    else {
-      let total = 0;
-      const card = el(`<div class="card"><div class="card-band">Below Par <span id="ord-total"></span></div><div class="card-body" id="ord"></div></div>`);
-      const ord = card.querySelector("#ord");
-      items.forEach((it) => {
-        total += it.order_cost;
-        ord.appendChild(el(`<div class="kv"><span>${esc(it.name)} <span class="muted">need ${fmtQty(it.order_qty)} ${esc(it.unit || "")}</span></span><b>${money(it.order_cost)}</b></div>`));
+    v.innerHTML = `<h2 class="section section-head">Order Guide</h2>`;
+    if (!g.item_count) {
+      v.appendChild(el(`<p class="empty">Everything&rsquo;s at or above par. Nothing to order.</p>`));
+    } else {
+      v.appendChild(el(`<div class="btn-row">
+        <button class="btn btn-ghost btn-sm" id="exp-order">&#x2B07; Order Guide (CSV)</button>
+      </div>`));
+      $("#exp-order").addEventListener("click", () =>
+        download("/api/export/order-guide.csv", "order-guide.csv")
+          .catch((e) => toast("Export failed: " + e.message)));
+      // One card per vendor, so each is a ready-to-send order.
+      g.vendors.forEach((vd) => {
+        const card = el(`<div class="card"><div class="card-band">${esc(vd.vendor)}
+          <span>${money(vd.subtotal)}</span></div><div class="card-body" id="ord"></div></div>`);
+        const ord = card.querySelector("#ord");
+        vd.items.forEach((it) => ord.appendChild(el(
+          `<div class="kv"><span>${esc(it.name)} <span class="muted">need ${fmtQty(it.order_qty)} ${esc(it.unit || "")}
+            &middot; on hand ${fmtQty(it.on_hand)}/${fmtQty(it.par)}</span></span>
+            <b>${money(it.line_cost)}</b></div>`)));
+        v.appendChild(card);
       });
-      card.querySelector("#ord-total").textContent = money(total);
-      v.appendChild(card);
+      v.appendChild(el(`<div class="kv total-row" style="margin-top:.4rem"><span><b>Total</b></span>
+        <b>${money(g.grand_total)}</b></div>`));
     }
     v.appendChild(el(`<button class="btn btn-ghost btn-block" id="back" style="margin-top:.6rem">Back to Stock</button>`));
     $("#back").addEventListener("click", () => { location.hash = "#/inventory"; });

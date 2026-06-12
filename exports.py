@@ -9,6 +9,7 @@ import csv
 import io
 
 import money
+import reports
 from db import get_db, active_location_id
 
 
@@ -65,3 +66,20 @@ def category_summary_csv(start, end):
             money.normalize(r["amt"]) or 0) for r in rows]
     out.append(("", "TOTAL", money.sum_dollars(r["amt"] for r in rows)))
     return _csv(["Category Type", "Category", "Total"], out)
+
+
+def order_guide_csv():
+    """The vendor-grouped order guide flattened to CSV: each item, a SUBTOTAL row
+    per vendor, and a final TOTAL — a ready-to-send order sheet per distributor."""
+    guide = reports.order_guide()
+    out = []
+    for v in guide["vendors"]:
+        for it in v["items"]:
+            out.append((v["vendor"], it["name"], it["unit"], it["par"],
+                        it["on_hand"], it["order_qty"], it["unit_cost"], it["line_cost"]))
+        out.append((v["vendor"], "SUBTOTAL", "", "", "", "", "", v["subtotal"]))
+    out.append(("TOTAL", "", "", "", "", "", "", guide["grand_total"]))
+    return _csv(
+        ["Vendor", "Item", "Unit", "Par", "On Hand", "Order Qty", "Unit Cost", "Line Cost"],
+        out,
+    )

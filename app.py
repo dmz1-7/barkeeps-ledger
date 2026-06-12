@@ -524,6 +524,12 @@ def order_list():
     return jsonify(out)
 
 
+@app.get("/api/inventory/order-guide")
+def order_guide():
+    """Below-par products grouped by vendor (one order per distributor)."""
+    return jsonify(reports.order_guide())
+
+
 @app.post("/api/counts")
 def count_save():
     """Record a walk-around count. lines: [{item_id, qty}]. Updates last_count
@@ -1056,6 +1062,11 @@ def export_category_summary():
     start, end = cogs.parse_range(request.args.get("start"), request.args.get("end"))
     return _csv_response(exports.category_summary_csv(start, end),
                          f"category-summary_{start}_{end}.csv")
+
+
+@app.get("/api/export/order-guide.csv")
+def export_order_guide():
+    return _csv_response(exports.order_guide_csv(), "order-guide.csv")
 
 
 @app.get("/api/alerts/price-increases")

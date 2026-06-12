@@ -991,10 +991,95 @@ class CsvExports(Base):
         # request to an export is rejected (these return raw business data).
         os.environ["APP_PASSWORD"] = "secret"
         try:
-            for path in ("/api/export/purchases.csv", "/api/export/category-summary.csv"):
+            for path in ("/api/export/purchases.csv", "/api/export/category-summary.csv",
+                         "/api/export/order-guide.csv"):
                 self.assertEqual(self.client.get(path).status_code, 401)
         finally:
             os.environ["APP_PASSWORD"] = ""
+
+
+class OrderGuide(Base):
+    """Below-par products grouped by vendor, with suggested order qty (to par)
+    and exact per-vendor subtotals — one order sheet per distributor."""
+
+    def _item(self, loc, name, vendor, par, on_hand, unit_cost, unit="ea"):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute(
+                "INSERT INTO inventory_items(location_id, name, vendor, unit, par_level, "
+                "last_count, unit_cost) VALUES(?,?,?,?,?,?,?)",
+                (loc, name, vendor, unit, par, on_hand, unit_cost))
+            d.commit()
+
+    def _guide(self):
+        with flask_app.app_context():
+            return reports.order_guide()
+
+    def test_groups_below_par_by_vendor_with_exact_totals(self):
+        self._item(1, "Gin", "Acme", 10, 3, 20.0)     # need 7  -> $140
+        self._item(1, "Rum", "Acme", 5, 5, 15.0)      # at par  -> excluded
+        self._item(1, "Wine", "Beta", 4, 1, 12.5)     # need 3  -> $37.50
+        g = self._guide()
+        self.assertEqual(g["item_count"], 2)
+        vendors = {v["vendor"]: v for v in g["vendors"]}
+        self.assertEqual(set(vendors), {"Acme", "Beta"})
+        gin = vendors["Acme"]["items"][0]
+        self.assertEqual((gin["order_qty"], gin["line_cost"]), (7.0, 140.0))
+        self.assertEqual(vendors["Acme"]["subtotal"], 140.0)
+        self.assertEqual(vendors["Beta"]["subtotal"], 37.5)
+        self.assertEqual(g["grand_total"], 177.5)
+
+    def test_zero_par_and_at_par_excluded(self):
+        self._item(1, "Soda", "Acme", 0, 0, 1.0)      # no par set
+        self._item(1, "Tonic", "Acme", 6, 6, 1.0)     # exactly at par
+        self.assertEqual(self._guide()["item_count"], 0)
+
+    def test_blank_vendor_bucketed_unassigned(self):
+        self._item(1, "Mystery", "", 3, 0, 2.0)
+        self.assertEqual(self._guide()["vendors"][0]["vendor"], "Unassigned")
+
+    def test_case_variant_vendors_group_together(self):
+        # The app keys vendors case-insensitively everywhere; one distributor
+        # must not split into two order sheets over casing.
+        self._item(1, "Gin", "Acme", 5, 0, 10.0)
+        self._item(1, "Vodka", "acme", 5, 0, 8.0)
+        g = self._guide()
+        self.assertEqual(len(g["vendors"]), 1)
+        self.assertEqual(len(g["vendors"][0]["items"]), 2)
+        self.assertEqual(g["vendors"][0]["subtotal"], 90.0)   # 5*10 + 5*8
+
+    def test_par_set_but_never_counted_is_ordered(self):
+        # last_count NULL (par set, no count yet) -> still needs ordering.
+        with flask_app.app_context():
+            get_db().execute(
+                "INSERT INTO inventory_items(location_id, name, vendor, par_level, last_count, "
+                "unit_cost) VALUES(1, 'NewSku', 'Acme', 4, NULL, 5.0)")
+            get_db().commit()
+        g = self._guide()
+        self.assertEqual(g["item_count"], 1)
+        self.assertEqual(g["vendors"][0]["items"][0]["order_qty"], 4.0)
+
+    def test_endpoint_scoped_by_location_header(self):
+        self._item(1, "DC-only", "Acme", 5, 0, 1.0)
+        self._item(2, "NYC-only", "Acme", 5, 0, 1.0)
+        g1 = self.client.get("/api/inventory/order-guide", headers={"X-Location-Id": "1"}).get_json()
+        g2 = self.client.get("/api/inventory/order-guide", headers={"X-Location-Id": "2"}).get_json()
+        self.assertEqual([i["name"] for v in g1["vendors"] for i in v["items"]], ["DC-only"])
+        self.assertEqual([i["name"] for v in g2["vendors"] for i in v["items"]], ["NYC-only"])
+
+    def test_csv_has_item_subtotal_and_total_rows(self):
+        self._item(1, "Gin", "Acme", 10, 3, 20.0)     # 7 * $20 = $140
+        r = self.client.get("/api/export/order-guide.csv", headers={"X-Location-Id": "1"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/csv", r.headers["Content-Type"])
+        rows = list(csv.reader(io.StringIO(r.get_data(as_text=True))))
+        self.assertEqual(rows[0], ["Vendor", "Item", "Unit", "Par", "On Hand",
+                                   "Order Qty", "Unit Cost", "Line Cost"])
+        self.assertEqual((rows[1][1], rows[1][7]), ("Gin", "140.0"))
+        sub = [x for x in rows if len(x) > 1 and x[1] == "SUBTOTAL"][0]
+        self.assertEqual(sub[7], "140.0")
+        total = [x for x in rows if x[0] == "TOTAL"][0]
+        self.assertEqual(total[7], "140.0")
 
 
 if __name__ == "__main__":
