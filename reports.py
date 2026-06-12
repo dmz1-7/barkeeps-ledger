@@ -178,6 +178,9 @@ def controllable_pl(start, end):
         "square_configured": square_client.is_configured(),
         "sales_error": sales_info.get("error"),
         "labor_error": labor_info.get("error"),
+        "labor_warning": labor_info.get("warning"),
+        "unwaged_hours": labor_info.get("unwaged_hours", 0),
+        "unwaged_shifts": labor_info.get("unwaged_shifts", 0),
     }
 
 
@@ -188,7 +191,7 @@ def _week_start(d):
 
 
 def sales_report(today=None):
-    today = today or dt.date.today()
+    today = today or square_client.business_today()
     configured = square_client.is_configured()
     this_mon = _week_start(today)
     last_mon = this_mon - dt.timedelta(days=7)

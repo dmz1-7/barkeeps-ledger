@@ -589,5 +589,122 @@ class LocationHeader(Base):
         self.assertEqual(r1, "LNKNR2A7MBB4K")     # other store untouched (no global mirror)
 
 
+class TippedLaborWage(Base):
+    """Shifts Square records with no wage (typical for tipped staff) must not
+    silently count as $0 labor: they're billed at default_hourly_wage when set
+    and always reported back as unwaged so Labor% stays trustworthy."""
+
+    def _shift(self, hours, amount_cents=None):
+        start = dt.datetime(2026, 6, 1, 18, 0, 0, tzinfo=dt.timezone.utc)
+        end = start + dt.timedelta(hours=hours)
+        s = {"start_at": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "end_at": end.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        if amount_cents is not None:
+            s["wage"] = {"hourly_rate": {"amount": amount_cents, "currency": "USD"}}
+        return s
+
+    def test_recorded_wage_priced_and_not_unwaged(self):
+        cost, hours, unwaged = square_client._shift_cost(self._shift(4, 1500), 0.0)
+        self.assertEqual((cost, hours, unwaged), (60.0, 4.0, 0.0))
+
+    def test_missing_wage_no_fallback_is_unwaged(self):
+        cost, hours, unwaged = square_client._shift_cost(self._shift(5), 0.0)
+        self.assertEqual((cost, hours, unwaged), (0.0, 5.0, 5.0))
+
+    def test_missing_wage_uses_fallback(self):
+        cost, hours, unwaged = square_client._shift_cost(self._shift(5), 12.0)
+        self.assertEqual((cost, hours, unwaged), (60.0, 5.0, 5.0))
+
+    def test_zero_amount_treated_as_unwaged(self):
+        cost, hours, unwaged = square_client._shift_cost(self._shift(3, 0), 10.0)
+        self.assertEqual((cost, hours, unwaged), (30.0, 3.0, 3.0))
+
+    def test_default_wage_setting_read(self):
+        with flask_app.app_context():
+            db.set_setting("default_hourly_wage", "15.50")
+            self.assertEqual(square_client._default_wage(), 15.5)
+            db.set_setting("default_hourly_wage", "")        # blank => off
+            self.assertEqual(square_client._default_wage(), 0.0)
+            db.set_setting("default_hourly_wage", "junk")    # unparseable => off
+            self.assertEqual(square_client._default_wage(), 0.0)
+
+    def test_default_wage_exposed_in_settings_api(self):
+        with flask_app.app_context():
+            db.set_setting("default_hourly_wage", "13")
+        cfg = self.client.get("/api/config").get_json()
+        self.assertEqual(cfg["default_hourly_wage"], "13")
+        self.client.post("/api/settings", json={"default_hourly_wage": "14.25"})
+        with flask_app.app_context():
+            self.assertEqual(db.get_setting("default_hourly_wage"), "14.25")
+
+    def _run_get_labor(self, shifts):
+        """get_labor over a stubbed Square response (DC store is seeded with a
+        square_location_id; setting a token makes is_configured() true)."""
+        from unittest import mock
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return {"shifts": shifts, "cursor": None}
+
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post",
+                                   return_value=FakeResp()):
+                return square_client.get_labor(dt.date(2026, 6, 1), dt.date(2026, 6, 1))
+
+    def test_get_labor_no_fallback_warns_and_understates_visibly(self):
+        info = self._run_get_labor([self._shift(4, 1500), self._shift(5)])
+        self.assertEqual(info["labor"], 60.0)           # only the waged shift priced
+        self.assertEqual(info["hours"], 9.0)
+        self.assertEqual(info["unwaged_hours"], 5.0)
+        self.assertEqual(info["unwaged_shifts"], 1)
+        self.assertIn("$0 labor", info["warning"])
+
+    def test_get_labor_fallback_prices_unwaged_and_still_discloses(self):
+        with flask_app.app_context():
+            db.set_setting("default_hourly_wage", "10")
+        info = self._run_get_labor([self._shift(4, 1500), self._shift(5)])
+        self.assertEqual(info["labor"], 110.0)          # 60 waged + 5h * $10 fallback
+        self.assertEqual(info["unwaged_shifts"], 1)
+        self.assertIn("estimated", info["warning"])
+
+    def test_get_labor_all_waged_has_no_warning(self):
+        info = self._run_get_labor([self._shift(4, 1500)])
+        self.assertEqual(info["unwaged_shifts"], 0)
+        self.assertIsNone(info["warning"])
+
+    def test_summary_payload_carries_labor_warning_keys(self):
+        with flask_app.app_context():
+            self.assertIn("labor_warning", cogs.summary(dt.date(2026, 6, 1),
+                                                        dt.date(2026, 6, 1)))
+            r = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 1))
+            self.assertIn("labor_warning", r)
+            self.assertIn("unwaged_hours", r)
+
+
+class BusinessToday(Base):
+    """Default date ranges resolve via the business day in the configured tz, so
+    they line up with how sales/labor are bucketed regardless of server tz."""
+
+    def test_after_midnight_before_5am_is_prior_day(self):
+        # 2026-06-12 03:00 America/New_York == 07:00 UTC; still 06-11's bar night.
+        now = dt.datetime(2026, 6, 12, 7, 0, tzinfo=dt.timezone.utc)
+        with flask_app.app_context():
+            self.assertEqual(square_client.business_today(now), dt.date(2026, 6, 11))
+
+    def test_after_5am_is_same_day(self):
+        # 2026-06-12 06:00 ET == 10:00 UTC; the new business day has rolled over.
+        now = dt.datetime(2026, 6, 12, 10, 0, tzinfo=dt.timezone.utc)
+        with flask_app.app_context():
+            self.assertEqual(square_client.business_today(now), dt.date(2026, 6, 12))
+
+    def test_independent_of_server_local_date(self):
+        # 23:30 ET on 06-12 is 03:30 UTC on 06-13: a UTC server's date.today()
+        # would say 06-13, but the bar night is still 06-12.
+        now = dt.datetime(2026, 6, 13, 3, 30, tzinfo=dt.timezone.utc)
+        with flask_app.app_context():
+            self.assertEqual(square_client.business_today(now), dt.date(2026, 6, 12))
+
+
 if __name__ == "__main__":
     unittest.main()

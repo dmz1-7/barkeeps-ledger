@@ -384,6 +384,9 @@ async function loadDash() {
   } else if (d.sales_error || d.labor_error) {
     body.appendChild(el(`<div class="note">Square says: ${esc(d.sales_error || d.labor_error)}</div>`));
   }
+  if (d.labor_warning) {
+    body.appendChild(el(`<div class="note">${esc(d.labor_warning)}</div>`));
+  }
 
   body.appendChild(el(`
     <div class="stat-grid">
@@ -957,6 +960,8 @@ async function renderSettings() {
         <label class="fld"><span>Target COGS %</span><input type="number" id="s-cogs" value="${esc(cfg.target_cogs_pct)}"></label>
         <label class="fld"><span>Target Labor %</span><input type="number" id="s-labor" value="${esc(cfg.target_labor_pct)}"></label>
       </div>
+      <label class="fld"><span>Default Hourly Wage $</span><input type="number" step="0.01" id="s-wage" value="${esc(cfg.default_hourly_wage)}"></label>
+      <p class="muted" style="font-size:.82rem;margin:.3rem 0 0">Applied to Square shifts with no wage recorded (e.g. tipped staff) so Labor% isn&rsquo;t understated. 0 leaves them at $0.</p>
     </div></div>
 
     <div class="card"><div class="card-band">Sales Mix &middot; per period</div><div class="card-body">
@@ -1058,6 +1063,7 @@ async function renderSettings() {
   $("#save-settings").addEventListener("click", async () => {
     const payload = {
       target_cogs_pct: $("#s-cogs").value, target_labor_pct: $("#s-labor").value,
+      default_hourly_wage: $("#s-wage").value,
       square_env: $("#s-env").value, square_version: $("#s-ver").value,
       square_location_id: $("#s-loc").value, ai_model: $("#s-model").value,
     };

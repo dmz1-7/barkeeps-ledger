@@ -206,6 +206,7 @@ def config():
         "ai_key_present": bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()),
         "target_cogs_pct": s.get("target_cogs_pct", "30"),
         "target_labor_pct": s.get("target_labor_pct", "25"),
+        "default_hourly_wage": s.get("default_hourly_wage", "0"),
     })
 
 
@@ -213,7 +214,7 @@ def config():
 def save_settings():
     data = request.json or {}
     for key in ("square_env", "square_version", "ai_model",
-                "target_cogs_pct", "target_labor_pct"):
+                "target_cogs_pct", "target_labor_pct", "default_hourly_wage"):
         if key in data:
             db.set_setting(key, data[key])
     # The Square location is per-store now: write it onto the active store's row,
@@ -572,7 +573,7 @@ def count_list():
 
 def _period_bounds(today=None):
     import datetime as _dt
-    today = today or _dt.date.today()
+    today = today or square_client.business_today()
     month_start = today.replace(day=1)
     last_month_end = month_start - _dt.timedelta(days=1)
     last_month_start = last_month_end.replace(day=1)
