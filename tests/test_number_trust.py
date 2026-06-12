@@ -1082,5 +1082,92 @@ class OrderGuide(Base):
         self.assertEqual(total[7], "140.0")
 
 
+class CreditsAndReturns(Base):
+    """Vendor credits / returns are negative invoices/lines. They must NET in
+    spend reports but must NOT pollute price intelligence (a return's negative
+    unit cost isn't a real price)."""
+
+    def _d(self, days_ago):
+        with flask_app.app_context():
+            return (square_client.business_today() - dt.timedelta(days=days_ago)).isoformat()
+
+    def _inv(self, vendor, date, lines, loc=1):
+        # lines: [(name, unit_cost, qty, total, [category_name])]
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute(
+                "INSERT INTO invoices(location_id, vendor, invoice_date, total, status) "
+                "VALUES(?,?,?,?, 'closed')",
+                (loc, vendor, date, sum(ln[3] for ln in lines))).lastrowid
+            for name, uc, qty, total, *rest in lines:
+                cid = None
+                if rest and rest[0]:
+                    row = d.execute("SELECT id FROM categories WHERE name=?", (rest[0],)).fetchone()
+                    cid = row["id"] if row else None
+                d.execute("INSERT INTO invoice_items(invoice_id, name, unit_cost, qty, total, category_id) "
+                          "VALUES(?,?,?,?,?,?)", (iid, name, uc, qty, total, cid))
+            d.commit()
+
+    def test_return_line_does_not_pollute_price_movers(self):
+        self._inv("Acme", "2026-05-15", [("Gin", 20.0, 2, 40.0)])    # prior price (before window)
+        self._inv("Acme", "2026-06-10", [("Gin", 24.0, 3, 72.0)])    # real move in window
+        self._inv("Acme", "2026-06-15", [("Gin", -24.0, -1, -24.0)])  # a return/credit, newest
+        with flask_app.app_context():
+            res = reports.price_movers(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        movers = {m["name"]: m for m in res["movers"]}
+        self.assertIn("Gin", movers)
+        self.assertEqual(movers["Gin"]["new_price"], 24.0)   # the -24 credit was ignored
+        self.assertEqual(movers["Gin"]["old_price"], 20.0)
+        self.assertEqual(movers["Gin"]["impact"], 12.0)      # (24-20)*3, return qty excluded
+
+    def test_credit_between_purchases_does_not_mask_a_real_alert(self):
+        # Without excluding credits, the -20 return would be read as the "prior
+        # price" and (being <= 0) suppress the genuine 20 -> 24 hike.
+        self._inv("Acme", self._d(30), [("Gin", 20.0, 1, 20.0)])     # real prior
+        self._inv("Acme", self._d(10), [("Gin", -20.0, -1, -20.0)])   # a return (credit)
+        self._inv("Acme", self._d(2), [("Gin", 24.0, 2, 48.0)])      # real new (+20%)
+        with flask_app.app_context():
+            res = reports.price_alerts(min_pct=10)
+        self.assertEqual(res["count"], 1)
+        self.assertEqual((res["alerts"][0]["old_price"], res["alerts"][0]["new_price"]), (20.0, 24.0))
+
+    def test_credit_invoice_nets_in_spend_reports(self):
+        self._inv("Acme", "2026-06-05", [("Case", 100.0, 1, 100.0, "Wine")])
+        self._inv("Acme", "2026-06-06", [("Credit", -30.0, -1, -30.0, "Wine")])   # vendor credit
+        with flask_app.app_context():
+            p = cogs.purchases(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+            cr = reports.category_report(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+            pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(p["total"], 70.0)            # 100 - 30 netted (invoice totals)
+        self.assertEqual(cr["grand_total"], 70.0)     # category report nets the credit
+        self.assertEqual(pl["total_cogs"], 70.0)      # P&L COGS nets the credit
+
+    def test_credit_line_does_not_corrupt_last_purchase_price(self):
+        # A purchase sets the SKU's last price; a later credit/return for the same
+        # SKU (negative unit_cost) must NOT overwrite it — but may advance the date.
+        self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_number": "P1", "invoice_date": "2026-06-05", "total": 30.0,
+            "line_items": [{"name": "Keg", "unit_cost": 30.0, "qty": 1, "total": 30.0}]})
+        self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_number": "C1", "invoice_date": "2026-06-10", "total": -30.0,
+            "line_items": [{"name": "Keg", "unit_cost": -30.0, "qty": -1, "total": -30.0}]})
+        with flask_app.app_context():
+            vi = get_db().execute(
+                "SELECT last_purchase_price, last_purchase_date FROM vendor_items "
+                "WHERE lower(vendor_item_name)='keg'").fetchone()
+        self.assertEqual(vi["last_purchase_price"], 30.0)        # not -30
+        self.assertEqual(vi["last_purchase_date"], "2026-06-10")  # date still advanced
+
+    def test_sku_first_seen_on_credit_stores_null_last_price(self):
+        self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_number": "C2", "invoice_date": "2026-06-10", "total": -15.0,
+            "line_items": [{"name": "Returns Only", "unit_cost": -15.0, "qty": -1, "total": -15.0}]})
+        with flask_app.app_context():
+            vi = get_db().execute(
+                "SELECT last_purchase_price FROM vendor_items "
+                "WHERE lower(vendor_item_name)='returns only'").fetchone()
+        self.assertIsNone(vi["last_purchase_price"])             # never a negative "last price"
+
+
 if __name__ == "__main__":
     unittest.main()

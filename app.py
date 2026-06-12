@@ -1176,15 +1176,20 @@ def _resolve_vendor_item(database, vendor, inv_date, line, loc):
         "  AND lower(vendor_item_name) = lower(?)",
         (loc, vendor or "", name),
     ).fetchone()
+    # A credit/return line carries a non-positive unit_cost — it's not a real
+    # purchase price, so it must never become the SKU's "last price" (that value
+    # is shown verbatim in the UI). Let it still advance the date/category.
+    price_for_store = price if (price or 0) > 0 else None
     if row:
         # Only advance the last-purchase price/date when this invoice is at least
         # as recent as what's recorded, so editing (or backfilling) an OLDER
         # invoice can't roll the latest price backwards.
         database.execute(
-            "UPDATE vendor_items SET last_purchase_date=?, last_purchase_price=?, "
+            "UPDATE vendor_items SET last_purchase_date=?, "
+            "last_purchase_price=CASE WHEN ? IS NOT NULL THEN ? ELSE last_purchase_price END, "
             "category_id=COALESCE(category_id, ?) "
             "WHERE id=? AND (last_purchase_date IS NULL OR last_purchase_date <= ?)",
-            (inv_date, price, cat_id, row["id"], inv_date),
+            (inv_date, price_for_store, price_for_store, cat_id, row["id"], inv_date),
         )
         return row["id"], (row["category_id"] or cat_id)
     vrow = database.execute(
@@ -1195,7 +1200,7 @@ def _resolve_vendor_item(database, vendor, inv_date, line, loc):
         "INSERT INTO vendor_items(location_id, vendor_id, vendor_name, vendor_item_name, "
         "category_id, last_purchase_date, last_purchase_price, status) "
         "VALUES(?,?,?,?,?,?,?, 'new')",
-        (loc, vrow["id"] if vrow else None, vendor, name, cat_id, inv_date, price),
+        (loc, vrow["id"] if vrow else None, vendor, name, cat_id, inv_date, price_for_store),
     )
     return cur.lastrowid, cat_id
 
