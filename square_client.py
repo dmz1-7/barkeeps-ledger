@@ -7,16 +7,26 @@ dashboard can show "Connect Square" instead of crashing.
 import datetime as dt
 import requests
 
-from db import get_setting, get_db
+from db import get_setting, get_db, active_location_id
 
 PROD_BASE = "https://connect.squareup.com"
 SANDBOX_BASE = "https://connect.squareupsandbox.com"
 
 
+def _active_square_location_id():
+    """The Square location id for the store this request is acting on, read from
+    the locations table (not a mutable global setting) so sales/labor always follow
+    the active store, even with concurrent devices."""
+    row = get_db().execute(
+        "SELECT square_location_id FROM locations WHERE id=?", (active_location_id(),)
+    ).fetchone()
+    return ((row["square_location_id"] if row else "") or "").strip()
+
+
 def _cfg():
     return {
         "token": (get_setting("square_token") or "").strip(),
-        "location_id": (get_setting("square_location_id") or "").strip(),
+        "location_id": _active_square_location_id(),
         "env": (get_setting("square_env") or "production").strip(),
         "version": (get_setting("square_version") or "2025-01-23").strip(),
     }

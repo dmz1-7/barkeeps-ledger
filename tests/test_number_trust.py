@@ -28,6 +28,8 @@ os.environ["APP_SECRET"] = ""
 
 import db                       # noqa: E402
 import square_client            # noqa: E402
+import cogs                     # noqa: E402
+import reports                  # noqa: E402
 from db import get_db           # noqa: E402
 import app as app_module        # noqa: E402
 
@@ -74,8 +76,10 @@ class NetSalesBasis(Base):
 
 class CacheZeroOverwrite(Base):
     def _configure_square(self):
-        db.set_setting("square_token", "x")
-        db.set_setting("square_location_id", "LOC1")
+        db.set_setting("square_token", "x")   # token is global; the location id is per-store now
+        get_db().execute("UPDATE locations SET square_location_id='LOC1' WHERE id=?",
+                         (db.active_location_id(),))
+        get_db().commit()
 
     def _seed_today(self, value):
         ds = dt.date.today().isoformat()
@@ -437,6 +441,152 @@ class UploadCap(Base):
             self.assertIn("too large", r.get_json()["error"])
         finally:
             flask_app.config["MAX_CONTENT_LENGTH"] = old
+
+
+class UsageCogs(Base):
+    def _count(self, date_str, value):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO counts(location_id, taken_at, value) VALUES(1, ?, ?)",
+                             (f"{date_str} 12:00:00", value))
+            get_db().commit()
+
+    def _invoice(self, date_str, total):
+        with flask_app.app_context():
+            get_db().execute(
+                "INSERT INTO invoices(location_id, vendor, invoice_date, total) VALUES(1,'V',?,?)",
+                (date_str, total))
+            get_db().commit()
+
+    def test_usage_cogs_uses_count_interval_not_requested_range(self):
+        self._count("2026-05-30", 1000.0)   # opening (just before the period)
+        self._count("2026-07-02", 800.0)    # closing (just after the period)
+        self._invoice("2026-05-20", 999.0)  # before interval  -> excluded
+        self._invoice("2026-05-30", 999.0)  # ON opening date  -> excluded (exclusive lower bound)
+        self._invoice("2026-06-15", 500.0)  # in interval
+        self._invoice("2026-07-02", 200.0)  # ON closing date  -> included
+        self._invoice("2026-07-05", 999.0)  # after interval   -> excluded
+        with flask_app.app_context():
+            s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(s["cogs_method"], "usage")
+        self.assertEqual(s["usage_period"],
+                         {"start": "2026-05-30", "end": "2026-07-02", "purchases": 700.0})
+        self.assertEqual(s["cogs"], 900.0)  # 1000 + 700 - 800
+
+    def test_far_counts_fall_back_to_purchases(self):
+        self._count("2026-01-01", 1000.0)   # outside the 14-day grace window
+        self._count("2026-12-31", 800.0)
+        self._invoice("2026-06-15", 500.0)
+        with flask_app.app_context():
+            s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(s["cogs_method"], "purchases")
+        self.assertIsNone(s["usage_period"])
+        self.assertEqual(s["cogs"], 500.0)
+
+
+class PriceMovers(Base):
+    def _vi(self, vendor, name):
+        with flask_app.app_context():
+            cur = get_db().execute(
+                "INSERT INTO vendor_items(location_id, vendor_name, vendor_item_name, status) "
+                "VALUES(1, ?, ?, 'reviewed')", (vendor, name))
+            get_db().commit()
+            return cur.lastrowid
+
+    def _line(self, date_str, vendor, name, price, qty, vi=None):
+        # Real model: the line name IS the vendor-item name. vi links it (or None).
+        with flask_app.app_context():
+            d = get_db()
+            inv = d.execute(
+                "INSERT INTO invoices(location_id, vendor, invoice_date, total) VALUES(1,?,?,?)",
+                (vendor, date_str, price * qty)).lastrowid
+            d.execute(
+                "INSERT INTO invoice_items(invoice_id, name, unit_cost, qty, vendor_item_id) "
+                "VALUES(?,?,?,?,?)", (inv, name, price, qty, vi))
+            d.commit()
+
+    def _movers(self):
+        with flask_app.app_context():
+            return reports.price_movers(dt.date(2026, 6, 1), dt.date(2026, 6, 30))["movers"]
+
+    def test_pack_sizes_do_not_merge(self):
+        # Different packs are distinct vendor-item names -> distinct keys.
+        self._line("2026-05-15", "Acme", "Tito 750ml", 20.0, 3)
+        self._line("2026-05-15", "Acme", "Tito 1.75L", 40.0, 2)
+        self._line("2026-06-10", "Acme", "Tito 750ml", 25.0, 4)   # moved 20 -> 25
+        self._line("2026-06-10", "Acme", "Tito 1.75L", 40.0, 1)   # unchanged
+        movers = self._movers()
+        self.assertEqual(len(movers), 1)
+        m = movers[0]
+        self.assertEqual((m["old_price"], m["new_price"], m["qty"], m["impact"]), (20.0, 25.0, 4.0, 20.0))
+
+    def test_move_survives_vendor_item_wipe(self):
+        # The importer wipes vendor_items (nulling vendor_item_id) then new lines get
+        # fresh ids; the (vendor, name) identity must still tie prior to current.
+        self._line("2026-05-15", "Acme", "Tito 750ml", 20.0, 3, vi=None)        # prior, unlinked
+        vi = self._vi("Acme", "Tito 750ml")
+        self._line("2026-06-10", "Acme", "Tito 750ml", 25.0, 4, vi=vi)          # window, linked
+        movers = self._movers()
+        self.assertEqual(len(movers), 1)
+        self.assertEqual((movers[0]["old_price"], movers[0]["new_price"]), (20.0, 25.0))
+
+    def test_blank_vendor_item_name_falls_back_to_invoice_line(self):
+        # A vendor_item created with a blank vendor must still unify with an
+        # unlinked prior line for the same product (NULLIF -> invoice vendor).
+        self._line("2026-05-15", "Acme", "Tito 750ml", 20.0, 3, vi=None)
+        vi = self._vi("", "Tito 750ml")                       # blank vendor_name
+        self._line("2026-06-10", "Acme", "Tito 750ml", 25.0, 4, vi=vi)
+        movers = self._movers()
+        self.assertEqual(len(movers), 1)
+        self.assertEqual((movers[0]["old_price"], movers[0]["new_price"]), (20.0, 25.0))
+
+    def test_same_name_different_vendor_not_merged(self):
+        self._line("2026-05-15", "Acme", "Vodka", 20.0, 2)
+        self._line("2026-05-15", "Beta", "Vodka", 30.0, 2)
+        self._line("2026-06-10", "Acme", "Vodka", 25.0, 3)   # Acme moved
+        self._line("2026-06-10", "Beta", "Vodka", 30.0, 3)   # Beta unchanged
+        movers = self._movers()
+        self.assertEqual(len(movers), 1)                     # not a cross-vendor merge
+        self.assertEqual(movers[0]["name"], "Vodka")
+        self.assertEqual((movers[0]["old_price"], movers[0]["new_price"]), (20.0, 25.0))
+
+
+class LocationHeader(Base):
+    """#6 — the active store is resolved per request from the X-Location-Id header,
+    not a shared mutable global, so concurrent devices don't cross-contaminate."""
+
+    def test_header_overrides_persisted_default(self):
+        with flask_app.app_context():
+            db.set_setting("active_location_id", "1")
+            nyc = get_db().execute(
+                "INSERT INTO invoices(location_id, vendor, total) VALUES(2,'N',5.0)").lastrowid
+            get_db().commit()
+        # Default store is 1 -> the NYC invoice is invisible...
+        self.assertEqual(self.client.get(f"/api/invoices/{nyc}").status_code, 404)
+        # ...until this request declares store 2 via the header.
+        self.assertEqual(
+            self.client.get(f"/api/invoices/{nyc}", headers={"X-Location-Id": "2"}).status_code, 200)
+
+    def test_invalid_header_falls_back_to_default(self):
+        with flask_app.app_context():
+            db.set_setting("active_location_id", "1")
+        for bad in ("999", "abc", ""):
+            r = self.client.get("/api/active-location", headers={"X-Location-Id": bad})
+            self.assertEqual(r.get_json()["active"], 1)
+
+    def test_square_location_resolves_per_request(self):
+        c1 = self.client.get("/api/config", headers={"X-Location-Id": "1"}).get_json()
+        c2 = self.client.get("/api/config", headers={"X-Location-Id": "2"}).get_json()
+        self.assertEqual(c1["square_location_id"], "LNKNR2A7MBB4K")   # seeded DC
+        self.assertEqual(c2["square_location_id"], "LS1WRASW8V02R")   # seeded NYC
+
+    def test_settings_writes_square_id_to_active_store_only(self):
+        self.client.post("/api/settings", json={"square_location_id": "NEWNYC"},
+                         headers={"X-Location-Id": "2"})
+        with flask_app.app_context():
+            r1 = get_db().execute("SELECT square_location_id FROM locations WHERE id=1").fetchone()[0]
+            r2 = get_db().execute("SELECT square_location_id FROM locations WHERE id=2").fetchone()[0]
+        self.assertEqual(r2, "NEWNYC")            # active store updated
+        self.assertEqual(r1, "LNKNR2A7MBB4K")     # other store untouched (no global mirror)
 
 
 if __name__ == "__main__":

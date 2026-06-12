@@ -103,6 +103,25 @@ def _guard():
             return jsonify({"error": "unauthorized"}), 401
 
 
+@app.before_request
+def _resolve_location():
+    """Resolve the per-request store from the X-Location-Id header (the SPA sends
+    it on every call) and stash it on g, validated against the locations table.
+    Left unset when the header is absent/invalid, so db.active_location_id() falls
+    back to the persisted default. Runs after _guard, so it never fires on a
+    request that failed auth."""
+    h = request.headers.get("X-Location-Id")
+    if not h:
+        return
+    try:
+        lid = int(h)
+    except (TypeError, ValueError):
+        return
+    if db.get_db().execute(
+            "SELECT 1 FROM locations WHERE id=? AND archived=0", (lid,)).fetchone():
+        g.location_override = lid
+
+
 # Throttle passcode guessing. In-memory (single-process dev server).
 _LOGIN_FAILS = {}          # key -> [recent failure timestamps]
 _LOGIN_MAX = 8             # per-key failures per window before lockout
@@ -173,11 +192,14 @@ def health():
 @app.get("/api/config")
 def config():
     s = db.all_settings()
+    loc_row = db.get_db().execute(
+        "SELECT square_location_id FROM locations WHERE id=?", (db.active_location_id(),)
+    ).fetchone()
     return jsonify({
         "auth_required": _expected_token() is not None,
         "square_configured": square_client.is_configured(),
         "square_env": s.get("square_env", "production"),
-        "square_location_id": s.get("square_location_id", ""),
+        "square_location_id": (loc_row["square_location_id"] if loc_row else "") or "",
         "square_version": s.get("square_version", ""),
         "has_square_token": bool((s.get("square_token") or "").strip()),
         "ai_model": s.get("ai_model", "claude-opus-4-8"),
@@ -190,12 +212,18 @@ def config():
 @app.post("/api/settings")
 def save_settings():
     data = request.json or {}
-    # Only persist a Square token if a non-blank one is supplied (so the UI can
-    # show "set" without round-tripping the secret).
-    for key in ("square_location_id", "square_env", "square_version", "ai_model",
+    for key in ("square_env", "square_version", "ai_model",
                 "target_cogs_pct", "target_labor_pct"):
         if key in data:
             db.set_setting(key, data[key])
+    # The Square location is per-store now: write it onto the active store's row,
+    # not a shared global setting.
+    if "square_location_id" in data:
+        db.get_db().execute("UPDATE locations SET square_location_id=? WHERE id=?",
+                            (data["square_location_id"], db.active_location_id()))
+        db.get_db().commit()
+    # Only persist a Square token if a non-blank one is supplied (so the UI can
+    # show "set" without round-tripping the secret).
     if data.get("square_token"):
         db.set_setting("square_token", data["square_token"].strip())
     return jsonify({"ok": True})
@@ -232,16 +260,17 @@ def active_location_get():
 
 @app.put("/api/active-location")
 def active_location_set():
+    """Persist the default store (for a fresh device / non-SPA callers). The SPA's
+    per-request X-Location-Id header is the real source of truth; the Square id is
+    now resolved per-request from the locations table, so nothing is mirrored into
+    a shared global setting here."""
     loc_id = (request.json or {}).get("location_id")
-    database = db.get_db()
-    row = database.execute(
-        "SELECT id, square_location_id FROM locations WHERE id=?", (loc_id,)
+    row = db.get_db().execute(
+        "SELECT id FROM locations WHERE id=? AND archived=0", (loc_id,)
     ).fetchone()
     if not row:
         return jsonify({"error": "Unknown location."}), 400
     db.set_setting("active_location_id", row["id"])
-    # Mirror the store's Square id so sales/labor follow the active location.
-    db.set_setting("square_location_id", row["square_location_id"] or "")
     return jsonify({"ok": True, "active": row["id"]})
 
 

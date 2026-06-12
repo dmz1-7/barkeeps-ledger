@@ -1,7 +1,12 @@
 /* Barkeep's Ledger — front-of-house single-page app (no build step). */
 
 const TOKEN_KEY = "ledger_token";
+const LOC_KEY = "ledger_active_loc";
 let CONFIG = {};
+let VENDOR_NAMES = null;  // per-store autocomplete cache; reset on store switch
+// The store this device is viewing. Sent as X-Location-Id on every request so the
+// backend scopes per-request (no shared global "current store"). Per-device.
+let ACTIVE_LOC = Number(localStorage.getItem(LOC_KEY)) || null;
 
 /* ---------- category taxonomy (Category Type -> Category) ---------- */
 let CATEGORIES = null;   // cache of /api/categories
@@ -53,6 +58,7 @@ async function api(method, path, body, isForm) {
   const headers = {};
   const token = localStorage.getItem(TOKEN_KEY);
   if (token) headers.Authorization = "Bearer " + token;
+  if (ACTIVE_LOC) headers["X-Location-Id"] = String(ACTIVE_LOC);
   const opts = { method, headers };
   if (body != null) {
     if (isForm) { opts.body = body; }
@@ -116,11 +122,19 @@ async function initLocationSwitch() {
   const sel = $("#loc-switch");
   try {
     const d = await api("GET", "/api/locations");
+    // Adopt the server's default store if this device hasn't chosen a valid one.
+    if (d.active && (!ACTIVE_LOC || !d.locations.some((l) => l.id === ACTIVE_LOC))) {
+      ACTIVE_LOC = d.active;
+      localStorage.setItem(LOC_KEY, ACTIVE_LOC);
+    }
     sel.innerHTML = d.locations.map((l) =>
-      `<option value="${l.id}" ${l.id === d.active ? "selected" : ""}>${esc(l.name)}</option>`).join("");
+      `<option value="${l.id}" ${l.id === ACTIVE_LOC ? "selected" : ""}>${esc(l.name)}</option>`).join("");
     sel.onchange = async () => {
+      ACTIVE_LOC = Number(sel.value);
+      localStorage.setItem(LOC_KEY, ACTIVE_LOC);   // per-device choice, sent as X-Location-Id
+      VENDOR_NAMES = null;   // vendors are per-store — drop the other store's autocomplete cache
       try {
-        await api("PUT", "/api/active-location", { location_id: Number(sel.value) });
+        await api("PUT", "/api/active-location", { location_id: ACTIVE_LOC });  // persist default
         CONFIG = await api("GET", "/api/config").catch(() => CONFIG);
         route();  // re-render the current screen against the new active store
       } catch (e) { toast(e.message); }
@@ -411,10 +425,12 @@ async function loadDash() {
     pb.appendChild(el(`<div class="kv"><span>${typePill(c)}</span><b>${money(amt)}</b></div>`)));
   body.appendChild(card);
 
-  if (d.begin_inventory && d.end_inventory) {
-    body.appendChild(el(`<div class="note">Usage-based COGS using counts:
-      open ${money(d.begin_inventory.value)} + buys ${money(d.purchases)} &minus;
-      close ${money(d.end_inventory.value)} = <b>${money(d.cogs)}</b>.</div>`));
+  if (d.usage_period) {
+    const up = d.usage_period;
+    body.appendChild(el(`<div class="note">Usage-based COGS, measured between your counts
+      (${up.start} &rarr; ${up.end}): open ${money(d.begin_inventory.value)} + buys
+      ${money(up.purchases)} &minus; close ${money(d.end_inventory.value)} = <b>${money(d.cogs)}</b>.
+      <span class="muted">&ldquo;Buys&rdquo; covers the count window, not just the selected range.</span></div>`));
   } else {
     body.appendChild(el(`<div class="note muted">Tip: take an inventory count at the start and end of a
       period and COGS switches from purchases-based to true usage-based automatically.</div>`));
@@ -1070,7 +1086,6 @@ async function renderSettings() {
 /* ============================================================
    VENDORS
    ============================================================ */
-let VENDOR_NAMES = null;  // cache for the autocomplete datalist
 
 async function fillVendorDatalist() {
   const dl = $("#vendor-list");
