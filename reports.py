@@ -14,6 +14,7 @@ Sales report depend on Square; without it they fail soft to zeros + an error.
 import datetime as dt
 
 from db import get_db, TAXONOMY, active_location_id
+from cogs import pretax_factor, _pretax_line_rows
 import money
 import square_client
 
@@ -46,7 +47,7 @@ def category_report(start, end, vendor=None, status=None, search=None):
         where.append("(vendor LIKE ? OR invoice_number LIKE ?)")
         params += [f"%{search}%", f"%{search}%"]
     invs = db.execute(
-        "SELECT id, invoice_date, invoice_number, vendor, status, total "
+        "SELECT id, invoice_date, invoice_number, vendor, status, subtotal, total "
         f"FROM invoices WHERE {' AND '.join(where)} "
         "ORDER BY invoice_date DESC, id DESC",
         params,
@@ -63,6 +64,15 @@ def category_report(start, end, vendor=None, status=None, search=None):
             inv_ids,
         ):
             cell[(r["invoice_id"], r["category_id"])] = _r(r["amt"])
+
+    # Deflate each invoice's cells to the pre-tax basis (so a tax-inclusive
+    # invoice doesn't inflate COGS), consistent with cogs.purchases.
+    line_sum = {}
+    for (iid, _cid), amt in cell.items():
+        line_sum[iid] = line_sum.get(iid, 0.0) + amt
+    factor = {inv["id"]: pretax_factor(inv["subtotal"], inv["total"],
+                                            line_sum.get(inv["id"], 0.0)) for inv in invs}
+    cell = {k: _r(v * factor.get(k[0], 1.0)) for k, v in cell.items()}
 
     # id 0 = an "Uncategorized" column for line items with category_id NULL, so
     # their spend is counted in column_totals/grand_total (otherwise the Category
@@ -121,10 +131,11 @@ def controllable_pl(start, end):
         })
     total_income = _r(sales)
 
-    # COGS by category type -> category, from invoice lines in the period.
-    # Accumulate in integer cents (no float-SUM drift), matching cogs.purchases.
+    # COGS by category type -> category, from invoice lines in the period, on the
+    # PRE-TAX basis (deflate tax-inclusive invoices) and summed in integer cents.
     cogs_rows = db.execute(
-        "SELECT c.category_type AS ctype, c.name AS category, ii.total AS amt "
+        "SELECT inv.id AS iid, inv.subtotal AS sub, inv.total AS tot, "
+        "       c.category_type AS ctype, c.name AS category, ii.total AS amt "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN categories c ON c.id = ii.category_id "
         "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ?",
@@ -132,11 +143,11 @@ def controllable_pl(start, end):
     ).fetchall()
 
     by_type = {}
-    for r in cogs_rows:
+    for r, amt in _pretax_line_rows(cogs_rows):
         ctype = r["ctype"] or "Uncategorized"
         cat = r["category"] or "Uncategorized"
         bt = by_type.setdefault(ctype, {"total_c": 0, "cats_c": {}})
-        cents = money.to_cents(r["amt"])
+        cents = money.to_cents(amt)
         bt["total_c"] += cents
         bt["cats_c"][cat] = bt["cats_c"].get(cat, 0) + cents
 
@@ -292,10 +303,12 @@ def price_movers(start, end):
         if g is None:
             groups[(r["vkey"], r["nkey"])] = g = {
                 "vendor": r["vendor"], "name": r["name"], "cat": r["cat"],
-                "new_price": None, "qty": 0.0,
+                "new_price": None, "earliest_price": None, "qty": 0.0,
             }
         if g["new_price"] is None and r["price"] is not None:
             g["new_price"] = r["price"]      # newest-first, so this is the latest price
+        if r["price"] is not None:
+            g["earliest_price"] = r["price"]  # newest-first: last write = oldest in-window price
         # Impact = price delta x qty bought AT the new price; only count units at
         # the latest price so units bought earlier in the window at the old price
         # don't get charged the full delta (which overstated impact).
@@ -319,6 +332,12 @@ def price_movers(start, end):
             (loc, start.isoformat(), gv, gn),
         ).fetchone()
         old_price = prior["p"] if prior else None
+        if old_price is None:
+            # No price before the window — fall back to the earliest price seen
+            # WITHIN it, so a change that happens entirely in-window still shows.
+            ep = g.get("earliest_price")
+            if ep is not None and ep != new_price:
+                old_price = ep
         if old_price is None or old_price == new_price:
             continue
         movers.append({

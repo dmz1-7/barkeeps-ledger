@@ -45,6 +45,15 @@ ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.teardown_appcontext(db.close_db)
+
+# Fail closed at IMPORT time (so it fires under gunicorn/any WSGI server, not just
+# `python app.py`): refuse to run unauthenticated unless open mode is explicitly
+# acknowledged. run.sh sets ALLOW_OPEN for local dev; production sets APP_PASSWORD.
+if not os.environ.get("APP_PASSWORD") and not os.environ.get("ALLOW_OPEN"):
+    raise RuntimeError(
+        "Refusing to start without authentication. Set APP_PASSWORD, or set "
+        "ALLOW_OPEN=1 to run open on a trusted local network.")
+
 # Cap uploads so a giant (or malicious) file can't exhaust memory/disk. 32 MB
 # covers a full-resolution phone photo while still bounding abuse.
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
@@ -268,8 +277,14 @@ def save_settings():
     # The Square location is per-store now: write it onto the active store's row,
     # not a shared global setting.
     if "square_location_id" in data:
+        sqid = _s(data["square_location_id"])
+        if sqid and db.get_db().execute(
+            "SELECT 1 FROM locations WHERE square_location_id=? AND id<>?",
+            (sqid, db.active_location_id())
+        ).fetchone():
+            return jsonify({"error": "That Square location is already assigned to another store."}), 400
         db.get_db().execute("UPDATE locations SET square_location_id=? WHERE id=?",
-                            (_s(data["square_location_id"]), db.active_location_id()))
+                            (sqid, db.active_location_id()))
         db.get_db().commit()
     # Only persist a Square token if a non-blank one is supplied (so the UI can
     # show "set" without round-tripping the secret).
@@ -938,7 +953,7 @@ def product_new_item_accept(vid):
     d = body()
     sets, vals = ["status='reviewed'"], []
     if "category_id" in d:
-        sets.append("category_id=?"); vals.append(_i(d.get("category_id")))
+        sets.append("category_id=?"); vals.append(_valid_id("categories", d.get("category_id")))
     if "product_id" in d:
         sets.append("product_id=?"); vals.append(_own_product_id(db.get_db(), d.get("product_id")))
     vals += [vid, db.active_location_id()]
@@ -1035,8 +1050,9 @@ def vendor_item_create():
     cur = db.get_db().execute(
         "INSERT INTO vendor_items(location_id, vendor_id, vendor_name, vendor_item_name, product_id, "
         "category_id, item_code, order_guide, status) VALUES(?,?,?,?,?,?,?,?, 'reviewed')",
-        (db.active_location_id(), _i(d.get("vendor_id")), _s(d.get("vendor_name")), name,
-         _own_product_id(db.get_db(), d.get("product_id")), _i(d.get("category_id")),
+        (db.active_location_id(), _valid_id("vendors", d.get("vendor_id"), loc_scoped=True),
+         _s(d.get("vendor_name")), name,
+         _own_product_id(db.get_db(), d.get("product_id")), _valid_id("categories", d.get("category_id")),
          _s(d.get("item_code")), _i(d.get("order_guide"), 0)),
     )
     db.get_db().commit()
@@ -1448,9 +1464,16 @@ def _image_name(v):
 
 def _coerce_col(key, v):
     """Bind-safe value for a dynamic column: numeric columns -> _f/_i (NULL on
-    junk), text columns -> dropped to None if a list/dict."""
+    junk), FK columns validated to exist/own (NULL if dangling), text columns
+    dropped to None if a list/dict."""
     if key in _NUM_REAL:
         return _f(v)
+    if key == "category_id":
+        return _valid_id("categories", v)            # categories are shared (not loc-scoped)
+    if key == "product_id":
+        return _own_product_id(db.get_db(), v)
+    if key == "vendor_id":
+        return _valid_id("vendors", v, loc_scoped=True)
     if key in _NUM_INT:
         return _i(v)
     return v if _scalar(v) else None
@@ -1488,6 +1511,21 @@ def _own_product_id(database, v):
         (pid, db.active_location_id()),
     ).fetchone()
     return pid if row else None
+
+
+def _valid_id(table, v, loc_scoped=False):
+    """An id coerced to int and validated to EXIST (and, when loc_scoped, belong
+    to the active store), else None — so a dangling/foreign FK is dropped to NULL
+    rather than stored or 500ing on a fresh DB's foreign-key constraint."""
+    iden = _i(v)
+    if iden is None:
+        return None
+    q = f"SELECT 1 FROM {table} WHERE id=?"
+    args = [iden]
+    if loc_scoped:
+        q += " AND location_id IS ?"
+        args.append(db.active_location_id())
+    return iden if db.get_db().execute(q, args).fetchone() else None
 
 
 with app.app_context():

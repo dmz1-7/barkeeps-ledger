@@ -551,7 +551,7 @@ async function loadDash() {
   if (d.usage_period) {
     const up = d.usage_period;
     body.appendChild(el(`<div class="note">Usage-based COGS, measured between your counts
-      (${up.start} &rarr; ${up.end}): open ${money(d.begin_inventory.value)} + buys
+      (${esc(up.start)} &rarr; ${esc(up.end)}): open ${money(d.begin_inventory.value)} + buys
       ${money(up.purchases)} &minus; close ${money(d.end_inventory.value)} = <b>${money(d.cogs)}</b>.
       <span class="muted">&ldquo;Buys&rdquo; covers the count window, not just the selected range.</span></div>`));
   } else {

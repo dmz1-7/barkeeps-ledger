@@ -14,26 +14,50 @@ import money
 import square_client
 
 
+def pretax_factor(subtotal, total, line_sum):
+    """Deflation factor to put an invoice's line totals on the PRE-TAX basis.
+
+    Vendors print line totals either tax-exclusive (sum to the subtotal) or
+    tax-inclusive (sum to the grand total) — `_reconcile` accepts both. COGS must
+    be pre-tax to match the tax-stripped net-sales denominator, so when an
+    invoice's lines reconcile to the tax-INCLUSIVE total, deflate them by
+    subtotal/total. Returns 1.0 when already pre-tax or undeterminable."""
+    if not subtotal or not total or subtotal <= 0 or total <= 0 or subtotal >= total:
+        return 1.0
+    return subtotal / total if abs(line_sum - total) < abs(line_sum - subtotal) else 1.0
+
+
+def _pretax_line_rows(rows):
+    """Given rows carrying (iid, sub, tot, amt[, ctype]), yield (row, deflated_amt)
+    with each line put on the pre-tax basis per its invoice's convention."""
+    line_sum = {}
+    for r in rows:
+        line_sum[r["iid"]] = line_sum.get(r["iid"], 0.0) + (r["amt"] or 0)
+    for r in rows:
+        f = pretax_factor(r["sub"], r["tot"], line_sum[r["iid"]])
+        yield r, (r["amt"] or 0) * f
+
+
 def purchases(start, end):
     """COGS-basis invoice spend in [start, end], plus a breakdown by category type.
 
-    Both the total AND the breakdown come from LINE ITEMS (invoice_items.total),
-    so the dashboard's purchases-COGS matches the Controllable P&L and Category
-    Report exactly (all three share one basis), and the header equals the sum of
-    the category rows. Summed in integer cents. Note: this is cost-of-goods (the
-    pre-tax/fees line items), not the invoice grand total."""
+    Both the total AND the breakdown come from LINE ITEMS, deflated to the
+    PRE-TAX base (so a vendor whose lines print tax-inclusive doesn't inflate
+    COGS vs. the tax-stripped sales denominator). Matches the Controllable P&L
+    and Category Report exactly. Summed in integer cents."""
     db = get_db()
     loc = active_location_id()
     rows = db.execute(
-        "SELECT COALESCE(c.category_type,'Uncategorized') AS ctype, ii.total AS amt "
+        "SELECT inv.id AS iid, inv.subtotal AS sub, inv.total AS tot, "
+        "       COALESCE(c.category_type,'Uncategorized') AS ctype, ii.total AS amt "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN categories c ON c.id = ii.category_id "
         "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ?",
         (loc, start.isoformat(), end.isoformat()),
     ).fetchall()
     by_cat_c = {}
-    for r in rows:
-        by_cat_c[r["ctype"]] = by_cat_c.get(r["ctype"], 0) + money.to_cents(r["amt"])
+    for r, amt in _pretax_line_rows(rows):
+        by_cat_c[r["ctype"]] = by_cat_c.get(r["ctype"], 0) + money.to_cents(amt)
     n = db.execute(
         "SELECT COUNT(*) AS n FROM invoices "
         "WHERE location_id IS ? AND invoice_date >= ? AND invoice_date <= ?",
@@ -45,17 +69,17 @@ def purchases(start, end):
 
 
 def _purchase_total(loc, after_date, through_date):
-    """Sum invoice LINE-ITEM totals received after `after_date` through
-    `through_date` (both ISO dates) — same cost-of-goods basis as purchases().
-    Used for usage-COGS, where purchases must span the SAME interval as the
-    bracketing counts (the opening count subsumes its own day's deliveries, so
-    the lower bound is exclusive)."""
+    """Sum invoice LINE-ITEM totals (pre-tax basis) received after `after_date`
+    through `through_date` (both ISO dates) — same basis as purchases(). Used for
+    usage-COGS, where purchases span the bracketing-count interval (the opening
+    count subsumes its own day's deliveries, so the lower bound is exclusive)."""
     rows = get_db().execute(
-        "SELECT ii.total AS amt FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
+        "SELECT inv.id AS iid, inv.subtotal AS sub, inv.total AS tot, ii.total AS amt "
+        "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "WHERE inv.location_id IS ? AND inv.invoice_date > ? AND inv.invoice_date <= ?",
         (loc, after_date, through_date),
     ).fetchall()
-    return money.sum_dollars(r["amt"] for r in rows)
+    return money.sum_dollars(amt for _, amt in _pretax_line_rows(rows))
 
 
 # How far a bracketing count may sit outside the requested period and still be
