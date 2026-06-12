@@ -1169,5 +1169,144 @@ class CreditsAndReturns(Base):
         self.assertIsNone(vi["last_purchase_price"])             # never a negative "last price"
 
 
+class RecipeCosting(Base):
+    """A recipe costs the sum of its ingredient lines (qty x product unit_cost);
+    yield gives per-serving cost; menu_price gives cost% and margin. Exact money,
+    location-scoped, items replaced on update and cascade-deleted."""
+
+    def _product(self, name, unit_cost, loc=1, unit="bottle"):
+        with flask_app.app_context():
+            d = get_db()
+            pid = d.execute(
+                "INSERT INTO inventory_items(location_id, name, unit, unit_cost) "
+                "VALUES(?,?,?,?)", (loc, name, unit, unit_cost)).lastrowid
+            d.commit()
+            return pid
+
+    def _create(self, **kw):
+        return self.client.post("/api/recipes", json=kw).get_json()
+
+    def test_cost_margin_and_cost_pct(self):
+        gin = self._product("Gin", 20.0)
+        verm = self._product("Vermouth", 10.0)
+        r = self._create(name="Martini", menu_price=12.0, yield_qty=1, items=[
+            {"product_id": gin, "qty": 0.1},      # $2.00
+            {"product_id": verm, "qty": 0.05}])   # $0.50
+        self.assertEqual(r["batch_cost"], 2.5)
+        self.assertEqual(r["cost_per_serving"], 2.5)
+        self.assertEqual(r["cost_pct"], 20.8)     # 2.5/12*100
+        self.assertEqual(r["margin"], 9.5)        # 12 - 2.5
+        self.assertEqual(r["item_count"], 2)
+
+    def test_yield_divides_into_per_serving(self):
+        keg = self._product("Keg", 124.0)
+        r = self._create(name="Pint", menu_price=6.0, yield_qty=124,
+                         items=[{"product_id": keg, "qty": 1}])
+        self.assertEqual(r["batch_cost"], 124.0)
+        self.assertEqual(r["cost_per_serving"], 1.0)   # 124 / 124
+        self.assertEqual(r["cost_pct"], 16.7)
+
+    def test_zero_yield_treated_as_one(self):
+        p = self._product("X", 5.0)
+        r = self._create(name="Y", menu_price=10.0, yield_qty=0,
+                         items=[{"product_id": p, "qty": 2}])
+        self.assertEqual(r["cost_per_serving"], 10.0)   # divided by 1, not a crash
+
+    def test_cost_sums_exactly(self):
+        p = self._product("Penny", 0.1)
+        r = self._create(name="Z", menu_price=1.0, yield_qty=1, items=[
+            {"product_id": p, "qty": 1}, {"product_id": p, "qty": 1},
+            {"product_id": p, "qty": 1}])
+        self.assertEqual(r["batch_cost"], 0.3)          # not 0.30000000000000004
+
+    def test_no_menu_price_leaves_pct_and_margin_null(self):
+        p = self._product("P", 5.0)
+        r = self._create(name="NoPrice", menu_price=0, yield_qty=1,
+                         items=[{"product_id": p, "qty": 1}])
+        self.assertIsNone(r["cost_pct"])
+        self.assertIsNone(r["margin"])
+
+    def test_deleted_product_line_costs_zero_and_is_flagged(self):
+        p = self._product("Temp", 5.0)
+        rid = self._create(name="R", menu_price=10.0, yield_qty=1,
+                           items=[{"product_id": p, "qty": 2}])["id"]
+        with flask_app.app_context():
+            get_db().execute("DELETE FROM inventory_items WHERE id=?", (p,))
+            get_db().commit()
+        r = self.client.get(f"/api/recipes/{rid}").get_json()
+        self.assertEqual(r["batch_cost"], 0.0)          # product_id SET NULL -> no cost
+        self.assertEqual(r["missing_products"], 1)
+        self.assertTrue(r["items"][0]["missing_product"])
+
+    def test_update_replaces_items(self):
+        p = self._product("P", 4.0)
+        rid = self._create(name="R", menu_price=10, yield_qty=1,
+                           items=[{"product_id": p, "qty": 1}])["id"]
+        upd = self.client.put(f"/api/recipes/{rid}", json={
+            "name": "R2", "menu_price": 8, "yield_qty": 2,
+            "items": [{"product_id": p, "qty": 4}]}).get_json()
+        self.assertEqual((upd["name"], upd["item_count"]), ("R2", 1))
+        self.assertEqual(upd["batch_cost"], 16.0)       # 4 * 4
+        self.assertEqual(upd["cost_per_serving"], 8.0)  # / 2
+
+    def test_delete_cascades_items(self):
+        p = self._product("P", 4.0)
+        rid = self._create(name="R", menu_price=10, yield_qty=1,
+                           items=[{"product_id": p, "qty": 1}])["id"]
+        self.assertEqual(self.client.delete(f"/api/recipes/{rid}").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/recipes/{rid}").status_code, 404)
+        with flask_app.app_context():
+            n = get_db().execute(
+                "SELECT COUNT(*) c FROM recipe_items WHERE recipe_id=?", (rid,)).fetchone()["c"]
+        self.assertEqual(n, 0)
+
+    def test_foreign_recipe_is_404(self):
+        p = self._product("NycGin", 5.0, loc=2)
+        rid = self.client.post("/api/recipes", headers={"X-Location-Id": "2"}, json={
+            "name": "NYC", "menu_price": 5, "yield_qty": 1,
+            "items": [{"product_id": p, "qty": 1}]}).get_json()["id"]
+        self.assertEqual(self.client.get(f"/api/recipes/{rid}",
+                                         headers={"X-Location-Id": "1"}).status_code, 404)
+        self.assertEqual(self.client.get(f"/api/recipes/{rid}",
+                                         headers={"X-Location-Id": "2"}).status_code, 200)
+
+    def test_foreign_product_dropped_not_costed(self):
+        # A store-1 recipe must not cost against a store-2 product's price; the
+        # foreign id is dropped to an unlinked ($0) line.
+        p2 = self._product("NycSpirit", 50.0, loc=2)
+        r = self._create(name="Sneaky", menu_price=10.0, yield_qty=1,
+                         items=[{"product_id": p2, "qty": 1}])
+        self.assertEqual(r["batch_cost"], 0.0)
+        self.assertEqual(r["missing_products"], 1)
+        self.assertEqual(r["item_count"], 1)
+
+    def test_non_list_items_does_not_crash(self):
+        r = self.client.post("/api/recipes", json={
+            "name": "Bad", "menu_price": 5, "yield_qty": 1, "items": 123})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["item_count"], 0)
+
+    def test_null_unit_cost_product_costs_zero(self):
+        with flask_app.app_context():
+            d = get_db()
+            pid = d.execute("INSERT INTO inventory_items(location_id, name, unit, unit_cost) "
+                            "VALUES(1, 'NoCost', 'ea', NULL)").lastrowid
+            d.commit()
+        r = self._create(name="R", menu_price=10.0, yield_qty=1,
+                         items=[{"product_id": pid, "qty": 5}])
+        self.assertEqual(r["batch_cost"], 0.0)        # NULL unit_cost -> $0, no crash
+
+    def test_recipes_csv(self):
+        p = self._product("Gin", 20.0)
+        self._create(name="Martini", menu_price=12.0, yield_qty=1,
+                     items=[{"product_id": p, "qty": 0.1}])
+        r = self.client.get("/api/export/recipes.csv")
+        self.assertEqual(r.status_code, 200)
+        rows = list(csv.reader(io.StringIO(r.get_data(as_text=True))))
+        self.assertEqual(rows[0], ["Recipe", "Menu Price", "Yield", "Batch Cost",
+                                   "Cost/Serving", "Cost %", "Margin"])
+        self.assertEqual((rows[1][0], rows[1][3], rows[1][6]), ("Martini", "2.0", "10.0"))
+
+
 if __name__ == "__main__":
     unittest.main()

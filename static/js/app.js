@@ -194,6 +194,7 @@ const NAV = [
   { tab: "products", icon: "\u{1F376}", label: "Products", href: "#/products",
     children: [
       { label: "All Products", href: "#/products" },
+      { label: "Recipes", href: "#/recipes" },
       { label: "New Item Review", href: "#/products/new" },
       { label: "Purchase Report", href: "#/products/purchase" },
     ] },
@@ -209,8 +210,8 @@ const NAV = [
 const SECTION_OF = {
   dashboard: "dashboard", orders: "orders", invoice: "orders",
   performance: "performance", vendors: "vendors", vendor: "vendors",
-  products: "products", product: "products", inventory: "inventory",
-  count: "inventory", settings: "settings",
+  products: "products", product: "products", recipes: "products",
+  inventory: "inventory", count: "inventory", settings: "settings",
 };
 
 const ROUTES = {
@@ -222,6 +223,7 @@ const ROUTES = {
   vendor: renderVendorDetail,
   products: renderProducts,
   product: renderProductDetail,
+  recipes: renderRecipes,
   inventory: renderInventory,
   count: renderCount,
   settings: renderSettings,
@@ -1636,6 +1638,150 @@ async function renderProductDetail(parts) {
     $("#edit-p").addEventListener("click", () => openItemEditor(p));
     $("#back-p").addEventListener("click", () => { location.hash = "#/products"; });
   } catch (e) { view().innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+
+/* ============================================================
+   RECIPES / plate costing
+   ============================================================ */
+function renderRecipes(parts) {
+  const sub = parts[0];
+  if (sub === "new") return recipeEditor(null);
+  if (sub) return recipeEditor(sub);
+  return recipeList();
+}
+
+async function recipeList() {
+  const v = view();
+  v.innerHTML = `<h2 class="section section-head">Recipes</h2>`;
+  v.appendChild(el(`<div class="btn-row">
+    <button class="btn btn-brass btn-sm" id="rec-new">+ New Recipe</button>
+    <button class="btn btn-ghost btn-sm" id="rec-exp">&#x2B07; Costing (CSV)</button>
+  </div>`));
+  $("#rec-new").addEventListener("click", () => { location.hash = "#/recipes/new"; });
+  $("#rec-exp").addEventListener("click", () =>
+    download("/api/export/recipes.csv", "recipe-costing.csv").catch((e) => toast("Export failed: " + e.message)));
+  const body = el(`<div><div class="spinner"></div></div>`);
+  v.appendChild(body);
+  try {
+    const list = await api("GET", "/api/recipes");
+    body.innerHTML = "";
+    if (!list.length) {
+      body.appendChild(el(`<p class="empty">No recipes yet. Add one to cost a menu item.</p>`));
+      return;
+    }
+    const columns = [
+      { key: "name", label: "Recipe", cls: "strong", fmt: (r) => esc(r.name) },
+      { key: "cost_per_serving", label: "Cost", align: "right", fmt: (r) => money(r.cost_per_serving) },
+      { key: "menu_price", label: "Price", align: "right", fmt: (r) => money(r.menu_price) },
+      { key: "cost_pct", label: "Cost %", align: "right", fmt: (r) => pct(r.cost_pct) },
+      { key: "margin", label: "Margin", align: "right", fmt: (r) => (r.margin == null ? "—" : money(r.margin)) },
+    ];
+    const rows = list.map((r) => ({ ...r, _href: `#/recipes/${r.id}` }));
+    body.appendChild(dataTable(columns, rows, { search: true, initialSort: { key: "cost_pct", dir: -1 } }));
+  } catch (e) { body.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+
+async function recipeEditor(id) {
+  const v = view();
+  v.innerHTML = `<div class="spinner"></div>`;
+  let rec = { name: "", menu_price: 0, yield_qty: 1, notes: "", items: [] };
+  let products = [];
+  try {
+    products = await api("GET", "/api/products");
+    if (id) rec = await api("GET", `/api/recipes/${id}`);
+  } catch (e) { v.innerHTML = `<p class="err">${esc(e.message)}</p>`; return; }
+
+  v.innerHTML = `<h2 class="section section-head">${id ? "Edit" : "New"} Recipe</h2>`;
+  v.appendChild(el(`<div class="card"><div class="card-body">
+    <label class="fld"><span>Name</span><input id="r-name" value="${esc(rec.name)}"></label>
+    <div class="row2">
+      <label class="fld"><span>Menu Price $</span><input type="number" step="0.01" id="r-price" value="${num(rec.menu_price)}"></label>
+      <label class="fld"><span>Yields (servings)</span><input type="number" step="0.01" id="r-yield" value="${num(rec.yield_qty)}"></label>
+    </div>
+    <label class="fld"><span>Notes</span><input id="r-notes" value="${esc(rec.notes || "")}"></label>
+  </div></div>`));
+
+  const ingCard = el(`<div class="card"><div class="card-band">Ingredients
+    <button class="btn btn-sm btn-ghost" id="r-add">+ Add</button></div>
+    <div class="card-body" id="r-lines"></div></div>`);
+  v.appendChild(ingCard);
+  const linesEl = ingCard.querySelector("#r-lines");
+  const prodOptions = products.map((p) =>
+    `<option value="${p.id}">${esc(p.name)} (${money(p.unit_cost)}/${esc(p.unit || "ea")})</option>`).join("");
+  const costOf = (pid) => { const p = products.find((x) => String(x.id) === String(pid)); return p ? (p.unit_cost || 0) : 0; };
+
+  const addRow = (it) => {
+    it = it || {};
+    const row = el(`<div class="lrow rrow">
+      <select class="ri-prod"><option value="">— product —</option>${prodOptions}</select>
+      <input class="ri-qty" type="number" step="0.0001" placeholder="qty" value="${num(it.qty)}">
+      <button class="btn btn-sm btn-ghost ri-del">&times;</button>
+    </div>`);
+    if (it.product_id) row.querySelector(".ri-prod").value = String(it.product_id);
+    row.querySelector(".ri-del").addEventListener("click", () => { row.remove(); recalc(); });
+    row.querySelector(".ri-prod").addEventListener("change", recalc);
+    row.querySelector(".ri-qty").addEventListener("input", recalc);
+    linesEl.appendChild(row);
+  };
+  (rec.items || []).forEach(addRow);
+  if (!(rec.items || []).length) addRow();
+  ingCard.querySelector("#r-add").addEventListener("click", () => { addRow(); recalc(); });
+
+  const preview = el(`<div class="note" id="r-preview"></div>`);
+  v.appendChild(preview);
+  // Round half-to-even, matching Python's round() / money.normalize on the
+  // backend, so the live preview equals the saved cost to the penny.
+  const bankers = (n) => {
+    const fl = Math.floor(n), d = n - fl;
+    if (d < 0.5) return fl;
+    if (d > 0.5) return fl + 1;
+    return fl % 2 === 0 ? fl : fl + 1;
+  };
+  // Mirror the backend: cost each line in cents, sum, divide by yield.
+  function recalc() {
+    let cents = 0;
+    linesEl.querySelectorAll(".rrow").forEach((row) => {
+      const pid = row.querySelector(".ri-prod").value;
+      const qty = Number(row.querySelector(".ri-qty").value) || 0;
+      cents += bankers(costOf(pid) * qty * 100);
+    });
+    const batch = cents / 100;
+    const yld = Number($("#r-yield").value) > 0 ? Number($("#r-yield").value) : 1;
+    const per = bankers(cents / yld) / 100;
+    const price = Number($("#r-price").value) || 0;
+    preview.innerHTML = `Batch ${money(batch)} &middot; per serving <b>${money(per)}</b>` +
+      (price ? ` &middot; cost ${pct((per / price) * 100)} &middot; margin ${money(price - per)}` : "");
+  }
+  $("#r-price").addEventListener("input", recalc);
+  $("#r-yield").addEventListener("input", recalc);
+  recalc();
+
+  v.appendChild(el(`<div class="btn-row" style="margin-top:.6rem">
+    <button class="btn btn-brass" id="r-save">Save</button>
+    ${id ? '<button class="btn btn-ghost" id="r-del">Delete</button>' : ""}
+    <button class="btn btn-ghost" id="r-cancel">Cancel</button>
+  </div>`));
+  $("#r-cancel").addEventListener("click", () => { location.hash = "#/recipes"; });
+  if (id) $("#r-del").addEventListener("click", async () => {
+    if (!confirm("Delete this recipe?")) return;
+    try { await api("DELETE", `/api/recipes/${id}`); location.hash = "#/recipes"; }
+    catch (e) { toast(e.message); }
+  });
+  $("#r-save").addEventListener("click", async () => {
+    const items = [...linesEl.querySelectorAll(".rrow")]
+      .map((row) => ({ product_id: row.querySelector(".ri-prod").value || null,
+                       qty: Number(row.querySelector(".ri-qty").value) || 0 }))
+      .filter((x) => x.product_id);
+    const name = $("#r-name").value.trim();
+    if (!name) { toast("Name the recipe."); return; }
+    const payload = { name, menu_price: Number($("#r-price").value) || 0,
+      yield_qty: Number($("#r-yield").value) || 1, notes: $("#r-notes").value, items };
+    try {
+      if (id) await api("PUT", `/api/recipes/${id}`, payload);
+      else await api("POST", "/api/recipes", payload);
+      location.hash = "#/recipes";
+    } catch (e) { toast(e.message); }
+  });
 }
 
 /* ---------- small format helpers ---------- */

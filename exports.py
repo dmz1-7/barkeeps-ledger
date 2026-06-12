@@ -9,6 +9,7 @@ import csv
 import io
 
 import money
+import recipes
 import reports
 from db import get_db, active_location_id
 
@@ -81,5 +82,19 @@ def order_guide_csv():
     out.append(("TOTAL", "", "", "", "", "", "", guide["grand_total"]))
     return _csv(
         ["Vendor", "Item", "Unit", "Par", "On Hand", "Order Qty", "Unit Cost", "Line Cost"],
+        out,
+    )
+
+
+def recipes_csv():
+    """Menu costing sheet: one row per recipe with cost, cost%, and margin."""
+    out = [
+        (r["name"], r["menu_price"], r["yield_qty"], r["batch_cost"],
+         r["cost_per_serving"], r["cost_pct"], r["margin"])
+        for r in recipes.list_costed()
+    ]
+    return _csv(
+        ["Recipe", "Menu Price", "Yield", "Batch Cost", "Cost/Serving",
+         "Cost %", "Margin"],
         out,
     )
