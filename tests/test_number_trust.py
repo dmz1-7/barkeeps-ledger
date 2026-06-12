@@ -1356,6 +1356,42 @@ class RecipeCosting(Base):
         self.assertEqual((rows[1][0], rows[1][3], rows[1][6]), ("Martini", "2.0", "10.0"))
 
 
+class CategoriesApi(Base):
+    """The category taxonomy admin (shared across stores) — backs the new UI."""
+
+    def test_create_appears_in_list(self):
+        r = self.client.post("/api/categories", json={"name": "Mezcal", "category_type": "Liquor"})
+        self.assertEqual(r.status_code, 200)
+        cats = self.client.get("/api/categories").get_json()
+        mez = [c for c in cats if c["name"] == "Mezcal"][0]
+        self.assertEqual(mez["category_type"], "Liquor")
+
+    def test_duplicate_name_rejected(self):
+        self.client.post("/api/categories", json={"name": "Mezcal", "category_type": "Liquor"})
+        r = self.client.post("/api/categories", json={"name": "Mezcal", "category_type": "Liquor"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_missing_name_or_type_rejected(self):
+        self.assertEqual(self.client.post(
+            "/api/categories", json={"name": "", "category_type": "Liquor"}).status_code, 400)
+        self.assertEqual(self.client.post(
+            "/api/categories", json={"name": "X", "category_type": ""}).status_code, 400)
+
+    def test_update_renames_and_retypes(self):
+        cid = self.client.post("/api/categories",
+                               json={"name": "Mezcal", "category_type": "Liquor"}).get_json()["id"]
+        self.client.put(f"/api/categories/{cid}", json={"name": "Agave", "category_type": "Other"})
+        c = [x for x in self.client.get("/api/categories").get_json() if x["id"] == cid][0]
+        self.assertEqual((c["name"], c["category_type"]), ("Agave", "Other"))
+
+    def test_archive_removes_from_list(self):
+        cid = self.client.post("/api/categories",
+                               json={"name": "Mezcal", "category_type": "Liquor"}).get_json()["id"]
+        self.client.delete(f"/api/categories/{cid}")
+        cats = self.client.get("/api/categories").get_json()
+        self.assertFalse(any(c["id"] == cid for c in cats))
+
+
 class UnitConvert(unittest.TestCase):
     def test_volume(self):
         self.assertAlmostEqual(units.convert(1, "l", "ml"), 1000.0)

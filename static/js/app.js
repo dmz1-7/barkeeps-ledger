@@ -214,6 +214,7 @@ const NAV = [
     children: [
       { label: "All Products", href: "#/products" },
       { label: "Recipes", href: "#/recipes" },
+      { label: "Categories", href: "#/categories" },
       { label: "New Item Review", href: "#/products/new" },
       { label: "Purchase Report", href: "#/products/purchase" },
     ] },
@@ -230,6 +231,7 @@ const SECTION_OF = {
   dashboard: "dashboard", orders: "orders", invoice: "orders",
   performance: "performance", vendors: "vendors", vendor: "vendors",
   products: "products", product: "products", recipes: "products",
+  categories: "products",
   inventory: "inventory", count: "inventory", settings: "settings",
 };
 
@@ -243,6 +245,7 @@ const ROUTES = {
   products: renderProducts,
   product: renderProductDetail,
   recipes: renderRecipes,
+  categories: renderCategoriesAdmin,
   inventory: renderInventory,
   count: renderCount,
   settings: renderSettings,
@@ -1825,6 +1828,76 @@ async function recipeEditor(id) {
       location.hash = "#/recipes";
     } catch (e) { toast(e.message); }
   });
+}
+
+/* ============================================================
+   CATEGORIES (taxonomy admin)
+   ============================================================ */
+async function renderCategoriesAdmin() {
+  const v = view();
+  const types = Object.keys(TYPE_CLASS);   // Food, Beer, Wine, Liquor, N/A Bev, Other
+  v.innerHTML = `<h2 class="section section-head">Categories</h2>`;
+  v.appendChild(el(`<div class="card"><div class="card-band">Add Category</div><div class="card-body">
+    <div class="row2">
+      <label class="fld"><span>Name</span><input id="c-name" placeholder="e.g. Mezcal"></label>
+      <label class="fld"><span>Type</span><select id="c-type">${types.map((t) => `<option>${esc(t)}</option>`).join("")}</select></label>
+    </div>
+    <button class="btn btn-brass btn-sm" id="c-add">Add</button>
+  </div></div>`));
+  const body = el(`<div id="cat-body"><div class="spinner"></div></div>`);
+  v.appendChild(body);
+
+  async function reload() {
+    CATEGORIES = null;            // bust the shared cache other screens read
+    body.innerHTML = '<div class="spinner"></div>';
+    let cats;
+    try { cats = await api("GET", "/api/categories"); }
+    catch (e) { body.innerHTML = `<p class="err">${esc(e.message)}</p>`; return; }
+    body.innerHTML = "";
+    types.forEach((t) => {
+      const inType = cats.filter((c) => c.category_type === t)
+        .sort((a, b) => (a.sort_order - b.sort_order) || a.name.localeCompare(b.name));
+      if (!inType.length) return;
+      const card = el(`<div class="card"><div class="card-band">${typePill(t)}</div><div class="card-body"></div></div>`);
+      const cb = card.querySelector(".card-body");
+      inType.forEach((c) => {
+        const row = el(`<div class="kv">
+          <input class="ce-name" value="${esc(c.name)}" style="flex:1;margin-right:.4rem">
+          <select class="ce-type">${types.map((tt) => `<option ${tt === t ? "selected" : ""}>${esc(tt)}</option>`).join("")}</select>
+          <button class="btn btn-sm btn-ghost ce-save">Save</button>
+          <button class="btn btn-sm btn-ghost ce-del">Archive</button>
+        </div>`);
+        row.querySelector(".ce-save").addEventListener("click", async () => {
+          const name = row.querySelector(".ce-name").value.trim();
+          if (!name) { toast("Name can’t be blank."); return; }
+          try {
+            await api("PUT", `/api/categories/${c.id}`,
+              { name, category_type: row.querySelector(".ce-type").value });
+            toast("Saved.");
+            reload();   // re-bucket under the (possibly new) type; also busts the cache
+          } catch (e) { toast(e.message); }
+        });
+        row.querySelector(".ce-del").addEventListener("click", async () => {
+          if (!confirm(`Archive "${c.name}"? Existing invoice lines keep their category.`)) return;
+          try { await api("DELETE", `/api/categories/${c.id}`); reload(); }
+          catch (e) { toast(e.message); }
+        });
+        cb.appendChild(row);
+      });
+      body.appendChild(card);
+    });
+  }
+
+  $("#c-add").addEventListener("click", async () => {
+    const name = $("#c-name").value.trim();
+    if (!name) { toast("Name the category."); return; }
+    try {
+      await api("POST", "/api/categories", { name, category_type: $("#c-type").value });
+      $("#c-name").value = "";
+      reload();
+    } catch (e) { toast(e.message); }
+  });
+  reload();
 }
 
 /* ---------- small format helpers ---------- */
