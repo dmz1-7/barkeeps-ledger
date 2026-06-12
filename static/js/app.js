@@ -501,7 +501,7 @@ async function loadDash() {
         ${pct(pa.min_pct)}+ vs their prior price, purchased in the last ${pa.lookback_days} days.</p>`));
       pa.alerts.forEach((a) => box.appendChild(el(
         `<div class="kv"><span>${esc(a.name)} <span class="muted">&middot; ${esc(a.vendor)}</span></span>
-          <b class="bad">${money(a.old_price)} &rarr; ${money(a.new_price)}
+          <b class="neg">${money(a.old_price)} &rarr; ${money(a.new_price)}
           <span class="muted">(+${pct(a.change_pct)})</span></b></div>`)));
       body.appendChild(ac);
     }
@@ -1838,7 +1838,7 @@ async function recipeEditor(id) {
     if (p.size_qty > 0 && unit && p.size_unit) {
       const used = convertUnit(qty, unit, p.size_unit);
       if (used !== null) return { dollars: uc * (used / p.size_qty), missing: false, unconverted: false };
-      return { dollars: qty * uc, missing: false, unconverted: !!qty };   // size set but unit didn't convert
+      return { dollars: 0, missing: false, unconverted: !!qty };   // size set but unit didn't convert: $0, flagged
     }
     return { dollars: qty * uc, missing: false, unconverted: false };     // no size: raw qty is correct
   };

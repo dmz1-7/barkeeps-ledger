@@ -162,9 +162,13 @@ def _open_mode_loopback_only():
                         "only. Set APP_PASSWORD to allow remote access."}), 403
     # remote_addr is loopback even when a reverse proxy / tunnel fronts us from
     # localhost, so the check above can't tell a real local client from a proxied
-    # remote one. A forwarded-for header (or a multi-hop access_route) means we're
+    # remote one. ANY forwarding header (or a multi-hop access_route) means we're
     # behind a proxy — refuse to serve open mode rather than trust a spoofable hop.
-    if request.headers.get("X-Forwarded-For") or len(request.access_route) > 1:
+    # Cover the common forwarders, not just X-Forwarded-For (cloudflared uses
+    # CF-Connecting-IP and doesn't populate access_route).
+    _PROXY_HEADERS = ("X-Forwarded-For", "CF-Connecting-IP", "X-Real-IP",
+                      "Forwarded", "True-Client-IP")
+    if len(request.access_route) > 1 or any(request.headers.get(h) for h in _PROXY_HEADERS):
         return jsonify({"error": "Running without authentication and detected behind "
                         "a proxy; refusing to serve. Set APP_PASSWORD."}), 403
 
@@ -430,7 +434,11 @@ def invoice_create():
     items = d.get("line_items")
     items = items if isinstance(items, list) else []
     vendor = _s(d.get("vendor"))
-    inv_date = _s(d.get("invoice_date"))
+    # Validate the date (400 on blank/non-ISO): an unvalidated invoice_date is
+    # compared lexically downstream, so a bad value would silently drop the invoice
+    # from COGS, the dashboard and every date-ranged report while still showing in
+    # date-agnostic totals — a number-trust inconsistency.
+    inv_date = str(cogs._iso_or_400(d.get("invoice_date")))
     database = db.get_db()
     loc = db.active_location_id()
     # Guard against logging the same delivery twice (a re-snapped photo or a
@@ -551,7 +559,11 @@ def invoice_update(inv_id):
     ).fetchone():
         abort(404, description="Not found.")
     vendor = _s(d.get("vendor"))
-    inv_date = _s(d.get("invoice_date"))
+    # Validate the date (400 on blank/non-ISO): an unvalidated invoice_date is
+    # compared lexically downstream, so a bad value would silently drop the invoice
+    # from COGS, the dashboard and every date-ranged report while still showing in
+    # date-agnostic totals — a number-trust inconsistency.
+    inv_date = str(cogs._iso_or_400(d.get("invoice_date")))
     database.execute(
         "UPDATE invoices SET vendor=?, invoice_date=?, invoice_number=?, category=?, "
         "subtotal=?, tax=?, total=?, notes=?, status=?, payment_account=? "
@@ -651,8 +663,11 @@ def inventory_delete(item_id):
 def order_list():
     """Items at or below par, with how many units to bring back up to par."""
     rows = db.get_db().execute(
+        # Match reports.order_guide's predicate (strict below-par, par>0) so the two
+        # reorder surfaces agree — no at-par $0 rows here that the guide omits.
         "SELECT * FROM inventory_items WHERE archived=0 AND location_id IS ? "
-        "AND last_count <= par_level ORDER BY category, name", (db.active_location_id(),)
+        "AND par_level > 0 AND COALESCE(last_count,0) < par_level "
+        "ORDER BY category, name", (db.active_location_id(),)
     ).fetchall()
     out = []
     for r in rows:

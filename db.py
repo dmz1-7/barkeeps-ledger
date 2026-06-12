@@ -305,6 +305,11 @@ def get_db():
         if DB_PATH not in _SCHEMA_READY:
             try:
                 _ensure_columns(conn)
+                # Populate any newly-added location-scoped column on existing rows
+                # too (init_db does this, but a long-running process can hit the
+                # self-heal first): a NULL location_id would make rows invisible to
+                # every `location_id IS ?` tenant query until the next restart.
+                _backfill_location_ids(conn)
                 _apply_post_indexes(conn)   # composite indexes (+ guarded unique constraint)
                 conn.commit()
                 _SCHEMA_READY.add(DB_PATH)   # only mark ready if it actually succeeded

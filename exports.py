@@ -8,6 +8,7 @@ spreadsheet; category totals are summed exactly via money.sum_dollars.
 import csv
 import io
 
+import cogs
 import money
 import recipes
 import reports
@@ -63,21 +64,25 @@ def purchases_csv(start, end):
 
 
 def category_summary_csv(start, end):
-    """Spend by Category Type -> Category for the range, with a grand-total row."""
-    db = get_db()
-    rows = db.execute(
-        "SELECT c.category_type AS ctype, c.name AS category, "
-        "       COALESCE(SUM(ii.total), 0) AS amt "
+    """Spend by Category Type -> Category for the range, with a grand-total row.
+
+    Deflated to the PRE-TAX line basis (via cogs._pretax_line_rows) so this export
+    ties out exactly to the on-screen Category Report and the Controllable P&L for
+    tax-inclusive vendors, instead of carrying the tax in the category spend."""
+    rows = get_db().execute(
+        "SELECT inv.id AS iid, inv.subtotal AS sub, inv.total AS tot, inv.tax AS tax, "
+        "       c.category_type AS ctype, c.name AS category, ii.total AS amt "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN categories c ON c.id = ii.category_id "
-        "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ? "
-        "GROUP BY c.category_type, c.name "
-        "ORDER BY c.category_type, c.name",
+        "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ?",
         (active_location_id(), start.isoformat(), end.isoformat()),
     ).fetchall()
-    out = [(r["ctype"] or "Uncategorized", r["category"] or "Uncategorized",
-            money.normalize(r["amt"]) or 0) for r in rows]
-    out.append(("", "TOTAL", money.sum_dollars(r["amt"] for r in rows)))
+    cents = {}   # (ctype, category) -> integer cents
+    for r, amt in cogs._pretax_line_rows(rows):
+        key = (r["ctype"] or "Uncategorized", r["category"] or "Uncategorized")
+        cents[key] = cents.get(key, 0) + money.to_cents(amt)
+    out = [(ctype, cat, round(c / 100.0, 2)) for (ctype, cat), c in sorted(cents.items())]
+    out.append(("", "TOTAL", round(sum(cents.values()) / 100.0, 2)))
     return _csv(["Category Type", "Category", "Total"], out)
 
 

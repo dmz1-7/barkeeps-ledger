@@ -77,19 +77,26 @@ def category_report(start, end, vendor=None, status=None, search=None):
                                             line_sum.get(inv["id"], 0.0), inv["tax"]) for inv in invs}
     cell = {k: v * factor.get(k[0], 1.0) for k, v in cell.items()}
 
-    # id 0 = an "Uncategorized" column for line items with category_id NULL, so
-    # their spend is counted in column_totals/grand_total (otherwise the Category
-    # Report's grand_total silently undershoots the invoice totals and disagrees
-    # with the Controllable P&L, which DOES include uncategorized cost).
+    # id 0 = an "Uncategorized" column. It catches line items with category_id
+    # NULL **and** any line booked to a category that is no longer active (archived
+    # or otherwise not a displayed column). Without that, spend on an archived
+    # category would be silently dropped from column_totals AND grand_total, making
+    # the Category Report under-report purchases and disagree with the Controllable
+    # P&L (which counts that spend under its type regardless of archive state).
+    active_ids = {c["id"] for c in cats}
     col_ids = [c["id"] for c in cats] + [0]
     col_cents = {cid: 0 for cid in col_ids}   # accumulate in integer cents (no float drift)
+    row_cents = {}                            # iid -> {col_id: cents}
+    for (iid, cid), amt in cell.items():
+        col = cid if cid in active_ids else 0   # NULL / archived / unknown -> Uncategorized
+        c = money.to_cents(amt)
+        col_cents[col] += c
+        rc = row_cents.setdefault(iid, {})
+        rc[col] = rc.get(col, 0) + c
     rows = []
     for inv in invs:
-        cells = {}
-        for cid in col_ids:
-            amt = cell.get((inv["id"], None if cid == 0 else cid), 0.0)
-            col_cents[cid] += money.to_cents(amt)
-            cells[cid] = round(amt, 2)   # display rounding only; totals use cents
+        rc = row_cents.get(inv["id"], {})
+        cells = {cid: round(rc.get(cid, 0) / 100.0, 2) for cid in col_ids}
         rows.append({**dict(inv), "cells": cells})
 
     cats_out = [dict(c) for c in cats] + [

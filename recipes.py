@@ -31,6 +31,11 @@ def _line_cost(qty, line_unit, unit_cost, size_qty, size_unit):
         used = units.convert(qty, line_unit, size_unit)
         if used is not None:
             return unit_cost * (used / size_qty), True
+        # Size present but the recipe unit is a different dimension (won't convert).
+        # Multiplying qty (recipe unit) by unit_cost (per PURCHASE unit) would inflate
+        # the line ~size_qty-fold, so contribute $0 and flag it (converted=False)
+        # rather than feed a wildly wrong cost into batch_cost/cost%/margin.
+        return 0.0, False
     return qty * unit_cost, False
 
 
