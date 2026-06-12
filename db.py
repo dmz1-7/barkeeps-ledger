@@ -270,6 +270,7 @@ def get_db():
         if DB_PATH not in _SCHEMA_READY:
             try:
                 _ensure_columns(conn)
+                conn.executescript(POST_INDEXES)   # composite indexes on the added columns
                 conn.commit()
                 _SCHEMA_READY.add(DB_PATH)   # only mark ready if it actually succeeded
             except sqlite3.OperationalError:
@@ -351,7 +352,11 @@ def _predrop_legacy_sales_mix(conn):
     rows are user-entered P&L income mix — NOT transient — so they're preserved
     and re-inserted by _restore_legacy_sales_mix (tagged location_id=0, which
     _migrate_locations then maps to the default store)."""
-    conn.execute("DROP TABLE IF EXISTS _sales_mix_legacy")
+    # If a prior init_db crashed between the rename and the restore, the temp
+    # table still holds the user's rows — DON'T drop it; leave it for
+    # _restore_legacy_sales_mix to recover this run.
+    if {r["name"] for r in conn.execute("PRAGMA table_info(_sales_mix_legacy)")}:
+        return
     info = list(conn.execute("PRAGMA table_info(sales_mix)"))
     cols = {r["name"] for r in info}
     # Rebuild if the table predates location_id OR still carries the legacy

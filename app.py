@@ -80,6 +80,16 @@ def body():
 # --- auth -------------------------------------------------------------------
 # Single shared passcode for a personal tool. Set APP_PASSWORD to enable it;
 # leave it unset to run open (fine on a private LAN, noted in the README).
+#
+# Design tradeoffs, deliberate for a single-user self-hosted app (not bugs):
+#  * The bearer token is HMAC(secret, passcode) — deterministic and non-expiring.
+#    There's one user and one passcode; rotating APP_SECRET invalidates all
+#    tokens (tested). A random session-id + TTL store would add a moving part
+#    without a real benefit at this scale.
+#  * app_secret and the Square token live in the SQLite file in plaintext,
+#    protected by filesystem permissions (the DB also holds all the business
+#    data). Encrypting them needs a key stored outside data/, which just moves
+#    the secret — not worth it for a self-hosted personal tool.
 
 def _app_secret():
     """The key the session token is signed with. Prefer an explicit APP_SECRET;
@@ -604,9 +614,13 @@ def count_save():
     lines = lines if isinstance(lines, list) else []
     database = db.get_db()
     loc = db.active_location_id()
+    # Stamp the count on the BUSINESS day (5am ET), not UTC — usage-COGS brackets
+    # counts by date, and a UTC default would put a late-evening-ET count on the
+    # wrong calendar day vs. how the rest of the app dates things.
+    taken_at = square_client.business_today().isoformat() + " 12:00:00"
     cur = database.execute(
-        "INSERT INTO counts(location_id, note, value) VALUES(?, ?, 0)",
-        (loc, _s(d.get("note"))),
+        "INSERT INTO counts(location_id, note, value, taken_at) VALUES(?, ?, 0, ?)",
+        (loc, _s(d.get("note")), taken_at),
     )
     count_id = cur.lastrowid
     total_value = 0.0
@@ -757,9 +771,9 @@ def vendor_update(vid):
               "order_days", "notes", "archived"]
     sets, vals = [], []
     for key in fields:
-        if key in d and _scalar(d[key]):
+        if key in d:
             sets.append(f"{key}=?")
-            vals.append(d[key])
+            vals.append(_coerce_col(key, d[key]))
     if not sets:
         return jsonify({"ok": True})
     vals += [vid, db.active_location_id()]

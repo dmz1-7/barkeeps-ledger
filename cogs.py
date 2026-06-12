@@ -145,7 +145,10 @@ def summary(start, end):
         # inflate COGS%. Otherwise fall back to range sales.
         interval_days = (e_date - b_date).days + 1
         if daily and len(daily) == interval_days:
-            interval_sales = round(sum(daily.values()), 2)
+            # Purchases are summed over (b_date, e_date] (exclusive of the opening
+            # count day), so match the sales denominator: drop b_date's sales.
+            b_iso = b_date.isoformat()
+            interval_sales = round(sum(v for day, v in daily.items() if day > b_iso), 2)
             if interval_sales:
                 cogs_sales, cogs_sales_basis = interval_sales, "interval"
 

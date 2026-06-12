@@ -122,45 +122,45 @@ def controllable_pl(start, end):
     total_income = _r(sales)
 
     # COGS by category type -> category, from invoice lines in the period.
+    # Accumulate in integer cents (no float-SUM drift), matching cogs.purchases.
     cogs_rows = db.execute(
-        "SELECT c.category_type AS ctype, c.name AS category, "
-        "       COALESCE(SUM(ii.total),0) AS amt "
+        "SELECT c.category_type AS ctype, c.name AS category, ii.total AS amt "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN categories c ON c.id = ii.category_id "
-        "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ? "
-        "GROUP BY c.category_type, c.name",
+        "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ?",
         (loc, start.isoformat(), end.isoformat()),
     ).fetchall()
 
     by_type = {}
     for r in cogs_rows:
         ctype = r["ctype"] or "Uncategorized"
-        by_type.setdefault(ctype, {"total": 0.0, "categories": []})
-        by_type[ctype]["total"] += r["amt"] or 0
-        by_type[ctype]["categories"].append({
-            "category": r["category"] or "Uncategorized",
-            "amt": _r(r["amt"]),
-        })
+        cat = r["category"] or "Uncategorized"
+        bt = by_type.setdefault(ctype, {"total_c": 0, "cats_c": {}})
+        cents = money.to_cents(r["amt"])
+        bt["total_c"] += cents
+        bt["cats_c"][cat] = bt["cats_c"].get(cat, 0) + cents
 
     ordered_types = CATEGORY_TYPES + [t for t in by_type if t not in CATEGORY_TYPES]
     cogs = []
-    total_cogs = 0.0
+    total_cogs_c = 0
     for t in ordered_types:
         if t not in by_type:
             continue
+        bt = by_type[t]
         type_income = income_by_type.get(t, 0)
-        type_total = _r(by_type[t]["total"])
-        total_cogs += type_total
-        for c in by_type[t]["categories"]:
-            c["pct"] = _r(c["amt"] / type_income * 100) if type_income else None
+        type_total = round(bt["total_c"] / 100.0, 2)
+        total_cogs_c += bt["total_c"]
+        cats = [{"category": cat, "amt": round(c / 100.0, 2),
+                 "pct": _r(round(c / 100.0, 2) / type_income * 100) if type_income else None}
+                for cat, c in bt["cats_c"].items()]
         cogs.append({
             "category_type": t,
             "type_total": type_total,
             "type_pct": _r(type_total / type_income * 100) if type_income else None,
-            "categories": sorted(by_type[t]["categories"], key=lambda x: -x["amt"]),
+            "categories": sorted(cats, key=lambda x: -x["amt"]),
         })
 
-    total_cogs = _r(total_cogs)
+    total_cogs = round(total_cogs_c / 100.0, 2)
     gross = _r(total_income - total_cogs)
     controllable = _r(gross - labor)
 

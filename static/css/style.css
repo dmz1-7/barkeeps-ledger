@@ -213,9 +213,11 @@ h2.section, .section-head {
 }
 .stat .value { font-weight: 500; font-size: 2rem; line-height: 1.1; margin-top: 6px; }
 .stat .sub { font-size: .82rem; color: var(--muted); margin-top: 4px; }
-/* the old per-tile accent stripes collapse to a single left accent on the
-   primary tiles; keep semantics via value coloring below */
-.stat.accent-ox, .stat.accent-grn, .stat.accent-ind { border-left: 2px solid var(--accent); }
+/* primary tiles carry a thin left accent; distinct semantic hues (these are
+   data indicators, not UI chrome, so they use the status tokens) */
+.stat.accent-ind { border-left: 2px solid var(--accent); }   /* sales */
+.stat.accent-ox  { border-left: 2px solid var(--warn); }     /* COGS */
+.stat.accent-grn { border-left: 2px solid var(--ok); }       /* labor */
 
 .value.good { color: var(--ok); }
 .value.warn { color: var(--warn); }
