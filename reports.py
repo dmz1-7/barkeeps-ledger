@@ -47,7 +47,7 @@ def category_report(start, end, vendor=None, status=None, search=None):
         where.append("(vendor LIKE ? OR invoice_number LIKE ?)")
         params += [f"%{search}%", f"%{search}%"]
     invs = db.execute(
-        "SELECT id, invoice_date, invoice_number, vendor, status, subtotal, total "
+        "SELECT id, invoice_date, invoice_number, vendor, status, subtotal, total, tax "
         f"FROM invoices WHERE {' AND '.join(where)} "
         "ORDER BY invoice_date DESC, id DESC",
         params,
@@ -74,7 +74,7 @@ def category_report(start, end, vendor=None, status=None, search=None):
     for (iid, _cid), amt in cell.items():
         line_sum[iid] = line_sum.get(iid, 0.0) + amt
     factor = {inv["id"]: pretax_factor(inv["subtotal"], inv["total"],
-                                            line_sum.get(inv["id"], 0.0)) for inv in invs}
+                                            line_sum.get(inv["id"], 0.0), inv["tax"]) for inv in invs}
     cell = {k: v * factor.get(k[0], 1.0) for k, v in cell.items()}
 
     # id 0 = an "Uncategorized" column for line items with category_id NULL, so
@@ -137,7 +137,7 @@ def controllable_pl(start, end):
     # COGS by category type -> category, from invoice lines in the period, on the
     # PRE-TAX basis (deflate tax-inclusive invoices) and summed in integer cents.
     cogs_rows = db.execute(
-        "SELECT inv.id AS iid, inv.subtotal AS sub, inv.total AS tot, "
+        "SELECT inv.id AS iid, inv.subtotal AS sub, inv.total AS tot, inv.tax AS tax, "
         "       c.category_type AS ctype, c.name AS category, ii.total AS amt "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN categories c ON c.id = ii.category_id "

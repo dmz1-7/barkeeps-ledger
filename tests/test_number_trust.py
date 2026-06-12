@@ -1430,8 +1430,8 @@ class UnitTableParity(unittest.TestCase):
         path = os.path.join(os.path.dirname(__file__), "..", "static", "js", "app.js")
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
-        m = re.search(r"const " + varname + r"\s*=\s*\{(.*?)\};", src)
-        self.assertIsNotNone(m, f"{varname} not found in app.js")
+        m = re.search(r"const " + varname + r"\s*=\s*\{(.*?)\};", src, re.DOTALL)
+        self.assertIsNotNone(m, f"{varname} not found in app.js")   # DOTALL: tolerate multi-line literals
         pairs = re.findall(r'(?:"([^"]+)"|([A-Za-z][\w ]*?))\s*:', m.group(1))
         return {(a or b).strip() for a, b in pairs}
 
@@ -1590,7 +1590,8 @@ class AuthGateCoverage(Base):
         super().tearDown()
 
     def test_tokenless_data_endpoints_401(self):
-        for ep in ("/api/dashboard", "/api/invoices", "/api/counts"):
+        # /uploads/ serves raw invoice photos — assert it's gated too, not just /api/
+        for ep in ("/api/dashboard", "/api/invoices", "/api/counts", "/uploads/x.jpg"):
             self.assertEqual(self.client.get(ep).status_code, 401)
 
     def test_config_open_but_minimal_pre_login(self):
@@ -2191,7 +2192,8 @@ class UnitFactorParity(unittest.TestCase):
         path = os.path.join(os.path.dirname(__file__), "..", "static", "js", "app.js")
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
-        m = re.search(r"const " + varname + r"\s*=\s*\{(.*?)\};", src)
+        m = re.search(r"const " + varname + r"\s*=\s*\{(.*?)\};", src, re.DOTALL)
+        self.assertIsNotNone(m, f"{varname} not found in app.js")   # guard: don't AttributeError on None
         out = {}
         for k1, k2, val in re.findall(r'(?:"([^"]+)"|([A-Za-z][\w ]*?))\s*:\s*([\d.]+)', m.group(1)):
             out[(k1 or k2).strip()] = float(val)
@@ -3254,6 +3256,114 @@ class RecipeUnconvertedOnlyGenuineMismatch(Base):
             "items": [{"product_id": lime, "qty": 2, "unit": "each"},
                       {"product_id": gin, "qty": 2, "unit": "g"}]}).get_json()
         self.assertEqual(r["unconverted_lines"], 1)         # only the gin g->ml mismatch, not the lime
+
+
+# ============================================================================
+# Thirteenth audit-fix regression tests (2026-06-12, 13th re-audit)
+# ============================================================================
+
+class UniqueSqidMigrationGuard(Base):
+    def test_duplicate_sqid_does_not_brick_migration(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("DROP INDEX IF EXISTS uq_locations_sqid")
+            d.execute("INSERT INTO locations(name, square_location_id) VALUES('A','DUP')")
+            d.execute("INSERT INTO locations(name, square_location_id) VALUES('B','DUP')")
+            d.commit()
+            # re-running the migration over a pre-existing duplicate must NOT raise
+            db._apply_post_indexes(d)
+            d.commit()
+            # the functional indexes still got created despite the unique-index skip
+            idx = {r["name"] for r in d.execute("PRAGMA index_list(invoices)")}
+        self.assertIn("idx_invoices_loc_date", idx)
+
+
+class UsageCogsZeroCountGuard(Base):
+    def test_zero_closing_count_falls_back_to_purchases(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("INSERT INTO counts(location_id,taken_at,value) VALUES(1,'2026-06-01 12:00:00',1000)")
+            d.execute("INSERT INTO counts(location_id,taken_at,value) VALUES(1,'2026-06-30 12:00:00',0)")  # forgotten/empty
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-15',500)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',500)", (iid,))
+            d.commit()
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "get_sales",
+                                      return_value={"sales": 2000.0, "orders": 1, "error": None}), \
+                    mock.patch.object(square_client, "get_labor", return_value=dict(_LABOR0)):
+                s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(s["cogs_method"], "purchases")   # a $0 bracket is not trusted
+        self.assertEqual(s["cogs"], 500.0)                 # purchases basis, not 1000+500-0=1500
+
+
+class PretaxNoSubtotal(Base):
+    def test_tax_inclusive_without_subtotal_still_deflates(self):
+        with flask_app.app_context():
+            d = get_db()
+            # tax + total recorded, NO subtotal (common AI/manual case); line tax-inclusive
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,subtotal,tax,total) "
+                            "VALUES(1,'V','2026-06-05',NULL,8,108)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'a',108)", (iid,))
+            d.commit()
+            p = cogs.purchases(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+            cr = reports.category_report(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(p["total"], 100.0)        # base = total - tax = 100; tax stripped from COGS
+        self.assertEqual(cr["grand_total"], 100.0)
+
+
+class CategoryUpdateMissing(Base):
+    def test_nonexistent_category_update_is_404(self):
+        r = self.client.put("/api/categories/999999", json={"name": "X", "category_type": "Food"})
+        self.assertEqual(r.status_code, 404)
+
+
+class CogsIncludesAllStatuses(Base):
+    def test_non_closed_invoice_still_counts_in_cogs(self):
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total,status) "
+                            "VALUES(1,'V','2026-06-05',200,'processing')").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',200)", (iid,))
+            d.commit()
+            p = cogs.purchases(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+            pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        # pin all-statuses behavior so a future per-view status filter can't silently diverge
+        self.assertEqual(p["total"], 200.0)
+        self.assertEqual(pl["total_cogs"], 200.0)
+
+
+class UsageCogsRealCacheToday(Base):
+    """End-to-end: summary() drives the REAL daily_sales_cached refetch/merge for an
+    interval that includes today, exercising the today/yesterday stale refetch."""
+    def test_interval_basis_through_real_cache_for_today_interval(self):
+        with flask_app.app_context():
+            d = get_db()
+            today = square_client.business_today()
+            b = today - dt.timedelta(days=5)
+            for day, val in ((b, 1000.0), (today, 700.0)):
+                d.execute("INSERT INTO counts(location_id,taken_at,value) VALUES(1,?,?)",
+                          (f"{day.isoformat()} 12:00:00", val))
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V',?,500)", ((b + dt.timedelta(days=2)).isoformat(),)).lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',500)", (iid,))
+            # seed the cache for every interval day EXCEPT today + yesterday (the stale window)
+            for n in range(2, 6):
+                day = (today - dt.timedelta(days=n)).isoformat()
+                d.execute("INSERT INTO daily_sales(square_location_id,date,net_sales,fetched_at) "
+                          "VALUES(?,?,?, '2020-01-01')", (_DC_SQID, day, 100.0))
+            d.commit()
+            db.set_setting("square_token", "tok")
+            fresh = {today.isoformat(): 100.0, (today - dt.timedelta(days=1)).isoformat(): 100.0}
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "get_sales",
+                                      return_value={"sales": 3000.0, "orders": 1, "error": None}), \
+                    mock.patch.object(square_client, "get_labor", return_value=dict(_LABOR0)), \
+                    mock.patch.object(square_client, "get_daily_sales", return_value=fresh):
+                s = cogs.summary(b, today)
+        # the cache+fetch layer covered every interval day, so the interval basis is trusted
+        self.assertEqual(s["cogs_sales_basis"], "interval")
+        self.assertEqual(s["cogs_method"], "usage")
 
 
 if __name__ == "__main__":

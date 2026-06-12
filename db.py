@@ -216,16 +216,34 @@ CREATE INDEX IF NOT EXISTS idx_recipeitems_product ON recipe_items(product_id);
 -- Case-insensitive product-name seek: the MarginEdge importer resolves each row
 -- with lower(name)=lower(?) per store; without this, every row is a per-store scan.
 CREATE INDEX IF NOT EXISTS idx_inv_loc_name ON inventory_items(location_id, name COLLATE NOCASE);
--- One Square location id per store: the daily_sales cache + sales/labor pulls key
--- on it, so a duplicate would cross-pollute two stores' Square numbers. Partial,
--- so blank/NULL ids (stores not yet wired to Square) don't collide.
-CREATE UNIQUE INDEX IF NOT EXISTS uq_locations_sqid ON locations(square_location_id)
-    WHERE COALESCE(square_location_id, '') <> '';
 -- Drop the redundant date-only invoice index: every invoice query also scopes by
 -- location_id, so idx_invoices_loc_date (location_id, invoice_date) already covers
 -- it and the single-column index only added write cost.
 DROP INDEX IF EXISTS idx_invoices_date;
 """
+
+# Applied separately from POST_INDEXES: creating a UNIQUE index can raise
+# IntegrityError (not OperationalError) if a legacy/corrupt DB already holds a
+# duplicate. That must NOT abort the rest of the migration or crash startup —
+# it's a safety-net constraint, so on a pre-existing dup we log and carry on.
+POST_UNIQUE = (
+    # One Square location id per store: the daily_sales cache + sales/labor pulls
+    # key on it, so a duplicate would cross-pollute two stores' Square numbers.
+    # Partial, so blank/NULL ids (stores not yet wired to Square) don't collide.
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_locations_sqid ON locations(square_location_id) "
+    "WHERE COALESCE(square_location_id, '') <> ''"
+)
+
+
+def _apply_post_indexes(conn):
+    """Run the functional index migration, then the unique constraint guardedly so
+    a pre-existing duplicate can't brick the app (see POST_UNIQUE)."""
+    conn.executescript(POST_INDEXES)
+    try:
+        conn.execute(POST_UNIQUE)
+    except sqlite3.IntegrityError:
+        print("  [!] uq_locations_sqid not applied: a duplicate square_location_id "
+              "already exists. Fix the duplicate to restore Square-number isolation.")
 
 # The seeded two-level taxonomy: {Category Type: [Category, ...]}. Order within
 # each list is the display sort order. Drives the Category Report, Purchase
@@ -287,7 +305,7 @@ def get_db():
         if DB_PATH not in _SCHEMA_READY:
             try:
                 _ensure_columns(conn)
-                conn.executescript(POST_INDEXES)   # composite indexes on the added columns
+                _apply_post_indexes(conn)   # composite indexes (+ guarded unique constraint)
                 conn.commit()
                 _SCHEMA_READY.add(DB_PATH)   # only mark ready if it actually succeeded
             except sqlite3.OperationalError:
@@ -522,7 +540,7 @@ def init_db():
     conn.executescript(SCHEMA)
     _restore_legacy_sales_mix(conn)
     _ensure_columns(conn)
-    conn.executescript(POST_INDEXES)
+    _apply_post_indexes(conn)
     # Seed any default settings not already present, and pull the (global) token
     # from env. The Square *location* is per-store now, so it's seeded onto the
     # store row below rather than into a global setting.

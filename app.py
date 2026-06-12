@@ -911,9 +911,11 @@ def category_update(cid):
     if sets:
         vals.append(cid)
         try:
-            db.get_db().execute(f"UPDATE categories SET {','.join(sets)} WHERE id=?", vals)
+            cur = db.get_db().execute(f"UPDATE categories SET {','.join(sets)} WHERE id=?", vals)
         except Exception:
             return jsonify({"error": "That category already exists."}), 400   # UNIQUE(name)
+        if cur.rowcount == 0:   # unknown/archived id -> 404, like every sibling update
+            abort(404, description="Not found.")
         db.get_db().commit()
     return jsonify({"ok": True})
 
