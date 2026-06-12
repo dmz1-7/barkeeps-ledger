@@ -441,3 +441,12 @@ table.dtable { width: 100%; border-collapse: collapse; font-size: .92rem; }
 .pl .pl-pct { font-family: var(--f-num); color: var(--ink-soft); width: 4.5rem; text-align: right; }
 .pl .pl-row.grand { font-family: var(--f-display); color: var(--teal-dk); font-size: 1.05rem; }
 .neg { color: var(--red); }
+
+/* Invoice line-item reconciliation readout (form + detail). */
+.recon {
+  font-family: var(--f-num); font-size: .92rem; font-weight: 600;
+  padding: .55rem .75rem; border-radius: 10px; margin: .2rem 0 .6rem;
+}
+.recon:empty { display: none; }
+.recon-ok   { color: var(--teal-dk); background: var(--mint); border: 2px solid var(--teal); }
+.recon-warn { color: var(--maroon); background: #fbe3d6; border: 2px solid var(--red); }

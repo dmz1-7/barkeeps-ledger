@@ -282,6 +282,8 @@ def invoice_get(inv_id):
     ).fetchall()
     out = dict(row)
     out["line_items"] = [dict(i) for i in items]
+    out["reconciliation"] = _reconcile(
+        row["subtotal"], row["tax"], row["total"], out["line_items"])
     return jsonify(out)
 
 
@@ -301,6 +303,45 @@ def invoice_delete(inv_id):
         except OSError:
             pass
     return jsonify({"ok": True})
+
+
+@app.put("/api/invoices/<int:inv_id>")
+def invoice_update(inv_id):
+    """Edit a saved invoice: update the header and replace its line items. Lets
+    the owner fix an AI misparse instead of delete-and-re-enter. The image and
+    the original AI audit (raw_json) are preserved."""
+    d = request.json or {}
+    database = db.get_db()
+    loc = db.active_location_id()
+    if not database.execute(
+        "SELECT 1 FROM invoices WHERE id=? AND location_id IS ?", (inv_id, loc)
+    ).fetchone():
+        abort(404)
+    vendor = d.get("vendor", "")
+    inv_date = d.get("invoice_date", "")
+    database.execute(
+        "UPDATE invoices SET vendor=?, invoice_date=?, invoice_number=?, category=?, "
+        "subtotal=?, tax=?, total=?, notes=?, status=?, payment_account=? "
+        "WHERE id=? AND location_id IS ?",
+        (vendor, inv_date, d.get("invoice_number", ""), d.get("category"),
+         _f(d.get("subtotal")), _f(d.get("tax")), _f(d.get("total")),
+         d.get("notes", ""), d.get("status", "closed"), d.get("payment_account"),
+         inv_id, loc),
+    )
+    items = d.get("line_items") or []
+    database.execute("DELETE FROM invoice_items WHERE invoice_id=?", (inv_id,))
+    for it in items:
+        vi_id, cat_id = _resolve_vendor_item(database, vendor, inv_date, it, loc)
+        database.execute(
+            "INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, "
+            "vendor_item_id, category_id) VALUES(?,?,?,?,?,?,?,?)",
+            (inv_id, it.get("name", ""), _f(it.get("qty")), it.get("unit"),
+             _f(it.get("unit_cost")), _f(it.get("total")), vi_id, cat_id),
+        )
+    database.commit()
+    return jsonify({"id": inv_id,
+                    "reconciliation": _reconcile(d.get("subtotal"), d.get("tax"),
+                                                 d.get("total"), items)})
 
 
 # --- inventory --------------------------------------------------------------
@@ -898,6 +939,35 @@ def _category_id_by_name(database, name):
     return r["id"] if r else None
 
 
+def _reconcile(subtotal, tax, total, line_items):
+    """Sanity-check that the line items represent the invoice, so an AI misparse
+    (a missing or mis-keyed line) is visible instead of silently skewing the
+    category breakdown that feeds the reports.
+
+    Vendors print line totals either tax-exclusive (summing to the subtotal) or
+    tax-inclusive (summing to the grand total), so a match to EITHER base counts
+    as reconciled. Returns {line_sum, expected, delta, ok}; ok is None when
+    there's nothing to compare (no amounts, or a header-only invoice with no
+    line items)."""
+    items = line_items or []
+    line_sum = round(sum((_f(li.get("total"), 0) or 0) for li in items), 2)
+    sub, tot, tx = _f(subtotal), _f(total), (_f(tax) or 0)
+    targets = []
+    if sub is not None:
+        targets.append(round(sub, 2))
+    if tot is not None:
+        targets.append(round(tot, 2))
+        if tx:
+            targets.append(round(tot - tx, 2))   # pre-tax base when lines exclude tax
+    if not targets or not items:
+        return {"line_sum": line_sum, "expected": (targets[0] if targets else None),
+                "delta": None, "ok": None}
+    expected = min(targets, key=lambda t: abs(line_sum - t))   # whichever convention fits
+    delta = round(line_sum - expected, 2)
+    tol = max(0.02, abs(expected) * 0.005)   # tolerate penny rounding; flag a real gap
+    return {"line_sum": line_sum, "expected": expected, "delta": delta, "ok": abs(delta) <= tol}
+
+
 def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, total):
     """Return a brief {id, vendor, invoice_date, invoice_number, total} for an
     existing invoice in this location that looks like the same one, else None.
@@ -942,10 +1012,14 @@ def _resolve_vendor_item(database, vendor, inv_date, line, loc):
         (loc, vendor or "", name),
     ).fetchone()
     if row:
+        # Only advance the last-purchase price/date when this invoice is at least
+        # as recent as what's recorded, so editing (or backfilling) an OLDER
+        # invoice can't roll the latest price backwards.
         database.execute(
             "UPDATE vendor_items SET last_purchase_date=?, last_purchase_price=?, "
-            "category_id=COALESCE(category_id, ?) WHERE id=?",
-            (inv_date, price, cat_id, row["id"]),
+            "category_id=COALESCE(category_id, ?) "
+            "WHERE id=? AND (last_purchase_date IS NULL OR last_purchase_date <= ?)",
+            (inv_date, price, cat_id, row["id"], inv_date),
         )
         return row["id"], (row["category_id"] or cat_id)
     vrow = database.execute(

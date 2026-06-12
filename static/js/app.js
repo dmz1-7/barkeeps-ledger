@@ -220,6 +220,14 @@ function route() {
 }
 window.addEventListener("hashchange", route);
 
+// Navigate, re-rendering even when the target hash equals the current one
+// (forms opened imperatively leave the hash unchanged, so a plain assignment
+// would fire no hashchange and the view would stay stuck on the form).
+function go(hash) {
+  if (location.hash === hash) route();
+  else location.hash = hash;
+}
+
 function closeDrawer() {
   $("#sidebar").classList.remove("open");
   $("#scrim").classList.add("hidden");
@@ -518,50 +526,93 @@ async function onPhoto(e) {
   }
 }
 
-async function openInvoiceForm(parsed, imagePath, warn) {
-  parsed = parsed || { vendor: "", invoice_date: "", invoice_number: "", subtotal: null, tax: null, total: null, line_items: [] };
+// parsed: AI/blank data for a NEW invoice. existing: a saved invoice to EDIT
+// (PUT instead of POST, prefilled, no duplicate prompt).
+async function openInvoiceForm(parsed, imagePath, warn, existing) {
   await loadCategories();
+  const editing = !!existing;
+  const src = existing || parsed ||
+    { vendor: "", invoice_date: "", invoice_number: "", subtotal: null, tax: null, total: null, line_items: [] };
+  imagePath = editing ? src.image_path : imagePath;
+  // Saved line items carry category_id; the picker keys on the category name.
+  const catNameById = {};
+  (CATEGORIES || []).forEach((c) => { catNameById[c.id] = c.name; });
+  const lineItems = (src.line_items || []).map((li) =>
+    ({ ...li, category: li.category != null ? li.category : (catNameById[li.category_id] || null) }));
   const v = view();
   v.innerHTML = "";
   v.appendChild(el(`
-    <h2 class="section section-head">Confirm Invoice</h2>
+    <h2 class="section section-head">${editing ? "Edit Invoice" : "Confirm Invoice"}</h2>
     ${warn ? `<div class="note">${esc(warn)} — enter the details by hand.</div>` : ""}
     ${imagePath ? `<img class="thumb-lg" src="/uploads/${esc(imagePath)}" alt="invoice">` : ""}
     <div class="card"><div class="card-body">
-      <label class="fld"><span>Vendor</span><input id="f-vendor" list="vendor-list" value="${esc(parsed.vendor)}"><datalist id="vendor-list"></datalist></label>
+      <label class="fld"><span>Vendor</span><input id="f-vendor" list="vendor-list" value="${esc(src.vendor || "")}"><datalist id="vendor-list"></datalist></label>
       <div class="row2">
-        <label class="fld"><span>Date</span><input type="date" id="f-date" value="${esc(parsed.invoice_date)}"></label>
-        <label class="fld"><span>Invoice #</span><input id="f-num" value="${esc(parsed.invoice_number)}"></label>
+        <label class="fld"><span>Date</span><input type="date" id="f-date" value="${esc(src.invoice_date || "")}"></label>
+        <label class="fld"><span>Invoice #</span><input id="f-num" value="${esc(src.invoice_number || "")}"></label>
       </div>
       <div class="row2">
         <label class="fld"><span>Status</span><select id="f-status">
           <option value="closed">Closed</option>
           <option value="processing">Processing</option>
           <option value="action_required">Action Required</option></select></label>
-        <label class="fld"><span>Payment Account</span><input id="f-pay" value="${esc(parsed.payment_account || "")}" placeholder="A/P"></label>
+        <label class="fld"><span>Payment Account</span><input id="f-pay" value="${esc(src.payment_account || "")}" placeholder="A/P"></label>
       </div>
       <div class="row3">
-        <label class="fld"><span>Subtotal</span><input type="number" step="0.01" id="f-sub" value="${num(parsed.subtotal)}"></label>
-        <label class="fld"><span>Tax</span><input type="number" step="0.01" id="f-tax" value="${num(parsed.tax)}"></label>
-        <label class="fld"><span>Total</span><input type="number" step="0.01" id="f-total" value="${num(parsed.total)}"></label>
+        <label class="fld"><span>Subtotal</span><input type="number" step="0.01" id="f-sub" value="${num(src.subtotal)}"></label>
+        <label class="fld"><span>Tax</span><input type="number" step="0.01" id="f-tax" value="${num(src.tax)}"></label>
+        <label class="fld"><span>Total</span><input type="number" step="0.01" id="f-total" value="${num(src.total)}"></label>
       </div>
     </div></div>
 
     <div class="card"><div class="card-band">Line Items <button class="btn btn-sm btn-ghost" id="add-line">+ Add</button></div>
       <div class="card-body" id="lines"></div></div>
+    <div id="recon" class="recon"></div>
 
     <div class="btn-row">
-      <button class="btn btn-grn btn-block" id="save-inv">Save to Ledger</button>
+      <button class="btn btn-grn btn-block" id="save-inv">${editing ? "Save Changes" : "Save to Ledger"}</button>
     </div>
     <button class="btn btn-ghost btn-block" id="cancel-inv" style="margin-top:.5rem">Cancel</button>
   `));
 
+  $("#f-status").value = src.status || "closed";
   const lines = $("#lines");
-  (parsed.line_items || []).forEach((li) => lines.appendChild(lineRow(li)));
-  if (!(parsed.line_items || []).length) lines.appendChild(lineRow({}));
-  $("#add-line").addEventListener("click", () => lines.appendChild(lineRow({})));
-  $("#cancel-inv").addEventListener("click", () => { location.hash = "#/orders"; });
+  lineItems.forEach((li) => lines.appendChild(lineRow(li)));
+  if (!lineItems.length) lines.appendChild(lineRow({}));
+
+  // Live reconciliation: do the line items add up to the invoice? Lines may be
+  // tax-exclusive (sum to subtotal) or tax-inclusive (sum to total), so match
+  // EITHER. Mirrors the backend _reconcile.
+  const round2 = (x) => Math.round(x * 100) / 100;
+  const reconRead = () => {
+    // Mirror the server: reconcile only the named rows that will actually be
+    // saved, and gate on whether any exist (not on the sum being zero).
+    const named = [...lines.querySelectorAll(".lrow")]
+      .filter((r) => r.querySelector(".li-name").value.trim());
+    const lineSum = round2(named.reduce((s, r) => s + (f(r.querySelector(".li-total").value) || 0), 0));
+    const sub = f($("#f-sub").value), tax = f($("#f-tax").value) || 0, tot = f($("#f-total").value);
+    const targets = [];
+    if (sub != null) targets.push(sub);
+    if (tot != null) { targets.push(tot); if (tax) targets.push(round2(tot - tax)); }
+    const box = $("#recon");
+    if (!targets.length || !named.length) { box.innerHTML = ""; box.className = "recon"; return; }
+    let expected = targets[0];
+    targets.forEach((t) => { if (Math.abs(lineSum - t) < Math.abs(lineSum - expected)) expected = t; });
+    const delta = round2(lineSum - expected);
+    const ok = Math.abs(delta) <= Math.max(0.02, Math.abs(expected) * 0.005);
+    box.className = "recon " + (ok ? "recon-ok" : "recon-warn");
+    box.innerHTML = ok
+      ? `✓ Line items add up (${money(lineSum)})`
+      : `⚠ Line items total ${money(lineSum)}, invoice is ${money(expected)} — off by ${money(Math.abs(delta))}`;
+  };
+
+  $("#add-line").addEventListener("click", () => { lines.appendChild(lineRow({})); reconRead(); });
+  lines.addEventListener("input", reconRead);
+  lines.addEventListener("click", (e) => { if (e.target.classList.contains("li-del")) setTimeout(reconRead, 0); });
+  ["f-sub", "f-tax", "f-total"].forEach((id) => $("#" + id).addEventListener("input", reconRead));
+  $("#cancel-inv").addEventListener("click", () => { go(editing ? `#/invoice/${src.id}` : "#/orders"); });
   fillVendorDatalist();
+  reconRead();
 
   $("#save-inv").addEventListener("click", async () => {
     const items = [...lines.querySelectorAll(".lrow")].map((r) => ({
@@ -580,7 +631,15 @@ async function openInvoiceForm(parsed, imagePath, warn) {
       image_path: imagePath || null, line_items: items,
       raw_json: parsed ? JSON.stringify(parsed) : "",
     };
-    const done = () => { toast("Logged to the ledger."); location.hash = "#/orders"; };
+    if (editing) {
+      try {
+        await api("PUT", `/api/invoices/${src.id}`, payload);
+        toast("Invoice updated.");
+        go(`#/invoice/${src.id}`);
+      } catch (e) { toast(e.message); }
+      return;
+    }
+    const done = () => { toast("Logged to the ledger."); go("#/orders"); };
     try {
       await api("POST", "/api/invoices", payload);
       done();
@@ -637,6 +696,7 @@ async function renderInvoiceDetail(parts) {
     const [iv, cats] = await Promise.all([api("GET", `/api/invoices/${id}`), loadCategories()]);
     const catName = {};
     cats.forEach((c) => { catName[c.id] = c.name; });
+    const recon = iv.reconciliation;
     const v = view();
     v.innerHTML = "";
     v.appendChild(el(`
@@ -651,11 +711,16 @@ async function renderInvoiceDetail(parts) {
         <div class="kv"><span>Tax</span><b>${money(iv.tax)}</b></div>
         <div class="kv"><span>Total</span><b>${money(iv.total)}</b></div>
       </div></div>
+      ${recon && recon.ok === false ? `<div class="recon recon-warn" style="margin-top:.6rem">
+        ⚠ Line items add up to ${money(recon.line_sum)}, but the invoice is ${money(recon.expected)}
+        (off by ${money(Math.abs(recon.delta))}). Tap Edit to fix.</div>` : ""}
       ${iv.line_items.length ? `<div class="card"><div class="card-band">Items</div><div class="card-body">
         ${iv.line_items.map((li) => `<div class="kv"><span>${esc(li.name)}${li.qty ? ` <span class="muted">×${li.qty} ${esc(li.unit || "")}</span>` : ""}${li.category_id ? ` <span class="muted">· ${esc(catName[li.category_id] || "")}</span>` : ""}</span><b>${money(li.total)}</b></div>`).join("")}
       </div></div>` : ""}
-      <button class="btn btn-ox btn-block" id="del-inv" style="margin-top:.6rem">Delete Invoice</button>
+      <button class="btn btn-brass btn-block" id="edit-inv" style="margin-top:.6rem">Edit Invoice</button>
+      <button class="btn btn-ox btn-block" id="del-inv" style="margin-top:.5rem">Delete Invoice</button>
       <button class="btn btn-ghost btn-block" id="back" style="margin-top:.5rem">Back</button>`));
+    $("#edit-inv").addEventListener("click", () => openInvoiceForm(null, null, null, iv));
     $("#back").addEventListener("click", () => { location.hash = "#/orders"; });
     $("#del-inv").addEventListener("click", async () => {
       if (!confirm("Delete this invoice?")) return;

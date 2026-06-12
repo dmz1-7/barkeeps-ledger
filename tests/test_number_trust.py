@@ -230,5 +230,106 @@ class LocationScoping(Base):
         self.assertEqual(cost, 25.0)
 
 
+class Reconcile(unittest.TestCase):
+    def test_lines_match_subtotal(self):
+        r = app_module._reconcile(100.0, 8.0, 108.0, [{"total": 60.0}, {"total": 40.0}])
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["line_sum"], 100.0)
+        self.assertEqual(r["expected"], 100.0)
+
+    def test_lines_mismatch_flagged(self):
+        r = app_module._reconcile(100.0, 8.0, 108.0, [{"total": 60.0}])
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["delta"], -40.0)
+
+    def test_no_subtotal_uses_total_minus_tax(self):
+        r = app_module._reconcile(None, 5.0, 105.0, [{"total": 100.0}])
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["expected"], 100.0)
+
+    def test_nothing_to_check_when_no_amounts(self):
+        r = app_module._reconcile(None, None, None, [{"total": 50.0}])
+        self.assertIsNone(r["ok"])
+
+    def test_tax_inclusive_lines_ok(self):
+        # Lines that sum to the grand total (tax-inclusive convention) reconcile.
+        r = app_module._reconcile(100.0, 8.0, 108.0, [{"total": 108.0}])
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["expected"], 108.0)
+
+    def test_header_only_invoice_not_flagged(self):
+        # A total with no itemization is "nothing to check", not an error.
+        r = app_module._reconcile(None, 8.0, 108.0, [])
+        self.assertIsNone(r["ok"])
+
+
+class InvoiceEdit(Base):
+    def _create(self):
+        r = self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_date": "2026-06-01", "invoice_number": "E-1",
+            "subtotal": 100.0, "tax": 8.0, "total": 108.0,
+            "line_items": [{"name": "Gin", "total": 100.0}]})
+        self.assertEqual(r.status_code, 200)
+        return r.get_json()["id"]
+
+    def test_edit_updates_header_and_replaces_lines(self):
+        iid = self._create()
+        r = self.client.put(f"/api/invoices/{iid}", json={
+            "vendor": "Acme Wine", "invoice_date": "2026-06-02", "invoice_number": "E-1",
+            "subtotal": 50.0, "tax": 0.0, "total": 50.0,
+            "line_items": [{"name": "Rye", "total": 30.0}, {"name": "Soda", "total": 20.0}]})
+        self.assertEqual(r.status_code, 200)
+        got = self.client.get(f"/api/invoices/{iid}").get_json()
+        self.assertEqual(got["vendor"], "Acme Wine")
+        self.assertEqual(got["total"], 50.0)
+        self.assertEqual(sorted(li["name"] for li in got["line_items"]), ["Rye", "Soda"])
+        self.assertTrue(got["reconciliation"]["ok"])
+
+    def test_edit_foreign_location_404(self):
+        with flask_app.app_context():
+            cur = get_db().execute(
+                "INSERT INTO invoices(location_id, vendor, total) VALUES(2, 'NYC', 10.0)")
+            get_db().commit()
+            fid = cur.lastrowid
+        r = self.client.put(f"/api/invoices/{fid}", json={"vendor": "x", "line_items": []})
+        self.assertEqual(r.status_code, 404)
+        with flask_app.app_context():
+            v = get_db().execute("SELECT vendor FROM invoices WHERE id=?", (fid,)).fetchone()["vendor"]
+        self.assertEqual(v, "NYC")   # untouched
+
+    def test_editing_old_invoice_does_not_roll_back_latest_price(self):
+        self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_date": "2026-06-01", "invoice_number": "A",
+            "total": 20.0, "line_items": [{"name": "Vodka", "unit_cost": 20.0, "total": 20.0}]})
+        self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_date": "2026-06-10", "invoice_number": "B",
+            "total": 22.0, "line_items": [{"name": "Vodka", "unit_cost": 22.0, "total": 22.0}]})
+
+        def vodka_price():
+            with flask_app.app_context():
+                return get_db().execute(
+                    "SELECT last_purchase_price FROM vendor_items "
+                    "WHERE lower(vendor_item_name)='vodka'").fetchone()["last_purchase_price"]
+
+        self.assertEqual(vodka_price(), 22.0)   # newest delivery wins
+        with flask_app.app_context():
+            old_id = get_db().execute(
+                "SELECT id FROM invoices WHERE invoice_number='A'").fetchone()["id"]
+        # Editing the OLD invoice must not roll the latest price back to 20.
+        self.client.put(f"/api/invoices/{old_id}", json={
+            "vendor": "Acme", "invoice_date": "2026-06-01", "invoice_number": "A2",
+            "total": 20.0, "line_items": [{"name": "Vodka", "unit_cost": 20.0, "total": 20.0}]})
+        self.assertEqual(vodka_price(), 22.0)   # unchanged
+
+    def test_detail_flags_reconciliation_mismatch(self):
+        iid = self._create()
+        self.client.put(f"/api/invoices/{iid}", json={
+            "vendor": "Acme", "subtotal": 100.0, "tax": 0.0, "total": 100.0,
+            "line_items": [{"name": "Gin", "total": 60.0}]})
+        recon = self.client.get(f"/api/invoices/{iid}").get_json()["reconciliation"]
+        self.assertFalse(recon["ok"])
+        self.assertEqual(recon["delta"], -40.0)
+
+
 if __name__ == "__main__":
     unittest.main()
