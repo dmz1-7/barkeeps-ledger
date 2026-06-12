@@ -3575,5 +3575,147 @@ class ActiveLocationPutValidation(AuthGateCoverage):
                                          headers=hdr).status_code, 400)
 
 
+# ============================================================================
+# Sixteenth audit-fix regression tests (2026-06-12, 16th re-audit)
+# ============================================================================
+
+class LaborOnlyOutage(Base):
+    def test_labor_error_nulls_prime_and_controllable_not_gross(self):
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-05',300)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',300)", (iid,))
+            d.commit()
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "get_sales",
+                                      return_value={"sales": 2000.0, "orders": 5, "error": None}), \
+                    mock.patch.object(square_client, "get_labor",
+                                      return_value={"labor": 0.0, "hours": 0, "error": "Square labor down"}):
+                s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+                pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        # sales OK so cogs_pct/gross are real; labor errored so labor-derived figures null
+        self.assertIsNotNone(s["cogs_pct"])
+        self.assertIsNone(s["labor_pct"])
+        self.assertIsNone(s["prime_pct"])
+        self.assertIsNone(s["prime"])               # not COGS-only masquerading as prime
+        self.assertIsNotNone(pl["gross_profit"])    # gross doesn't depend on labor
+        self.assertIsNone(pl["controllable_profit"])  # gross - labor is unknown -> null
+        self.assertEqual(pl["labor_error"], "Square labor down")
+
+
+class VendorDetailSpendFull(Base):
+    def test_spend_sums_all_invoices_not_just_50(self):
+        with flask_app.app_context():
+            d = get_db()
+            vid = d.execute("INSERT INTO vendors(location_id,name) VALUES(1,'Acme')").lastrowid
+            for i in range(55):                     # > the 50-row detail cap
+                d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                          "VALUES(1,'Acme','2026-06-05',10)")
+            d.commit()
+        out = self.client.get(f"/api/vendors/{vid}", headers={"X-Location-Id": "1"}).get_json()
+        self.assertEqual(out["spend"], 550.0)       # 55 * 10, not capped at 50 * 10
+
+
+class SalesMixBounds(Base):
+    def test_out_of_range_percent_rejected(self):
+        r = self.client.put("/api/sales-mix?start=2026-06-01&end=2026-06-30",
+                            json={"mix": {"Food": 150, "Beer": -50}})   # sums to 100 but out of range
+        self.assertEqual(r.status_code, 400)
+
+
+class PurchasesCountDistinct(Base):
+    def test_zero_line_invoice_not_counted(self):
+        with flask_app.app_context():
+            d = get_db()
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-05',100)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',100)", (iid,))
+            d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                      "VALUES(1,'V','2026-06-06',0)")   # header only, no line items
+            d.commit()
+            p = cogs.purchases(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(p["count"], 1)             # only the invoice that contributes spend
+        self.assertEqual(p["total"], 100.0)
+
+
+class InventoryNameUnique(Base):
+    def test_duplicate_product_name_per_store_blocked(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("INSERT INTO inventory_items(location_id,name) VALUES(1,'Gin')")
+            with self.assertRaises(sqlite3.IntegrityError):
+                d.execute("INSERT INTO inventory_items(location_id,name) VALUES(1,'gin')")  # NOCASE dup
+                d.commit()
+
+    def test_same_name_different_store_ok(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("INSERT INTO inventory_items(location_id,name) VALUES(1,'Vodka')")
+            d.execute("INSERT INTO inventory_items(location_id,name) VALUES(2,'Vodka')")  # other store
+            d.commit()
+
+    def test_duplicate_does_not_brick_migration(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("DROP INDEX IF EXISTS uq_inv_loc_name")
+            d.execute("INSERT INTO inventory_items(location_id,name) VALUES(1,'Dup')")
+            d.execute("INSERT INTO inventory_items(location_id,name) VALUES(1,'dup')")
+            d.commit()
+            db._apply_post_indexes(d)               # must swallow the IntegrityError
+            d.commit()
+
+
+class ImporterRelinksCounts(Base):
+    def test_reimport_preserves_count_line_product_link(self):
+        import import_marginedge
+        with flask_app.app_context():
+            d = get_db()
+            pid = d.execute("INSERT INTO inventory_items(location_id,name) VALUES(1,'Gin')").lastrowid
+            cnt = d.execute("INSERT INTO counts(location_id,taken_at,value) "
+                            "VALUES(1,'2026-06-01 12:00:00',100)").lastrowid
+            clid = d.execute("INSERT INTO count_lines(count_id,item_id,qty,unit_cost) "
+                             "VALUES(?,?,1,5)", (cnt, pid)).lastrowid
+            d.commit()
+            imp = import_marginedge.Importer(d, 1)
+            imp.clear_location()
+            imp.import_products([{"Name": "Gin", "Latest Price": "5"}])
+            imp.relink_counts()
+            d.commit()
+            item_id = d.execute("SELECT item_id FROM count_lines WHERE id=?", (clid,)).fetchone()["item_id"]
+            newgin = d.execute("SELECT id FROM inventory_items WHERE location_id IS 1 "
+                               "AND name='Gin'").fetchone()["id"]
+        self.assertEqual(item_id, newgin)           # re-linked, not left NULL
+
+
+class GetLaborMultiPageError(Base):
+    def test_page2_error_discards_page1_labor(self):
+        import requests as rq
+        page1 = {"shifts": [{"start_at": "2026-06-01T18:00:00Z", "end_at": "2026-06-01T22:00:00Z",
+                             "wage": {"hourly_rate": {"amount": 1500}}}], "cursor": "c"}
+
+        class FakeResp:
+            def __init__(self, d): self._d = d
+            def raise_for_status(self): pass
+            def json(self): return self._d
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post",
+                                   side_effect=[FakeResp(page1), rq.RequestException("boom")]):
+                info = square_client.get_labor(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertEqual(info["labor"], 0.0)        # page-1 labor discarded, not banked
+        self.assertIsNotNone(info["error"])
+
+
+class BackupPermissions(Base):
+    def test_backup_file_is_owner_only(self):
+        import stat
+        with flask_app.app_context():
+            snap = db.backup()
+        self.assertTrue(snap)
+        mode = stat.S_IMODE(os.stat(snap).st_mode)
+        self.assertEqual(mode & 0o077, 0)           # no group/other access (0600-ish)
+
+
 if __name__ == "__main__":
     unittest.main()

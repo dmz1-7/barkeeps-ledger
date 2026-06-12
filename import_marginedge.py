@@ -122,6 +122,14 @@ class Importer:
                 "JOIN inventory_items ii ON ii.id = ri.product_id "
                 "WHERE ii.location_id IS ?", (self.loc,))
         }
+        # Same for count lines (count_lines.item_id is also ON DELETE SET NULL), so
+        # historical count rows keep their product link across a re-import.
+        self._count_links = {
+            r["id"]: r["name"] for r in self.c.execute(
+                "SELECT cl.id AS id, ii.name AS name FROM count_lines cl "
+                "JOIN inventory_items ii ON ii.id = cl.item_id "
+                "WHERE ii.location_id IS ?", (self.loc,))
+        }
         self.c.execute("DELETE FROM inventory_items WHERE location_id IS ?", (self.loc,))
         self.c.execute("DELETE FROM vendors WHERE location_id IS ?", (self.loc,))
         print(f"  cleared prior data for location {self.loc} (invoices, items, vendor_items, products, vendors)")
@@ -139,6 +147,16 @@ class Importer:
                 relinked += 1
         if self._recipe_links:
             print(f"  re-linked {relinked}/{len(self._recipe_links)} recipe ingredients by name")
+
+    def relink_counts(self):
+        """Re-attach count lines to the re-imported products by name (count_lines.item_id
+        is ON DELETE SET NULL). Call after import_products, alongside relink_recipes."""
+        for cl_id, name in getattr(self, "_count_links", {}).items():
+            row = self.c.execute(
+                "SELECT id FROM inventory_items WHERE location_id IS ? AND name = ? COLLATE NOCASE",
+                (self.loc, name)).fetchone()
+            if row:
+                self.c.execute("UPDATE count_lines SET item_id=? WHERE id=?", (row["id"], cl_id))
 
     def import_products(self, rows):
         for r in rows:
@@ -274,6 +292,7 @@ def main():
     imp.clear_location()
     imp.import_products(_read(products))
     imp.relink_recipes()   # restore recipe ingredient links the inventory wipe NULLed
+    imp.relink_counts()    # and count-line product links
     imp.import_vendor_items(_read(vendor_items))
     imp.import_invoices(category_report)
     conn.commit()

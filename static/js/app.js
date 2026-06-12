@@ -1816,7 +1816,7 @@ async function recipeEditor(id) {
   const linesEl = ingCard.querySelector("#r-lines");
   v.appendChild(el(`<datalist id="unit-list">${RECIPE_UNITS.map((u) => `<option value="${u}">`).join("")}</datalist>`));
   const prodOptions = products.map((p) =>
-    `<option value="${p.id}">${esc(p.name)} (${money(p.unit_cost)}/${esc(p.unit || "ea")}${p.size_qty ? `, ${p.size_qty}${esc(p.size_unit || "")}` : ""})</option>`).join("");
+    `<option value="${p.id}">${esc(p.name)} (${money(p.unit_cost)}/${esc(p.unit || "ea")}${p.size_qty ? `, ${esc(String(p.size_qty))}${esc(p.size_unit || "")}` : ""})</option>`).join("");
   const prodById = (pid) => products.find((x) => String(x.id) === String(pid));
   // Round half-to-even, matching Python's round() / money.normalize on the
   // backend, so the live preview equals the saved cost to the penny.

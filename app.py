@@ -178,6 +178,13 @@ def _open_mode_loopback_only():
     if len(request.access_route) > 1 or any(request.headers.get(h) for h in _PROXY_HEADERS):
         return jsonify({"error": "Running without authentication and detected behind "
                         "a proxy; refusing to serve. Set APP_PASSWORD."}), 403
+    # Defense-in-depth against a header-stripping proxy that adds no forwarding
+    # header at all: open mode is localhost-developer-only, so the Host must be a
+    # loopback name too. A public proxy forwards its own (non-loopback) Host.
+    host = (request.host or "").rsplit(":", 1)[0]
+    if host and host not in _LOOPBACK:
+        return jsonify({"error": "Running without authentication; only reachable as "
+                        "localhost. Set APP_PASSWORD to allow remote access."}), 403
 
 
 @app.before_request
@@ -845,7 +852,13 @@ def vendor_get(vid):
     ).fetchall()
     out["invoices"] = [dict(r) for r in invoices]
     out["items"] = [dict(r) for r in items]
-    out["spend"] = money.sum_dollars(r["total"] for r in invoices)
+    # Total spend over ALL invoices, not just the 50 shown — summing the capped
+    # `invoices` list would understate the headline and disagree with the vendor list.
+    out["spend"] = round(db_.execute(
+        "SELECT COALESCE(SUM(total),0) AS t FROM invoices "
+        "WHERE location_id IS ? AND lower(vendor) = lower(?)",
+        (v["location_id"], v["name"]),
+    ).fetchone()["t"], 2)
     return jsonify(out)
 
 
@@ -1205,9 +1218,15 @@ def sales_mix_put():
         abort(400, description="mix must be an object of category_type -> percent.")
     # Reject a non-numeric/non-finite percent rather than silently coercing it to
     # 0 (which would slip past the 100% total guard and store a wrong 0% split).
+    # Also bound each type to [0,100]: e.g. {Food:150, Beer:-50} sums to 100 but
+    # makes per-type income negative / over-100% even though the grand total ties.
     for t in reports.CATEGORY_TYPES:
-        if t in mix and _f(mix[t]) is None:
-            abort(400, description=f"{t} percent must be a number.")
+        if t in mix:
+            v = _f(mix[t])
+            if v is None:
+                abort(400, description=f"{t} percent must be a number.")
+            if not (0 <= v <= 100):
+                abort(400, description=f"{t} percent must be between 0 and 100.")
     # A mix that doesn't total ~100% would make Income (sales x mix%) not reconcile
     # to total sales and skew every per-type COGS%. Allow all-zero (clearing).
     total = round(sum(_f(mix[t], 0) or 0 for t in reports.CATEGORY_TYPES if t in mix), 2)
