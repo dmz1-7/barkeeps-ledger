@@ -2421,5 +2421,88 @@ class CountTimestampBusinessDay(Base):
         self.assertTrue(taken.startswith(today))
 
 
+# ============================================================================
+# Seventh audit-fix regression tests (2026-06-12, 7th re-audit)
+# ============================================================================
+
+class ImporterTenantScoping(Base):
+    def test_import_does_not_wipe_other_store(self):
+        import import_marginedge
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                      "VALUES(2,'NYCvendor','2026-06-01',999)")
+            d.execute("INSERT INTO vendor_items(location_id,vendor_item_name,status) "
+                      "VALUES(2,'NYCsku','reviewed')")
+            d.commit()
+            imp = import_marginedge.Importer(d, 1)
+            path = os.path.join(self.tmpdir, "cat.csv")
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                csv.writer(fh).writerows([["Invoice Date", "Invoice #", "Vendor", "Total", "Liquor"],
+                                          ["06/05/2026", "I1", "DCvendor", "$50", "50"]])
+            imp.import_invoices(path)
+            imp.import_vendor_items([{"Vendor Item Name": "DCsku", "Vendor": "DCvendor",
+                                      "Last Purch $": "$5"}])
+            d.commit()
+            inv2 = d.execute("SELECT COUNT(*) c FROM invoices WHERE location_id=2").fetchone()["c"]
+            vi2 = d.execute("SELECT COUNT(*) c FROM vendor_items WHERE location_id=2").fetchone()["c"]
+        self.assertEqual(inv2, 1)        # store 2's invoice survived a store-1 import
+        self.assertEqual(vi2, 1)
+
+
+class DupInvoiceLocationScoping(Base):
+    def test_duplicate_guard_is_per_store(self):
+        payload = {"vendor": "Acme", "invoice_number": "INV-1",
+                   "invoice_date": "2026-06-01", "total": 100, "line_items": []}
+        self.assertEqual(self.client.post("/api/invoices", json=payload,
+                                          headers={"X-Location-Id": "1"}).status_code, 200)
+        # same vendor+number in the OTHER store is NOT a duplicate
+        self.assertEqual(self.client.post("/api/invoices", json=payload,
+                                          headers={"X-Location-Id": "2"}).status_code, 200)
+        # a repeat in store 1 IS
+        self.assertEqual(self.client.post("/api/invoices", json=payload,
+                                          headers={"X-Location-Id": "1"}).status_code, 409)
+
+
+class SalesReportColumns(Base):
+    def test_ytd_last_week_last_year(self):
+        cache = {
+            "2026-01-05": 500.0,                       # earlier in the year (YTD)
+            "2026-02-09": 70.0, "2026-02-10": 30.0,    # last week (Mon/Tue)
+            "2025-02-17": 12.0,                        # ~52 weeks back (last-year column)
+            "2026-02-16": 100.0, "2026-02-18": 50.0,   # this week (Mon/Wed)
+        }
+        with flask_app.app_context(), \
+                mock.patch.object(square_client, "daily_sales_cached", return_value=cache):
+            rep = reports.sales_report(today=dt.date(2026, 2, 18))
+        self.assertEqual(rep["totals"]["last_week"], 100.0)       # 70 + 30
+        self.assertEqual(rep["totals"]["last_year"], 12.0)
+        # YTD = every cached 2026 day <= today: 500 + 70 + 30 + 100 + 50
+        self.assertEqual(rep["year_to_date"], 750.0)
+
+
+class PrimeDollarConsistency(Base):
+    def test_prime_dollars_scale_over_consumption_span(self):
+        with flask_app.app_context():
+            d = get_db()
+            for day, val in (("2026-05-30", 1000.0), ("2026-07-02", 800.0)):
+                d.execute("INSERT INTO counts(location_id,taken_at,value) VALUES(1,?,?)",
+                          (f"{day} 12:00:00", val))
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-15',700)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',700)", (iid,))
+            d.commit()
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "get_sales",
+                                      return_value={"sales": 1000.0, "orders": 1, "error": None}), \
+                    mock.patch.object(square_client, "get_labor", return_value=dict(_LABOR0)), \
+                    mock.patch.object(square_client, "daily_sales_cached",
+                                      side_effect=lambda b, e: {(b + dt.timedelta(days=i)).isoformat(): 100.0
+                                                                for i in range((e - b).days + 1)}):
+                s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        # span = 33 days (opening excluded); prime COGS = 900 * 30/33 = 818.18 (+$0 labor)
+        self.assertEqual(s["prime"], 818.18)
+
+
 if __name__ == "__main__":
     unittest.main()

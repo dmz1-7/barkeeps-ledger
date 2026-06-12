@@ -444,6 +444,9 @@ table.dtable { width: 100%; border-collapse: collapse; font-size: .88rem; }
 .dtable td.strong { font-weight: 600; }
 .dtable tbody tr[data-href] { cursor: pointer; }
 .dtable tbody tr:hover { background: var(--surface-2); }
+.dtable th.sortable:focus-visible, .dtable tbody tr[data-href]:focus-visible {
+  outline: 2px solid var(--ring); outline-offset: -2px;   /* themed keyboard focus */
+}
 .dtable tfoot td { padding: 8px 10px; border-top: 1px solid var(--border-strong);
   font-weight: 600; background: var(--surface-2); }
 .dt-empty { text-align: center; color: var(--muted); padding: 24px; }

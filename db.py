@@ -287,6 +287,13 @@ def close_db(_exc=None):
 
 # Columns added to tables that predate this schema. ALTER TABLE ADD COLUMN
 # disallows non-constant defaults, so upload_date is added bare and backfilled.
+# NOTE: ALTER ADD COLUMN also can't carry a REFERENCES/ON DELETE constraint, so
+# on a MIGRATED db these columns (location_id, vendor_item_id, category_id) lack
+# the FKs that a FRESH db has. We deliberately DON'T rebuild the tables to add
+# them: a full CREATE+copy+swap on the live two-store DB is a real corruption
+# risk, and the app soft-deletes (archived=1) rather than hard-deleting, so the
+# missing ON DELETE SET NULL paths effectively never fire. Tenant scoping is
+# enforced in the queries, not by these FKs.
 _ADDED_COLUMNS = {
     "invoices": {
         "status": "TEXT DEFAULT 'closed'",
@@ -537,8 +544,12 @@ def active_location_id():
     try:
         return int(v)
     except (TypeError, ValueError):
+        # Fall back to the lowest store. A real id is always present (the seed
+        # creates DC/NYC), so this never returns None in practice — and the
+        # location backfill leaves no NULL-location rows for a stray None to
+        # match, so `location_id IS ?` can't leak orphans.
         row = get_db().execute("SELECT MIN(id) AS id FROM locations WHERE archived=0").fetchone()
-        return row["id"] if row else None
+        return row["id"] if row and row["id"] is not None else 1
 
 
 def set_setting(key, value):

@@ -164,7 +164,11 @@ def summary(start, end):
     prime_cogs = cogs_amount
     if cogs_sales_basis == "interval":
         range_days = (end - start).days + 1
-        prime_cogs = money.normalize(cogs_amount * range_days / interval_days) or 0.0
+        # COGS/interval-sales span the (b_date, e_date] window = interval_days-1
+        # days (the opening-count day is excluded), so scale by that, not the
+        # inclusive interval_days, to stay consistent with cogs_pct.
+        span_days = max(interval_days - 1, 1)
+        prime_cogs = money.normalize(cogs_amount * range_days / span_days) or 0.0
     prime = round((prime_cogs or 0.0) + labor, 2)
 
     return {

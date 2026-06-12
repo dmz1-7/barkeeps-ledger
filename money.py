@@ -22,10 +22,10 @@ def to_cents(x, default=0):
     if x is None or x == "":
         return default
     try:
-        f = float(x)
+        c = float(x) * 100   # multiply first: a huge-but-finite value (1e308) overflows here
     except (TypeError, ValueError):
         return default
-    return int(round(f * 100)) if math.isfinite(f) else default
+    return int(round(c)) if math.isfinite(c) else default
 
 
 def cents_or_none(x):
@@ -34,10 +34,10 @@ def cents_or_none(x):
     if x is None or x == "":
         return None
     try:
-        f = float(x)
+        c = float(x) * 100
     except (TypeError, ValueError):
         return None
-    return int(round(f * 100)) if math.isfinite(f) else None
+    return int(round(c)) if math.isfinite(c) else None
 
 
 def to_dollars(cents):
