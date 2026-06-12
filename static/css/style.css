@@ -25,7 +25,6 @@
   --ok:            oklch(0.52 0.13 150);
   --ok-soft:       oklch(0.95 0.04 150);
   --warn:          oklch(0.52 0.12 70);
-  --warn-soft:     oklch(0.95 0.05 80);
   --danger:        oklch(0.52 0.19 27);
   --danger-soft:   oklch(0.95 0.04 27);
 
@@ -59,7 +58,6 @@
     --ok:            oklch(0.72 0.14 150);
     --ok-soft:       oklch(0.30 0.05 150);
     --warn:          oklch(0.78 0.13 80);
-    --warn-soft:     oklch(0.32 0.05 80);
     --danger:        oklch(0.70 0.17 27);
     --danger-soft:   oklch(0.32 0.06 27);
 
@@ -84,7 +82,6 @@
   --ok:            oklch(0.72 0.14 150);
   --ok-soft:       oklch(0.30 0.05 150);
   --warn:          oklch(0.78 0.13 80);
-  --warn-soft:     oklch(0.32 0.05 80);
   --danger:        oklch(0.70 0.17 27);
   --danger-soft:   oklch(0.32 0.06 27);
   --ring:          oklch(0.64 0.14 252 / 0.5);
@@ -161,6 +158,9 @@ h2.section, .section-head {
   padding: calc(10px + env(safe-area-inset-top)) 16px 10px;
   border-bottom: 1px solid var(--border);
 }
+/* Push the right group (loc switch + theme toggle) to the edge via the brand, so
+   right-alignment survives the loc switch being hidden on the /api/locations error path. */
+.topbar-inner .brand { margin-right: auto; }
 .view { padding: 0 16px 24px; }
 
 /* ---------- theme toggle ---------- */
@@ -388,7 +388,7 @@ input:focus, select:focus, textarea:focus {
 .hamburger { display: none; background: none; border: none; color: var(--text);
   font-size: 1.3rem; cursor: pointer; padding: 2px 6px; line-height: 1; }
 .loc-switch {
-  margin-left: auto; width: auto; max-width: 12rem;
+  width: auto; max-width: 12rem;
   font-size: .82rem; color: var(--text); background: var(--surface);
   border: 1px solid var(--border-strong); border-radius: var(--radius);
   padding: 6px 24px 6px 10px; cursor: pointer;

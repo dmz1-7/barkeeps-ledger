@@ -53,29 +53,25 @@ def category_report(start, end, vendor=None, status=None, search=None):
         params,
     ).fetchall()
 
+    # Deflate and round each LINE to cents (via _pretax_line_rows), exactly as
+    # cogs.purchases / controllable_pl do — NOT a per-(invoice,category) SUM rounded
+    # once. Rounding at the same per-line granularity keeps the Category Report's
+    # column_totals/grand_total reconciled to the P&L to the penny even for
+    # tax-inclusive multi-line invoices (where the two granularities diverge ~1c/group).
+    cell_cents = {}   # (invoice_id, category_id) -> integer cents
     inv_ids = [r["id"] for r in invs]
-    cell = {}
     if inv_ids:
         marks = ",".join("?" * len(inv_ids))
-        for r in db.execute(
-            f"SELECT invoice_id, category_id, COALESCE(SUM(total),0) AS amt "
-            f"FROM invoice_items WHERE invoice_id IN ({marks}) "
-            f"GROUP BY invoice_id, category_id",
+        rows_q = db.execute(
+            f"SELECT inv.id AS iid, inv.subtotal AS sub, inv.total AS tot, inv.tax AS tax, "
+            f"ii.category_id AS cat, ii.total AS amt "
+            f"FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
+            f"WHERE ii.invoice_id IN ({marks})",
             inv_ids,
-        ):
-            cell[(r["invoice_id"], r["category_id"])] = r["amt"] or 0.0
-
-    # Deflate each invoice's cells to the pre-tax basis (so a tax-inclusive
-    # invoice doesn't inflate COGS), consistent with cogs.purchases. Carry the
-    # raw deflated floats through and let money.to_cents do the SINGLE rounding
-    # below — an intermediate _r() here would make grand_total drift from the
-    # Controllable P&L, which deflates line-by-line straight to cents.
-    line_sum = {}
-    for (iid, _cid), amt in cell.items():
-        line_sum[iid] = line_sum.get(iid, 0.0) + amt
-    factor = {inv["id"]: pretax_factor(inv["subtotal"], inv["total"],
-                                            line_sum.get(inv["id"], 0.0), inv["tax"]) for inv in invs}
-    cell = {k: v * factor.get(k[0], 1.0) for k, v in cell.items()}
+        ).fetchall()
+        for r, amt in _pretax_line_rows(rows_q):
+            key = (r["iid"], r["cat"])
+            cell_cents[key] = cell_cents.get(key, 0) + money.to_cents(amt)
 
     # id 0 = an "Uncategorized" column. It catches line items with category_id
     # NULL **and** any line booked to a category that is no longer active (archived
@@ -87,9 +83,8 @@ def category_report(start, end, vendor=None, status=None, search=None):
     col_ids = [c["id"] for c in cats] + [0]
     col_cents = {cid: 0 for cid in col_ids}   # accumulate in integer cents (no float drift)
     row_cents = {}                            # iid -> {col_id: cents}
-    for (iid, cid), amt in cell.items():
+    for (iid, cid), c in cell_cents.items():
         col = cid if cid in active_ids else 0   # NULL / archived / unknown -> Uncategorized
-        c = money.to_cents(amt)
         col_cents[col] += c
         rc = row_cents.setdefault(iid, {})
         rc[col] = rc.get(col, 0) + c

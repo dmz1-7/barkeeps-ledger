@@ -54,6 +54,13 @@ if not os.environ.get("APP_PASSWORD") and not os.environ.get("ALLOW_OPEN"):
         "Refusing to start without authentication. Set APP_PASSWORD, or set "
         "ALLOW_OPEN=1 to run open on a trusted local network.")
 
+# Warn (don't hard-fail — that could lock the owner out of a running install) when
+# the passcode is short: the global 10/60s login throttle and the secret tunnel URL
+# are the only brute-force defenses, so a weak passcode is the main residual risk.
+if os.environ.get("APP_PASSWORD") and len(os.environ["APP_PASSWORD"]) < 12:
+    print("  [!] APP_PASSWORD is shorter than 12 characters. Use a longer passphrase: "
+          "it's the main defense behind the public tunnel.")
+
 # Cap uploads so a giant (or malicious) file can't exhaust memory/disk. 32 MB
 # covers a full-resolution phone photo while still bounding abuse.
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
@@ -1311,6 +1318,8 @@ def recipe_list():
 @app.post("/api/recipes")
 def recipe_create():
     d = body()
+    if not _s(d.get("name")):   # name is NOT NULL; reject a blank like every sibling create
+        return jsonify({"error": "Recipe needs a name."}), 400
     database = db.get_db()
     cur = database.execute(
         "INSERT INTO recipes(location_id, name, menu_price, yield_qty, notes) "
@@ -1336,6 +1345,8 @@ def recipe_get(rid):
 @app.put("/api/recipes/<int:rid>")
 def recipe_update(rid):
     d = body()
+    if not _s(d.get("name")):   # name is NOT NULL; reject a blank like every sibling update
+        return jsonify({"error": "Recipe needs a name."}), 400
     database = db.get_db()
     loc = db.active_location_id()
     if not database.execute(

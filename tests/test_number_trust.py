@@ -3479,5 +3479,101 @@ class SettingsGlobalTenancy(Base):
         self.assertEqual(str(c2["target_cogs_pct"]), "31")
 
 
+# ============================================================================
+# Fifteenth audit-fix regression tests (2026-06-12, 15th re-audit)
+# ============================================================================
+
+class CategoryReportPerLineRounding(Base):
+    def test_tax_inclusive_multiline_reconciles_to_pl_to_the_penny(self):
+        with flask_app.app_context():
+            d = get_db()
+            wine = d.execute("SELECT id FROM categories WHERE name='Wine'").fetchone()["id"]
+            # three tax-inclusive lines summing to 108; factor 100/108. Per-GROUP
+            # rounding gives $100.00, per-LINE gives $99.99 — the report must match
+            # the P&L, which rounds per line.
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,subtotal,tax,total) "
+                            "VALUES(1,'V','2026-06-05',100,8,108)").lastrowid
+            for _ in range(3):
+                d.execute("INSERT INTO invoice_items(invoice_id,name,total,category_id) "
+                          "VALUES(?,'x',36.0,?)", (iid, wine))
+            d.commit()
+            cr = reports.category_report(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+            pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(cr["grand_total"], pl["total_cogs"])   # same per-line granularity
+        self.assertEqual(cr["grand_total"], 99.99)              # 3 * round(36*100/108) = 9999c
+
+
+class RecipeNameRequired(Base):
+    def test_blank_recipe_name_rejected(self):
+        r = self.client.post("/api/recipes", json={"menu_price": 5, "yield_qty": 1, "items": []})
+        self.assertEqual(r.status_code, 400)
+        rid = self.client.post("/api/recipes", json={"name": "Real", "menu_price": 5,
+                                                     "yield_qty": 1, "items": []}).get_json()["id"]
+        upd = self.client.put(f"/api/recipes/{rid}", json={"name": "", "menu_price": 5,
+                                                           "yield_qty": 1, "items": []})
+        self.assertEqual(upd.status_code, 400)
+
+
+class ImporterRelinksRecipes(Base):
+    def test_reimport_preserves_recipe_product_link(self):
+        import import_marginedge
+        with flask_app.app_context():
+            d = get_db()
+            pid = d.execute("INSERT INTO inventory_items(location_id,name,unit_cost) "
+                            "VALUES(1,'Gin',20)").lastrowid
+            rid = d.execute("INSERT INTO recipes(location_id,name,menu_price,yield_qty) "
+                            "VALUES(1,'Martini',12,1)").lastrowid
+            riid = d.execute("INSERT INTO recipe_items(recipe_id,product_id,qty,unit) "
+                             "VALUES(?,?,1,'each')", (rid, pid)).lastrowid
+            d.commit()
+            imp = import_marginedge.Importer(d, 1)
+            imp.clear_location()                       # wipes inventory_items -> SET NULL on the link
+            imp.import_products([{"Name": "Gin", "Latest Price": "22"}])
+            imp.relink_recipes()
+            d.commit()
+            row = d.execute("SELECT product_id FROM recipe_items WHERE id=?", (riid,)).fetchone()
+            newgin = d.execute("SELECT id FROM inventory_items WHERE location_id IS 1 "
+                               "AND name='Gin'").fetchone()["id"]
+        self.assertEqual(row["product_id"], newgin)    # re-linked by name, not left NULL
+
+
+class NetSalesRefundedOrderFrame(Base):
+    def test_net_amounts_frame_wins_over_order_level_totals(self):
+        # a partially-refunded order carries BOTH net_amounts AND order-level total_*;
+        # the net_amounts frame must win and total_money must be ignored (never mixed).
+        order = {"net_amounts": {"total_money": {"amount": 1180},
+                                 "tax_money": {"amount": 100},
+                                 "tip_money": {"amount": 80}},
+                 "total_money": {"amount": 9999}}
+        self.assertEqual(square_client._net_sales_cents(order), 1000)   # 1180-100-80, not 9999
+
+
+class ShiftCostClamp(Base):
+    def test_negative_duration_shift_clamps_to_zero(self):
+        bad = {"start_at": "2026-06-01T20:00:00Z", "end_at": "2026-06-01T18:00:00Z"}  # end before start
+        self.assertEqual(square_client._shift_cost(bad, 15.0), (0.0, 0.0, 0.0))
+
+    def test_breaks_longer_than_shift_clamp_to_zero(self):
+        s = {"start_at": "2026-06-01T18:00:00Z", "end_at": "2026-06-01T19:00:00Z",
+             "wage": {"hourly_rate": {"amount": 1500}},
+             "breaks": [{"start_at": "2026-06-01T18:00:00Z", "end_at": "2026-06-01T21:00:00Z"}]}
+        cost, hours, _ = square_client._shift_cost(s, 0.0)
+        self.assertEqual((cost, hours), (0.0, 0.0))   # 3h unpaid break > 1h shift -> floored
+
+
+class ActiveLocationPutValidation(AuthGateCoverage):
+    def test_archived_and_unknown_ids_rejected(self):
+        token = self.client.post("/api/login", json={"password": "secret"}).get_json()["token"]
+        hdr = {"Authorization": "Bearer " + token}
+        with flask_app.app_context():
+            d = get_db()
+            arch = d.execute("INSERT INTO locations(name, archived) VALUES('Closed',1)").lastrowid
+            d.commit()
+        self.assertEqual(self.client.put("/api/active-location", json={"location_id": arch},
+                                         headers=hdr).status_code, 400)
+        self.assertEqual(self.client.put("/api/active-location", json={"location_id": 99999},
+                                         headers=hdr).status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()
