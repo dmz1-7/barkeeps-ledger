@@ -308,6 +308,7 @@ input:focus, select:focus, textarea:focus {
 .pill.st-action_required{ color: var(--warn); }
 .pill.st-processing     { color: var(--accent); }
 .pill.st-closed, .pill.st-reviewed { color: var(--ok); }
+.pill.wine { color: var(--warn); }   /* the "Low" stock badge */
 
 /* ---------- count mode (walk-around) ---------- */
 .count-row {
@@ -372,6 +373,7 @@ input:focus, select:focus, textarea:focus {
 .thumb-lg { width: 100%; max-height: 340px; object-fit: contain; border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); }
 .divider { height: 1px; background: var(--border); margin: 14px 0; border: none; }
 .kv { display: flex; justify-content: space-between; align-items: center; padding: 7px 0; font-size: .92rem; border-bottom: 1px solid var(--border); gap: 10px; }
+.kv.total-row { border-top: 1px solid var(--border-strong); border-bottom: none; font-weight: 600; padding-top: 8px; }
 .kv:last-child { border-bottom: none; }
 .kv b { font-weight: 500; font-size: 1rem; }
 .linkbtn { background: none; border: none; color: var(--accent); text-decoration: underline; font-weight: 500; cursor: pointer; padding: 0; font-size: .9rem; }

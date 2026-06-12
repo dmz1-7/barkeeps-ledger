@@ -203,6 +203,10 @@ CREATE INDEX IF NOT EXISTS idx_vendoritems_name ON vendor_items(vendor_name, ven
 # tables — created only after those columns are guaranteed to exist.
 POST_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_items_category ON invoice_items(category_id);
+-- Composite (location, ...) indexes: every report scopes by location_id, so a
+-- date-only / single-column index forced a scan to filter the store.
+CREATE INDEX IF NOT EXISTS idx_invoices_loc_date ON invoices(location_id, invoice_date);
+CREATE INDEX IF NOT EXISTS idx_inv_loc_arch ON inventory_items(location_id, archived);
 """
 
 # The seeded two-level taxonomy: {Category Type: [Category, ...]}. Order within
@@ -466,6 +470,10 @@ def init_db():
             (env_sq,))
     _migrate_legacy_data(conn)
     _migrate_locations(conn)
+    # Idempotent: re-home any sales_mix row stranded on the legacy location_id=0
+    # default (e.g. from an old DB) onto the default store so it's not invisible.
+    conn.execute(
+        "UPDATE sales_mix SET location_id=(SELECT MIN(id) FROM locations) WHERE location_id=0")
     conn.commit()
     conn.close()
 

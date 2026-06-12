@@ -25,11 +25,13 @@ def _line_cost(qty, line_unit, unit_cost, size_qty, size_unit):
     - Otherwise falls back to qty * unit_cost (qty in the product's own unit) and
       converted=False, so the UI can prompt for a size / matching unit.
     """
+    # Return the RAW (unrounded) cost so legitimately sub-cent pours aren't zeroed
+    # per-line; the batch total is rounded to the penny once (see _summary).
     if size_qty and size_qty > 0 and line_unit and size_unit:
         used = units.convert(qty, line_unit, size_unit)
         if used is not None:
-            return money.normalize(unit_cost * (used / size_qty)) or 0.0, True
-    return money.normalize(qty * unit_cost) or 0.0, False
+            return unit_cost * (used / size_qty), True
+    return qty * unit_cost, False
 
 
 def _costed_items(db, recipe_id, loc):
@@ -65,7 +67,9 @@ def _costed_items(db, recipe_id, loc):
 
 
 def _summary(rec, items):
-    batch = money.sum_dollars(i["line_cost"] for i in items)
+    # Sum the raw line costs, THEN round once, so many sub-cent pours total
+    # correctly instead of each rounding to $0.00 first.
+    batch = money.normalize(sum(i["line_cost"] for i in items)) or 0.0
     yld = rec["yield_qty"] if (rec["yield_qty"] or 0) > 0 else 1
     per = money.normalize(batch / yld) or 0.0
     price = rec["menu_price"] or 0

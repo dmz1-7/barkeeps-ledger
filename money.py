@@ -12,29 +12,32 @@ Unit RATES (unit_cost, last_purchase_price) are deliberately NOT forced through
 here: a per-unit price can be legitimately sub-cent (e.g. $0.33/can in a
 24-pack, or a per-pound price), so those columns stay plain REAL.
 """
+import math
 
 
 def to_cents(x, default=0):
     """A dollar amount (number/str/None) -> integer cents, rounded to the penny.
-    None/blank/unparseable -> `default` (0 by default — use cents_or_none when a
-    missing value must stay distinguishable from $0.00)."""
+    None/blank/unparseable/non-finite (inf, nan) -> `default` (0 by default — use
+    cents_or_none when a missing value must stay distinguishable from $0.00)."""
     if x is None or x == "":
         return default
     try:
-        return int(round(float(x) * 100))
+        f = float(x)
     except (TypeError, ValueError):
         return default
+    return int(round(f * 100)) if math.isfinite(f) else default
 
 
 def cents_or_none(x):
-    """Like to_cents, but a missing/unparseable value returns None instead of 0,
-    so a genuinely absent amount stays distinct from $0.00 (used by reconcile)."""
+    """Like to_cents, but a missing/unparseable/non-finite value returns None
+    instead of 0, so a genuinely absent amount stays distinct from $0.00."""
     if x is None or x == "":
         return None
     try:
-        return int(round(float(x) * 100))
+        f = float(x)
     except (TypeError, ValueError):
         return None
+    return int(round(f * 100)) if math.isfinite(f) else None
 
 
 def to_dollars(cents):

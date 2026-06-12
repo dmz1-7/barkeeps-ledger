@@ -10,6 +10,7 @@ Run:  python app.py    (see README for configuration)
 """
 import hashlib
 import hmac
+import math
 import os
 import secrets
 import threading
@@ -148,14 +149,19 @@ def _resolve_location():
 
 
 # Throttle passcode guessing. Behind the Cloudflare tunnel every client connects
-# from loopback, so a per-IP key is meaningless and CF-Connecting-IP is
-# attacker-spoofable — we throttle GLOBALLY instead. Crucially the password is
-# checked first and a CORRECT passcode always succeeds and clears the counter,
-# so a flood of wrong guesses throttles the attacker (429) without ever locking
-# out the real owner. In-memory (single-process dev server).
+# from loopback and CF-Connecting-IP is attacker-spoofable, so per-client keying
+# is impossible — we throttle GLOBALLY with a short sliding window. Once the
+# window's wrong-guess budget is spent we SHORT-CIRCUIT (429) BEFORE hashing the
+# guess, so it's a real rate limit, not a cosmetic message swap.
+#
+# Tradeoff (deliberate): a sustained flood can make the owner wait out the
+# WINDOW too. That's acceptable here because the tunnel URL is itself a random
+# per-install secret (the real first line of defense); the window is short so
+# any lockout self-heals in seconds, and a brief stall under active attack is
+# preferable to leaving guessing unthrottled. In-memory (single-process).
 _LOGIN_FAILS = []          # recent wrong-guess timestamps (monotonic)
-_LOGIN_MAX = 10            # wrong guesses per window before further wrong guesses 429
-_LOGIN_WINDOW = 300        # seconds
+_LOGIN_MAX = 10            # wrong guesses per window before requests are 429'd
+_LOGIN_WINDOW = 60         # seconds (short, so a throttle self-heals quickly)
 
 
 def _login_recent_fails():
@@ -169,14 +175,13 @@ def login():
     expected = _expected_token()
     if expected is None:
         return jsonify({"token": "", "auth_required": False})
+    if _login_recent_fails() >= _LOGIN_MAX:   # rate limit: refuse BEFORE evaluating the guess
+        return jsonify({"error": "Too many attempts. Wait a minute and try again."}), 429
     pw = body().get("password", "")
-    token = _token_for(pw)
-    if hmac.compare_digest(token, expected):
-        _LOGIN_FAILS.clear()          # right passcode always wins -> owner is never locked out
-        return jsonify({"token": token, "auth_required": True})
+    if hmac.compare_digest(_token_for(pw), expected):
+        _LOGIN_FAILS.clear()
+        return jsonify({"token": _token_for(pw), "auth_required": True})
     _LOGIN_FAILS.append(time.monotonic())
-    if _login_recent_fails() > _LOGIN_MAX:
-        return jsonify({"error": "Too many attempts. Wait a few minutes and try again."}), 429
     return jsonify({"error": "Wrong passcode."}), 401
 
 
@@ -281,10 +286,10 @@ def active_location_set():
     per-request X-Location-Id header is the real source of truth; the Square id is
     now resolved per-request from the locations table, so nothing is mirrored into
     a shared global setting here."""
-    loc_id = body().get("location_id")
+    loc_id = _i(body().get("location_id"))
     row = db.get_db().execute(
         "SELECT id FROM locations WHERE id=? AND archived=0", (loc_id,)
-    ).fetchone()
+    ).fetchone() if loc_id is not None else None
     if not row:
         return jsonify({"error": "Unknown location."}), 400
     db.set_setting("active_location_id", row["id"])
@@ -331,8 +336,8 @@ def invoice_create():
     d = body()
     items = d.get("line_items")
     items = items if isinstance(items, list) else []
-    vendor = d.get("vendor", "")
-    inv_date = d.get("invoice_date", "")
+    vendor = _s(d.get("vendor"))
+    inv_date = _s(d.get("invoice_date"))
     database = db.get_db()
     loc = db.active_location_id()
     # Guard against logging the same delivery twice (a re-snapped photo or a
@@ -348,10 +353,10 @@ def invoice_create():
         "subtotal, tax, total, image_path, notes, raw_json, status, payment_account) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
-            loc, vendor, inv_date, d.get("invoice_number", ""),
-            d.get("category"), money.normalize(d.get("subtotal")), money.normalize(d.get("tax")),
-            money.normalize(d.get("total")), d.get("image_path"), d.get("notes", ""),
-            d.get("raw_json", ""), d.get("status", "closed"), d.get("payment_account"),
+            loc, vendor, inv_date, _s(d.get("invoice_number")),
+            _s(d.get("category")) or None, money.normalize(d.get("subtotal")), money.normalize(d.get("tax")),
+            money.normalize(d.get("total")), _s(d.get("image_path")) or None, _s(d.get("notes")),
+            _s(d.get("raw_json")), _s(d.get("status")) or "closed", _s(d.get("payment_account")) or None,
         ),
     )
     inv_id = cur.lastrowid
@@ -419,7 +424,27 @@ def invoice_delete(inv_id):
                       (inv_id, loc)).fetchone()
     if not row:
         abort(404)
+    # Which SKUs does this invoice touch? Capture before the cascade so we can
+    # recompute their last price afterward (deleting the newest delivery must not
+    # strand a now-wrong "last price" on the vendor item).
+    affected = [r["vendor_item_id"] for r in db_.execute(
+        "SELECT DISTINCT vendor_item_id FROM invoice_items "
+        "WHERE invoice_id=? AND vendor_item_id IS NOT NULL", (inv_id,))]
     db_.execute("DELETE FROM invoices WHERE id=? AND location_id IS ?", (inv_id, loc))
+    for vi_id in affected:
+        # Re-point last price/date at the most recent remaining positive-priced
+        # line for this SKU, or NULL it if nothing is left.
+        db_.execute(
+            "UPDATE vendor_items SET "
+            "  last_purchase_date=(SELECT inv.invoice_date FROM invoice_items ii "
+            "    JOIN invoices inv ON inv.id=ii.invoice_id "
+            "    WHERE ii.vendor_item_id=vendor_items.id AND ii.unit_cost>0 "
+            "    ORDER BY inv.invoice_date DESC, ii.id DESC LIMIT 1), "
+            "  last_purchase_price=(SELECT ii.unit_cost FROM invoice_items ii "
+            "    JOIN invoices inv ON inv.id=ii.invoice_id "
+            "    WHERE ii.vendor_item_id=vendor_items.id AND ii.unit_cost>0 "
+            "    ORDER BY inv.invoice_date DESC, ii.id DESC LIMIT 1) "
+            "WHERE id=?", (vi_id,))
     db_.commit()
     if row["image_path"]:
         try:
@@ -441,15 +466,15 @@ def invoice_update(inv_id):
         "SELECT 1 FROM invoices WHERE id=? AND location_id IS ?", (inv_id, loc)
     ).fetchone():
         abort(404)
-    vendor = d.get("vendor", "")
-    inv_date = d.get("invoice_date", "")
+    vendor = _s(d.get("vendor"))
+    inv_date = _s(d.get("invoice_date"))
     database.execute(
         "UPDATE invoices SET vendor=?, invoice_date=?, invoice_number=?, category=?, "
         "subtotal=?, tax=?, total=?, notes=?, status=?, payment_account=? "
         "WHERE id=? AND location_id IS ?",
-        (vendor, inv_date, d.get("invoice_number", ""), d.get("category"),
+        (vendor, inv_date, _s(d.get("invoice_number")), _s(d.get("category")) or None,
          money.normalize(d.get("subtotal")), money.normalize(d.get("tax")), money.normalize(d.get("total")),
-         d.get("notes", ""), d.get("status", "closed"), d.get("payment_account"),
+         _s(d.get("notes")), _s(d.get("status")) or "closed", _s(d.get("payment_account")) or None,
          inv_id, loc),
     )
     items = d.get("line_items")
@@ -560,16 +585,19 @@ def count_save():
     loc = db.active_location_id()
     cur = database.execute(
         "INSERT INTO counts(location_id, note, value) VALUES(?, ?, 0)",
-        (loc, d.get("note", "")),
+        (loc, _s(d.get("note"))),
     )
     count_id = cur.lastrowid
     total_value = 0.0
     for ln in lines:
         if not isinstance(ln, dict):
             continue
+        item_id = _i(ln.get("item_id"))
+        if item_id is None:
+            continue
         item = database.execute(
             "SELECT unit_cost FROM inventory_items WHERE id=? AND location_id IS ?",
-            (ln.get("item_id"), loc),
+            (item_id, loc),
         ).fetchone()
         if not item:
             continue  # ignore items that don't belong to the active store
@@ -578,11 +606,11 @@ def count_save():
         total_value += qty * unit_cost
         database.execute(
             "INSERT INTO count_lines(count_id, item_id, qty, unit_cost) VALUES(?,?,?,?)",
-            (count_id, ln.get("item_id"), qty, unit_cost),
+            (count_id, item_id, qty, unit_cost),
         )
         database.execute(
             "UPDATE inventory_items SET last_count=? WHERE id=? AND location_id IS ?",
-            (qty, ln.get("item_id"), loc),
+            (qty, item_id, loc),
         )
     value = money.normalize(total_value)
     database.execute("UPDATE counts SET value=? WHERE id=?", (value, count_id))
@@ -670,8 +698,8 @@ def vendor_create():
     cur = db.get_db().execute(
         "INSERT INTO vendors(location_id, name, contact_name, phone, email, account_number, "
         "order_days, notes) VALUES(?,?,?,?,?,?,?,?)",
-        (db.active_location_id(), name, d.get("contact_name", ""), d.get("phone", ""),
-         d.get("email", ""), d.get("account_number", ""), d.get("order_days", ""), d.get("notes", "")),
+        (db.active_location_id(), name, _s(d.get("contact_name")), _s(d.get("phone")),
+         _s(d.get("email")), _s(d.get("account_number")), _s(d.get("order_days")), _s(d.get("notes"))),
     )
     db.get_db().commit()
     return jsonify({"id": cur.lastrowid})
@@ -817,7 +845,7 @@ def product_create():
     name = _s(d.get("name"))
     if not name:
         return jsonify({"error": "Product needs a name."}), 400
-    cols = [k for k in _PRODUCT_COLS if k in d]
+    cols = [k for k in _PRODUCT_COLS if k in d and _scalar(d[k])]   # drop list/dict values
     if "name" not in cols:
         cols.append("name")
     cols.append("location_id")
@@ -874,7 +902,7 @@ def product_new_item_accept(vid):
     if "category_id" in d:
         sets.append("category_id=?"); vals.append(_i(d.get("category_id")))
     if "product_id" in d:
-        sets.append("product_id=?"); vals.append(_i(d.get("product_id")))
+        sets.append("product_id=?"); vals.append(_own_product_id(db.get_db(), d.get("product_id")))
     vals += [vid, db.active_location_id()]
     cur = db.get_db().execute(
         f"UPDATE vendor_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
@@ -969,8 +997,9 @@ def vendor_item_create():
     cur = db.get_db().execute(
         "INSERT INTO vendor_items(location_id, vendor_id, vendor_name, vendor_item_name, product_id, "
         "category_id, item_code, order_guide, status) VALUES(?,?,?,?,?,?,?,?, 'reviewed')",
-        (db.active_location_id(), _i(d.get("vendor_id")), d.get("vendor_name", ""), name,
-         _i(d.get("product_id")), _i(d.get("category_id")), d.get("item_code", ""), _i(d.get("order_guide"), 0)),
+        (db.active_location_id(), _i(d.get("vendor_id")), _s(d.get("vendor_name")), name,
+         _own_product_id(db.get_db(), d.get("product_id")), _i(d.get("category_id")),
+         _s(d.get("item_code")), _i(d.get("order_guide"), 0)),
     )
     db.get_db().commit()
     return jsonify({"id": cur.lastrowid})
@@ -983,7 +1012,9 @@ def vendor_item_update(vid):
     for key in ("vendor_name", "vendor_item_name", "product_id", "category_id",
                 "item_code", "order_guide", "status", "archived"):
         if key in d and _scalar(d[key]):
-            sets.append(f"{key}=?"); vals.append(d[key])
+            # a product_id must belong to the active store (else drop to NULL)
+            val = _own_product_id(db.get_db(), d[key]) if key == "product_id" else d[key]
+            sets.append(f"{key}=?"); vals.append(val)
     if sets:
         vals += [vid, db.active_location_id()]
         cur = db.get_db().execute(
@@ -1145,7 +1176,7 @@ def recipe_create():
         "VALUES(?,?,?,?,?)",
         (db.active_location_id(), _s(d.get("name")),
          money.normalize(d.get("menu_price")) or 0, _f(d.get("yield_qty"), 1) or 1,
-         d.get("notes", "")),
+         _s(d.get("notes"))),
     )
     rid = cur.lastrowid
     _save_recipe_items(database, rid, d.get("items"))
@@ -1174,7 +1205,7 @@ def recipe_update(rid):
         "UPDATE recipes SET name=?, menu_price=?, yield_qty=?, notes=? "
         "WHERE id=? AND location_id IS ?",
         (_s(d.get("name")), money.normalize(d.get("menu_price")) or 0,
-         _f(d.get("yield_qty"), 1) or 1, d.get("notes", ""), rid, loc),
+         _f(d.get("yield_qty"), 1) or 1, _s(d.get("notes")), rid, loc),
     )
     database.execute("DELETE FROM recipe_items WHERE recipe_id=?", (rid,))
     _save_recipe_items(database, rid, d.get("items"))
@@ -1333,9 +1364,12 @@ def _resolve_vendor_item(database, vendor, inv_date, line, loc):
 
 def _f(v, default=None):
     try:
-        return float(v)
+        f = float(v)
     except (TypeError, ValueError):
         return default
+    # Reject inf/nan ("Infinity" parses as a float) so they can't poison stored
+    # qty/unit_cost and downstream sums.
+    return f if math.isfinite(f) else default
 
 
 def _i(v, default=None):
@@ -1355,6 +1389,20 @@ def _scalar(v):
     """True if v is safe to bind to sqlite (not a list/dict). Used to drop
     structured values from dynamic UPDATE column lists instead of 500ing."""
     return not isinstance(v, (list, dict))
+
+
+def _own_product_id(database, v):
+    """A product_id coerced to int and validated to belong to the active store,
+    else None — so a vendor item can't reference (and surface the name of)
+    another store's product. Mirrors the recipe write guard."""
+    pid = _i(v)
+    if pid is None:
+        return None
+    row = database.execute(
+        "SELECT 1 FROM inventory_items WHERE id=? AND location_id IS ?",
+        (pid, db.active_location_id()),
+    ).fetchone()
+    return pid if row else None
 
 
 with app.app_context():

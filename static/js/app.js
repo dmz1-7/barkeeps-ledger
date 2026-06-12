@@ -313,8 +313,11 @@ function effectiveTheme() {
   return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 function applyThemeToggleIcon() {
+  const dark = effectiveTheme() === "dark";
   const btn = $("#theme-toggle");
-  if (btn) btn.textContent = effectiveTheme() === "dark" ? "◐" : "◑";
+  if (btn) btn.textContent = dark ? "◐" : "◑";
+  const meta = $("#theme-color-meta");
+  if (meta) meta.setAttribute("content", dark ? "#141414" : "#fbfaf7");
 }
 $("#theme-toggle").addEventListener("click", () => {
   const next = effectiveTheme() === "dark" ? "light" : "dark";
