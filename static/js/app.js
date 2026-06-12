@@ -264,6 +264,15 @@ function buildNav() {
     }
     return html;
   }).join("");
+
+  // Mobile bottom tab bar: top-level sections only, quick switching (CSS hides
+  // it on desktop). Mirrors the sidebar's active section.
+  const tb = $("#tabbar");
+  if (tb) {
+    tb.innerHTML = NAV.map((n) =>
+      `<a href="${n.href}" class="${n.tab === section ? "active" : ""}">
+        <span class="ic">${n.icon}</span><b>${esc(n.label)}</b></a>`).join("");
+  }
 }
 
 function route() {
