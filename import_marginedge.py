@@ -19,6 +19,7 @@ import sqlite3
 import sys
 
 import db
+import money
 
 DEFAULT_DIR = "/mnt/c/Users/dmkab/Downloads"
 
@@ -173,11 +174,11 @@ class Importer:
                     "INSERT INTO invoices(location_id, vendor, invoice_date, invoice_number, status, total) "
                     "VALUES(?,?,?,?,?,?)",
                     (self.loc, row[vendor_i].strip(), _iso(row[date_i]), row[num_i].strip(),
-                     (status or "closed").strip().lower(), _price(row[total_i])))
+                     (status or "closed").strip().lower(), money.normalize(_price(row[total_i]))))
                 inv_id = cur.lastrowid
                 n_inv += 1
                 for amt_s, cid in zip(row[cat_start:], cat_ids):
-                    amt = _price(amt_s)
+                    amt = money.normalize(_price(amt_s))
                     if amt:
                         self.c.execute(
                             "INSERT INTO invoice_items(invoice_id, name, total, category_id) "

@@ -29,6 +29,7 @@ os.environ["APP_SECRET"] = ""
 import db                       # noqa: E402
 import square_client            # noqa: E402
 import cogs                     # noqa: E402
+import money                    # noqa: E402
 import reports                  # noqa: E402
 from db import get_db           # noqa: E402
 import app as app_module        # noqa: E402
@@ -704,6 +705,124 @@ class BusinessToday(Base):
         now = dt.datetime(2026, 6, 13, 3, 30, tzinfo=dt.timezone.utc)
         with flask_app.app_context():
             self.assertEqual(square_client.business_today(now), dt.date(2026, 6, 12))
+
+
+class MoneyHelpers(unittest.TestCase):
+    """money.py routes settled amounts through integer cents so sums and
+    comparisons are exact and writes are clean to the penny."""
+
+    def test_to_cents_and_back(self):
+        self.assertEqual(money.to_cents("42.50"), 4250)
+        self.assertEqual(money.to_cents(None), 0)
+        self.assertEqual(money.to_cents("", default=0), 0)
+        self.assertEqual(money.to_cents("junk", default=0), 0)
+        self.assertEqual(money.to_dollars(4250), 42.5)
+        # The classic float trap, made exact.
+        self.assertEqual(money.to_cents(0.1) + money.to_cents(0.2), money.to_cents(0.3))
+
+    def test_cents_or_none_keeps_zero_distinct(self):
+        self.assertIsNone(money.cents_or_none(None))
+        self.assertIsNone(money.cents_or_none(""))
+        self.assertIsNone(money.cents_or_none("abc"))
+        self.assertEqual(money.cents_or_none(0), 0)       # $0.00 is a real amount
+
+    def test_normalize_cleans_noise_and_preserves_none(self):
+        self.assertIsNone(money.normalize(None))
+        self.assertIsNone(money.normalize(""))
+        self.assertEqual(money.normalize(0.1 + 0.2), 0.3)  # 0.30000000000000004 -> 0.3
+        self.assertEqual(money.normalize(12.344), 12.34)
+        self.assertEqual(money.normalize(12.346), 12.35)
+
+    def test_half_cent_uses_bankers_rounding(self):
+        # 0.125 is exactly representable, so this is deterministic: round() is
+        # half-even (consistent with every other round(x, 2) in the app), so
+        # 0.125 -> 0.12 not 0.13. Pinned so a switch to half-up is a conscious choice.
+        self.assertEqual(money.normalize(0.125), 0.12)
+        self.assertEqual(money.to_cents(0.125), 12)
+
+    def test_sum_dollars_is_exact(self):
+        self.assertNotEqual(sum([0.1, 0.2]), 0.3)          # the naive way drifts
+        self.assertEqual(money.sum_dollars([0.1, 0.2]), 0.3)
+        self.assertEqual(money.sum_dollars([0.10] * 10), 1.0)
+        self.assertEqual(money.sum_dollars([None, "5.00", 2.5]), 7.5)
+
+    def test_same_money(self):
+        self.assertTrue(money.same_money(10.00, 10.004))   # same to the penny
+        self.assertFalse(money.same_money(10.00, 10.01))
+        self.assertTrue(money.same_money(10.00, 10.01, tol_cents=1))
+
+
+class ReconcileExact(unittest.TestCase):
+    """_reconcile compares in integer cents, so many small lines reconcile
+    exactly instead of relying on a final float round to hide drift."""
+
+    def test_many_small_lines_reconcile_exactly(self):
+        r = app_module._reconcile(1.00, None, 1.00, [{"total": 0.10}] * 10)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["line_sum"], 1.0)
+        self.assertEqual(r["delta"], 0.0)
+
+    def test_real_gap_still_flagged(self):
+        r = app_module._reconcile(1.00, None, 1.00, [{"total": 0.10}] * 9)  # $0.90
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["delta"], -0.1)
+
+    def test_tolerance_boundary_at_exact_dollar(self):
+        # expected $5.00 -> 0.5% = 2.5c; a 2c gap reconciles, 3c does not. (This
+        # is the half-even edge that bit the old round()-based tolerance.)
+        self.assertTrue(app_module._reconcile(5.00, None, 5.00, [{"total": 5.02}])["ok"])
+        self.assertFalse(app_module._reconcile(5.00, None, 5.00, [{"total": 5.03}])["ok"])
+
+    def test_tax_exclusive_and_inclusive_both_reconcile(self):
+        excl = app_module._reconcile(100.0, 8.0, 108.0, [{"total": 100.0}])
+        self.assertTrue(excl["ok"])
+        self.assertEqual(excl["expected"], 100.0)
+        incl = app_module._reconcile(100.0, 8.0, 108.0, [{"total": 108.0}])
+        self.assertTrue(incl["ok"])
+        self.assertEqual(incl["expected"], 108.0)
+
+
+class DuplicateCentPrecision(Base):
+    """The no-invoice-number fallback dup check matches to the exact penny."""
+
+    def _post(self, total):
+        return self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_number": "", "invoice_date": "2026-06-01",
+            "total": total, "line_items": []})
+
+    def test_same_penny_is_duplicate(self):
+        self.assertEqual(self._post(10.00).status_code, 200)
+        self.assertEqual(self._post(10.004).status_code, 409)   # rounds to 10.00
+
+    def test_off_by_a_penny_is_not_duplicate(self):
+        self.assertEqual(self._post(10.00).status_code, 200)
+        self.assertEqual(self._post(10.01).status_code, 200)
+
+
+class MoneyWriteNormalization(Base):
+    """Settled amounts land in the DB clean to the penny, so they sum exactly."""
+
+    def test_invoice_total_stored_to_the_penny_and_sums_exactly(self):
+        for _ in range(10):
+            self.client.post("/api/invoices", json={
+                "vendor": "Drip", "invoice_number": "", "invoice_date": "2026-06-02",
+                "total": 0.10, "line_items": [], "confirm_duplicate": True})
+        with flask_app.app_context():
+            stored = [r["total"] for r in get_db().execute(
+                "SELECT total FROM invoices WHERE lower(vendor)='drip'")]
+        self.assertEqual(len(stored), 10)
+        self.assertTrue(all(t == 0.1 for t in stored))      # clean, not 0.099999…
+        self.assertEqual(money.sum_dollars(stored), 1.0)
+
+    def test_line_total_normalized_on_save(self):
+        r = self.client.post("/api/invoices", json={
+            "vendor": "Drip", "invoice_number": "L1", "invoice_date": "2026-06-03",
+            "total": 0.30, "line_items": [{"name": "x", "total": 0.1 + 0.2}]})
+        self.assertEqual(r.status_code, 200)
+        with flask_app.app_context():
+            t = get_db().execute(
+                "SELECT total FROM invoice_items WHERE name='x'").fetchone()["total"]
+        self.assertEqual(t, 0.3)                            # 0.30000000000000004 cleaned
 
 
 if __name__ == "__main__":

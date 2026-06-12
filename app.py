@@ -29,6 +29,7 @@ from flask import (
 
 import db
 import cogs
+import money
 import reports
 import square_client
 from invoice_ai import parse_invoice, InvoiceError
@@ -332,8 +333,8 @@ def invoice_create():
         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             loc, vendor, inv_date, d.get("invoice_number", ""),
-            d.get("category"), _f(d.get("subtotal")), _f(d.get("tax")),
-            _f(d.get("total")), d.get("image_path"), d.get("notes", ""),
+            d.get("category"), money.normalize(d.get("subtotal")), money.normalize(d.get("tax")),
+            money.normalize(d.get("total")), d.get("image_path"), d.get("notes", ""),
             d.get("raw_json", ""), d.get("status", "closed"), d.get("payment_account"),
         ),
     )
@@ -344,7 +345,7 @@ def invoice_create():
             "INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, "
             "vendor_item_id, category_id) VALUES(?,?,?,?,?,?,?,?)",
             (inv_id, it.get("name", ""), _f(it.get("qty")), it.get("unit"),
-             _f(it.get("unit_cost")), _f(it.get("total")), vi_id, cat_id),
+             _f(it.get("unit_cost")), money.normalize(it.get("total")), vi_id, cat_id),
         )
     database.commit()
     return jsonify({"id": inv_id})
@@ -429,7 +430,7 @@ def invoice_update(inv_id):
         "subtotal=?, tax=?, total=?, notes=?, status=?, payment_account=? "
         "WHERE id=? AND location_id IS ?",
         (vendor, inv_date, d.get("invoice_number", ""), d.get("category"),
-         _f(d.get("subtotal")), _f(d.get("tax")), _f(d.get("total")),
+         money.normalize(d.get("subtotal")), money.normalize(d.get("tax")), money.normalize(d.get("total")),
          d.get("notes", ""), d.get("status", "closed"), d.get("payment_account"),
          inv_id, loc),
     )
@@ -441,7 +442,7 @@ def invoice_update(inv_id):
             "INSERT INTO invoice_items(invoice_id, name, qty, unit, unit_cost, total, "
             "vendor_item_id, category_id) VALUES(?,?,?,?,?,?,?,?)",
             (inv_id, it.get("name", ""), _f(it.get("qty")), it.get("unit"),
-             _f(it.get("unit_cost")), _f(it.get("total")), vi_id, cat_id),
+             _f(it.get("unit_cost")), money.normalize(it.get("total")), vi_id, cat_id),
         )
     database.commit()
     return jsonify({"id": inv_id,
@@ -553,9 +554,10 @@ def count_save():
             "UPDATE inventory_items SET last_count=? WHERE id=? AND location_id IS ?",
             (qty, ln.get("item_id"), loc),
         )
-    database.execute("UPDATE counts SET value=? WHERE id=?", (round(total_value, 2), count_id))
+    value = money.normalize(total_value)
+    database.execute("UPDATE counts SET value=? WHERE id=?", (value, count_id))
     database.commit()
-    return jsonify({"id": count_id, "value": round(total_value, 2)})
+    return jsonify({"id": count_id, "value": value})
 
 
 @app.get("/api/counts")
@@ -665,7 +667,7 @@ def vendor_get(vid):
     ).fetchall()
     out["invoices"] = [dict(r) for r in invoices]
     out["items"] = [dict(r) for r in items]
-    out["spend"] = round(sum((r["total"] or 0) for r in invoices), 2)
+    out["spend"] = money.sum_dollars(r["total"] for r in invoices)
     return jsonify(out)
 
 
@@ -1054,23 +1056,29 @@ def _reconcile(subtotal, tax, total, line_items):
     as reconciled. Returns {line_sum, expected, delta, ok}; ok is None when
     there's nothing to compare (no amounts, or a header-only invoice with no
     line items)."""
+    # Work in integer cents so the line sum and the comparison are exact (float
+    # summation of many line totals otherwise drifts below the penny).
     items = line_items or []
-    line_sum = round(sum((_f(li.get("total"), 0) or 0) for li in items), 2)
-    sub, tot, tx = _f(subtotal), _f(total), (_f(tax) or 0)
+    line_c = sum(money.to_cents(li.get("total"), 0) for li in items)
+    sub_c, tot_c, tx_c = money.cents_or_none(subtotal), money.cents_or_none(total), money.to_cents(tax, 0)
     targets = []
-    if sub is not None:
-        targets.append(round(sub, 2))
-    if tot is not None:
-        targets.append(round(tot, 2))
-        if tx:
-            targets.append(round(tot - tx, 2))   # pre-tax base when lines exclude tax
+    if sub_c is not None:
+        targets.append(sub_c)
+    if tot_c is not None:
+        targets.append(tot_c)
+        if tx_c:
+            targets.append(tot_c - tx_c)   # pre-tax base when lines exclude tax
     if not targets or not items:
-        return {"line_sum": line_sum, "expected": (targets[0] if targets else None),
-                "delta": None, "ok": None}
-    expected = min(targets, key=lambda t: abs(line_sum - t))   # whichever convention fits
-    delta = round(line_sum - expected, 2)
-    tol = max(0.02, abs(expected) * 0.005)   # tolerate penny rounding; flag a real gap
-    return {"line_sum": line_sum, "expected": expected, "delta": delta, "ok": abs(delta) <= tol}
+        exp = targets[0] / 100.0 if targets else None
+        return {"line_sum": line_c / 100.0, "expected": exp, "delta": None, "ok": None}
+    expected_c = min(targets, key=lambda t: abs(line_c - t))   # whichever convention fits
+    delta_c = line_c - expected_c
+    # Tolerate sub-cent rounding: >=2c, or 0.5% of the invoice. Compared as exact
+    # integers (x1000, no rounding) so this verdict is bit-identical to the JS
+    # preview in reconRead — no half-even/half-up drift between the two.
+    ok = abs(delta_c) * 1000 <= max(2000, abs(expected_c) * 5)
+    return {"line_sum": line_c / 100.0, "expected": expected_c / 100.0,
+            "delta": delta_c / 100.0, "ok": ok}
 
 
 def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, total):
@@ -1091,9 +1099,11 @@ def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, tot
         if row:
             return dict(row)
     if vendor and inv_date and total is not None:
+        # Compare to the penny exactly (CAST avoids float fuzz from REAL storage).
         row = database.execute(
             f"SELECT {cols} FROM invoices WHERE location_id IS ? AND lower(vendor)=lower(?) "
-            "AND invoice_date=? AND total IS NOT NULL AND ABS(total - ?) < 0.01 "
+            "AND invoice_date=? AND total IS NOT NULL "
+            "AND CAST(ROUND(total*100) AS INTEGER) = CAST(ROUND(?*100) AS INTEGER) "
             "ORDER BY id DESC LIMIT 1",
             (loc, vendor, inv_date, total),
         ).fetchone()

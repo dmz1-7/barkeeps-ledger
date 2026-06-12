@@ -602,27 +602,31 @@ async function openInvoiceForm(parsed, imagePath, warn, existing) {
   // Live reconciliation: do the line items add up to the invoice? Lines may be
   // tax-exclusive (sum to subtotal) or tax-inclusive (sum to total), so match
   // EITHER. Mirrors the backend _reconcile.
-  const round2 = (x) => Math.round(x * 100) / 100;
+  // Work in integer cents (like the backend _reconcile) so the line sum and the
+  // comparison are exact and don't drift below the penny in float.
+  const cents = (x) => Math.round((Number(x) || 0) * 100);
   const reconRead = () => {
     // Mirror the server: reconcile only the named rows that will actually be
     // saved, and gate on whether any exist (not on the sum being zero).
     const named = [...lines.querySelectorAll(".lrow")]
       .filter((r) => r.querySelector(".li-name").value.trim());
-    const lineSum = round2(named.reduce((s, r) => s + (f(r.querySelector(".li-total").value) || 0), 0));
+    const lineC = named.reduce((s, r) => s + cents(f(r.querySelector(".li-total").value)), 0);
     const sub = f($("#f-sub").value), tax = f($("#f-tax").value) || 0, tot = f($("#f-total").value);
     const targets = [];
-    if (sub != null) targets.push(sub);
-    if (tot != null) { targets.push(tot); if (tax) targets.push(round2(tot - tax)); }
+    if (sub != null) targets.push(cents(sub));
+    if (tot != null) { targets.push(cents(tot)); if (tax) targets.push(cents(tot) - cents(tax)); }
     const box = $("#recon");
     if (!targets.length || !named.length) { box.innerHTML = ""; box.className = "recon"; return; }
-    let expected = targets[0];
-    targets.forEach((t) => { if (Math.abs(lineSum - t) < Math.abs(lineSum - expected)) expected = t; });
-    const delta = round2(lineSum - expected);
-    const ok = Math.abs(delta) <= Math.max(0.02, Math.abs(expected) * 0.005);
+    let expectedC = targets[0];
+    targets.forEach((t) => { if (Math.abs(lineC - t) < Math.abs(lineC - expectedC)) expectedC = t; });
+    const deltaC = lineC - expectedC;
+    // Exact-integer tolerance (>=2c or 0.5%), x1000 so it matches the backend
+    // _reconcile bit-for-bit (no Math.round vs Python round half-even drift).
+    const ok = Math.abs(deltaC) * 1000 <= Math.max(2000, Math.abs(expectedC) * 5);
     box.className = "recon " + (ok ? "recon-ok" : "recon-warn");
     box.innerHTML = ok
-      ? `✓ Line items add up (${money(lineSum)})`
-      : `⚠ Line items total ${money(lineSum)}, invoice is ${money(expected)} — off by ${money(Math.abs(delta))}`;
+      ? `✓ Line items add up (${money(lineC / 100)})`
+      : `⚠ Line items total ${money(lineC / 100)}, invoice is ${money(expectedC / 100)} — off by ${money(Math.abs(deltaC) / 100)}`;
   };
 
   $("#add-line").addEventListener("click", () => { lines.appendChild(lineRow({})); reconRead(); });
