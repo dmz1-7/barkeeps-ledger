@@ -408,6 +408,7 @@ input:focus, select:focus, textarea:focus {
   .view { padding: 0 24px 32px; }
   .stat-grid { grid-template-columns: repeat(4, 1fr); }
   .sticky-action { position: static; max-width: none; margin: 16px 0 0; padding: 0; background: none; border: none; }
+  .tabbar { display: none; }   /* desktop uses the sidebar */
 }
 @media (max-width: 899px) {
   .hamburger { display: block; }
@@ -415,6 +416,9 @@ input:focus, select:focus, textarea:focus {
     z-index: 45; background: var(--surface); overflow-y: auto; border-right: 1px solid var(--border);
     transform: translateX(-100%); transition: transform .2s ease; padding-top: env(safe-area-inset-top); }
   .sidebar.open { transform: none; }
+  /* leave room for the fixed bottom tab bar, and float the count's save bar above it */
+  .app { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
+  .sticky-action { bottom: calc(56px + env(safe-area-inset-bottom)); }
 }
 
 /* ============================================================
