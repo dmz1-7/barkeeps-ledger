@@ -448,7 +448,9 @@ def _shift_cost(shift, fallback_rate=0.0):
         if br.get("is_paid", True):
             continue
         b_start = _parse_ts(br.get("start_at"))
-        b_end = _parse_ts(br.get("end_at"))
+        # An open/malformed unpaid break (no parseable end) falls back to the shift's
+        # end, so its time is still deducted instead of silently staying in paid hours.
+        b_end = _parse_ts(br.get("end_at")) or end
         if b_start and b_end:
             seconds -= (b_end - b_start).total_seconds()
     hours = max(seconds, 0) / 3600.0
