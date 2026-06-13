@@ -1092,7 +1092,9 @@ async function renderCount() {
   v.appendChild(el(`<div style="height:60px"></div>`));
   const action = el(`<div class="sticky-action">
     <button class="btn btn-grn btn-block" id="save-count">Finish &amp; Record Count</button></div>`);
-  document.body.appendChild(action);
+  // Append into the centered .app column (not <body>) so on desktop, where the bar
+  // is position:static, it aligns under the content instead of rendering full-bleed.
+  (document.querySelector(".app") || document.body).appendChild(action);
 
   const cleanup = () => action.remove();
   $("#save-count", action).addEventListener("click", async () => {

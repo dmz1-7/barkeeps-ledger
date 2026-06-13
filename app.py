@@ -1655,6 +1655,10 @@ _NUM_REAL = {"par_level", "last_count", "unit_cost", "size_qty", "menu_price",
              "yield_qty", "pct"}
 _NUM_INT = {"sort_order", "on_inventory", "tax_exempt", "archived", "category_id",
             "product_id", "vendor_id", "order_guide"}
+# Boolean flag columns: filters use strict equality (archived=0 / archived=1), so a
+# NULL would orphan the row from BOTH the active list and every archived view —
+# clamp these to 0/1, never NULL.
+_BOOL_FLAGS = {"archived", "on_inventory", "tax_exempt", "order_guide"}
 
 
 def _image_name(v):
@@ -1677,6 +1681,11 @@ def _coerce_col(key, v):
         return _own_product_id(db.get_db(), v)
     if key == "vendor_id":
         return _valid_id("vendors", v, loc_scoped=True)
+    if key in _BOOL_FLAGS:
+        # Clamp to 0/1, NEVER NULL: a malformed value (_i -> None written verbatim)
+        # would orphan the row — SQL NULL matches neither `archived=0` nor `archived=1`,
+        # so it vanishes from the active list AND every archived view with no recovery.
+        return 1 if _i(v) else 0
     if key in _NUM_INT:
         return _i(v)
     return v if _scalar(v) else None

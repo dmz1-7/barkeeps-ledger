@@ -4055,6 +4055,22 @@ class PurchaseReportMixedUnits(Base):
         gin = [r for r in rows if r["product"] == "Gin"][0]
         self.assertTrue(gin["mixed_units"])   # case + btl can't be summed
 
+    def test_spend_units_and_store_isolation(self):
+        with flask_app.app_context():
+            d = get_db()
+            for loc, qty, total in ((1, 2, 20.0), (1, 3, 30.0), (2, 9, 999.0)):  # 2 store-1, 1 store-2
+                iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                                "VALUES(?,'V','2026-06-05',?)", (loc, total)).lastrowid
+                d.execute("INSERT INTO invoice_items(invoice_id,name,unit,qty,total) "
+                          "VALUES(?,'Gin','case',?,?)", (iid, qty, total))
+            d.commit()
+        rows = self.client.get("/api/products/purchase-report?start=2026-06-01&end=2026-06-30",
+                               headers={"X-Location-Id": "1"}).get_json()["rows"]
+        gin = [r for r in rows if r["product"] == "Gin"][0]
+        self.assertEqual(gin["spend"], 50.0)    # 20 + 30 (store-1 only, not the store-2 999)
+        self.assertEqual(gin["units"], 5.0)     # 2 + 3, single unit -> not mixed
+        self.assertFalse(gin["mixed_units"])
+
 
 class OrphanInvoiceItemScrub(Base):
     def test_init_db_removes_orphaned_invoice_items(self):
@@ -4272,6 +4288,80 @@ class InvoiceParseSuccess(InvoiceParseEndpoint):
         self.assertTrue(j["image_path"].endswith(".png"))
         self.assertEqual(j["parsed"]["vendor"], "Acme")
         self.assertTrue(os.path.exists(os.path.join(app_module.UPLOAD_DIR, j["image_path"])))
+
+
+# ============================================================================
+# Twenty-second audit-fix regression tests (2026-06-12, 22nd re-audit)
+# ============================================================================
+
+class DbFilePermissions(Base):
+    def test_db_file_is_owner_only(self):
+        import stat
+        with flask_app.app_context():
+            get_db()   # ensure the file/chmod path ran
+        mode = stat.S_IMODE(os.stat(db.DB_PATH).st_mode)
+        self.assertEqual(mode & 0o077, 0)   # no group/other access
+
+
+class BoolFlagClamp(Base):
+    def test_malformed_archived_clamps_not_null(self):
+        with flask_app.app_context():
+            d = get_db()
+            pid = d.execute("INSERT INTO inventory_items(location_id,name,archived) "
+                            "VALUES(1,'Gin',0)").lastrowid
+            d.commit()
+        # a malformed flag value must clamp to 0/1, never persist NULL (which would
+        # orphan the row from both the active list and every archived view)
+        self.client.put(f"/api/inventory/{pid}", json={"archived": []})
+        with flask_app.app_context():
+            row = get_db().execute("SELECT archived FROM inventory_items WHERE id=?", (pid,)).fetchone()
+        self.assertEqual(row["archived"], 0)   # not NULL
+        # the row is still visible in the active list
+        names = [r["name"] for r in self.client.get("/api/inventory",
+                                                     headers={"X-Location-Id": "1"}).get_json()]
+        self.assertIn("Gin", names)
+
+
+class ImporterPreservesSizes(Base):
+    def test_reimport_preserves_user_entered_size(self):
+        import import_marginedge
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("INSERT INTO inventory_items(location_id,name,unit_cost,size_qty,size_unit) "
+                      "VALUES(1,'Gin',20,750,'ml')")
+            d.commit()
+            imp = import_marginedge.Importer(d, 1)
+            imp.clear_location()
+            imp.import_products([{"Name": "Gin", "Latest Price": "20"}])
+            imp.relink_sizes()
+            d.commit()
+            row = d.execute("SELECT size_qty, size_unit FROM inventory_items "
+                            "WHERE location_id IS 1 AND name='Gin'").fetchone()
+        self.assertEqual((row["size_qty"], row["size_unit"]), (750, "ml"))   # not wiped to NULL
+
+
+class SalesReportFutureDay(Base):
+    def test_future_days_none_and_past_zero_day(self):
+        # a real Square cache for one mid-week day; report 'today' = that Wednesday
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            wed = dt.date(2026, 2, 18)   # a Wednesday
+            mon = wed - dt.timedelta(days=2)
+            d = get_db()
+            d.execute("INSERT INTO daily_sales(square_location_id,date,net_sales,fetched_at) "
+                      "VALUES(?,?,?, '2020-01-01')", (_DC_SQID, wed.isoformat(), 500.0))
+            d.commit()
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "business_today", return_value=wed), \
+                    mock.patch.object(square_client, "daily_sales_cached",
+                                      side_effect=lambda a, b: {wed.isoformat(): 500.0}):
+                rep = reports.sales_report()
+        days = {x["day"]: x for x in rep["days"]}
+        # Thu..Sun are after 'today' -> this_week None (not 0)
+        for lbl in ("Thu", "Fri", "Sat", "Sun"):
+            self.assertIsNone(days[lbl]["this_week"])
+        self.assertEqual(days["Wed"]["this_week"], 500.0)
+        self.assertEqual(rep["totals"]["this_week"], 500.0)   # only the one real day
 
 
 if __name__ == "__main__":

@@ -307,10 +307,24 @@ DEFAULT_SETTINGS = {
 _SCHEMA_READY = set()   # DB_PATHs whose columns this process has ensured
 
 
+def _restrict_db_perms():
+    """Lock the DB file + its dir to owner-only (0600/0700): they hold app_secret
+    (the session-token signing key) and the Square token in plaintext — the
+    documented filesystem-perms trust model — so they must not inherit a
+    world-readable umask. Mirrors backup()'s chmod of the snapshot."""
+    try:
+        os.chmod(os.path.dirname(DB_PATH), 0o700)
+        if os.path.exists(DB_PATH):
+            os.chmod(DB_PATH, 0o600)
+    except OSError:
+        pass
+
+
 def get_db():
     if "db" not in g:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         conn = sqlite3.connect(DB_PATH)
+        _restrict_db_perms()
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         # Self-heal once per process: re-run ONLY _ensure_columns (column adds) so
@@ -554,6 +568,7 @@ def _migrate_legacy_data(conn):
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    _restrict_db_perms()                       # owner-only: holds app_secret + Square token
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")   # match get_db so any cascading migration behaves
     _predrop_legacy_sales_mix(conn)
