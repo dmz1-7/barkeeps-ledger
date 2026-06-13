@@ -250,7 +250,8 @@ def sales_report(today=None):
 
     # One cached pull covers the weekly grids (incl. last year), PTD and YTD.
     full_start = min(ly_mon, year_start, last_mon)
-    sales = square_client.daily_sales_cached(full_start, today)
+    errors = []
+    sales = square_client.daily_sales_cached(full_start, today, errors)
 
     def g(d):
         return sales.get(d.isoformat(), 0.0)
@@ -290,6 +291,9 @@ def sales_report(today=None):
         "period_to_date": _r(ptd),
         "year_to_date": _r(ytd),
         "square_configured": configured,
+        # Surface a Square outage so an all-$0 degraded report is distinguishable
+        # from a genuine slow sales week (mirrors summary/controllable_pl).
+        "sales_error": errors[0] if errors else None,
     }
 
 
@@ -380,14 +384,15 @@ def price_movers(start, end):
                 old_price = ep
         if old_price is None or old_price == new_price:
             continue
+        q = _r(qty)   # use the DISPLAYED qty for impact so Δprice x shown-qty reconciles
         movers.append({
             "name": g["name"],
             "category": cat_names.get(g["cat"], "Uncategorized"),
             "old_price": _r(old_price),
             "new_price": _r(new_price),
             "change_pct": _r((new_price - old_price) / old_price * 100) if old_price else None,
-            "qty": _r(qty),
-            "impact": _r((new_price - old_price) * qty),
+            "qty": q,
+            "impact": _r((new_price - old_price) * q),
         })
 
     movers.sort(key=lambda m: -abs(m["impact"]))
@@ -482,8 +487,8 @@ def price_alerts(lookback_days=30, min_pct=10.0):
             "new_price": _r(new),
             "change_pct": _r(pct),
             "last_date": g["new_date"],
-            "qty": _r(g["new_qty"]),
-            "impact": _r((new - old) * (g["new_qty"] or 0)),
+            "qty": (q := _r(g["new_qty"] or 0)),
+            "impact": _r((new - old) * q),   # impact from the displayed qty, so they reconcile
         })
 
     alerts.sort(key=lambda a: -a["change_pct"])

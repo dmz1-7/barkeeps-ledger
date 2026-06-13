@@ -269,11 +269,14 @@ def get_daily_sales(start, end):
         return None
 
 
-def daily_sales_cached(start, end):
+def daily_sales_cached(start, end, errors=None):
     """Per-day net sales for [start, end] for the active Square location, backed
     by the daily_sales table. Only days that are missing from the cache or still
     changing (today and yesterday) are fetched from Square; everything else is
-    served from the DB. Returns {iso_date: dollars} (0 for days with no sales)."""
+    served from the DB. Returns {iso_date: dollars} (0 for days with no sales).
+
+    If `errors` is a list, a refresh failure (Square down) appends a message to it
+    so the caller can surface a 'Square unavailable' note instead of a silent $0."""
     c = _cfg()
     if not is_configured():
         return {}
@@ -303,6 +306,8 @@ def daily_sales_cached(start, end):
             # The Square call errored. Serve whatever we already have and DO NOT
             # write zeros — overwriting good cached days with 0 would silently
             # and permanently corrupt the Sales history.
+            if errors is not None:
+                errors.append("Square sales temporarily unavailable")
             return cached
         # Write ONLY the days we set out to refresh (missing or stale). A day that
         # was already cached and not in `need` is left untouched, so a partial

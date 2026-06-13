@@ -242,8 +242,10 @@ def summary(start, end):
     prime_cogs = cogs_amount
     if cogs_sales_basis == "interval" and cogs_sales:
         prime_cogs = money.normalize(cogs_amount * sales / cogs_sales) or 0.0
-    # Prime needs labor; null it on a labor outage rather than report COGS-only as prime.
-    prime = None if labor_failed else round((prime_cogs or 0.0) + labor, 2)
+    # Prime needs labor; null it on a labor outage rather than report COGS-only as
+    # prime. Also pair it with prime_pct: if prime_pct is None (e.g. range sales is 0
+    # so labor_pct is None) don't show a lone Prime$ next to a blank Prime%.
+    prime = None if (labor_failed or prime_pct is None) else round((prime_cogs or 0.0) + labor, 2)
 
     return {
         "range": {"start": start.isoformat(), "end": end.isoformat()},

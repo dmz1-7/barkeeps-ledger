@@ -4354,7 +4354,7 @@ class SalesReportFutureDay(Base):
             with mock.patch.object(square_client, "is_configured", return_value=True), \
                     mock.patch.object(square_client, "business_today", return_value=wed), \
                     mock.patch.object(square_client, "daily_sales_cached",
-                                      side_effect=lambda a, b: {wed.isoformat(): 500.0}):
+                                      side_effect=lambda a, b, e=None: {wed.isoformat(): 500.0}):
                 rep = reports.sales_report()
         days = {x["day"]: x for x in rep["days"]}
         # Thu..Sun are after 'today' -> this_week None (not 0)
@@ -4362,6 +4362,78 @@ class SalesReportFutureDay(Base):
             self.assertIsNone(days[lbl]["this_week"])
         self.assertEqual(days["Wed"]["this_week"], 500.0)
         self.assertEqual(rep["totals"]["this_week"], 500.0)   # only the one real day
+
+
+# ============================================================================
+# Twenty-third audit-fix regression tests (2026-06-12, 23rd re-audit)
+# ============================================================================
+
+class SalesReportErrorSurfaced(Base):
+    def test_square_error_sets_sales_error_and_keeps_cache(self):
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            today = square_client.business_today()
+            d = get_db()
+            d.execute("INSERT INTO daily_sales(square_location_id,date,net_sales,fetched_at) "
+                      "VALUES(?,?,?, '2020-01-01')", (_DC_SQID, today.isoformat(), 500.0))
+            d.commit()
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "get_daily_sales", return_value=None):
+                rep = reports.sales_report()
+        self.assertIsNotNone(rep["sales_error"])   # outage surfaced, not a silent $0
+
+
+class PriceMoverQtyReconciles(Base):
+    def test_impact_uses_displayed_qty(self):
+        with flask_app.app_context():
+            d = get_db()
+            # prior + in-window price, fractional qty so raw != rounded
+            for date, price, qty in (("2026-05-15", 6.0, 1.005), ("2026-06-20", 10.0, 3.004)):
+                iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                                "VALUES(1,'Acme',?,?)", (date, price)).lastrowid
+                d.execute("INSERT INTO invoice_items(invoice_id,name,unit_cost,qty,total) "
+                          "VALUES(?,'Gin',?,?,?)", (iid, price, qty, price))
+            d.commit()
+            res = reports.price_movers(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        gin = [m for m in res["movers"] if m["name"] == "Gin"][0]
+        self.assertEqual(gin["impact"], round((gin["new_price"] - gin["old_price"]) * gin["qty"], 2))
+
+
+class CountNegativeQtyClamped(Base):
+    def test_negative_qty_clamped_to_zero(self):
+        with flask_app.app_context():
+            pid = get_db().execute("INSERT INTO inventory_items(location_id,name,unit_cost) "
+                                   "VALUES(1,'Gin',10)").lastrowid
+            get_db().commit()
+        r = self.client.post("/api/counts", json={"lines": [{"item_id": pid, "qty": -5}]}).get_json()
+        self.assertEqual(r["value"], 0.0)   # negative clamped, not -50
+
+
+class PrimePairsWithPct(Base):
+    def test_prime_null_when_prime_pct_null(self):
+        # range with zero sales but a count interval that has sales -> labor_pct None
+        # -> prime_pct None; prime$ must also be None (not a lone dollar figure).
+        with flask_app.app_context():
+            d = get_db()
+            for day, val in (("2026-06-01", 1000.0), ("2026-06-30", 800.0)):
+                d.execute("INSERT INTO counts(location_id,taken_at,value) VALUES(1,?,?)",
+                          (f"{day} 12:00:00", val))
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-15',500)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',500)", (iid,))
+            d.commit()
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "get_sales",
+                                      return_value={"sales": 0.0, "orders": 0, "error": None}), \
+                    mock.patch.object(square_client, "get_labor",
+                                      return_value={"labor": 300.0, "hours": 10, "error": None}), \
+                    mock.patch.object(square_client, "daily_sales_cached",
+                                      side_effect=lambda b, e, errs=None: {
+                                          (b + dt.timedelta(days=i)).isoformat(): 100.0
+                                          for i in range((e - b).days + 1)}):
+                s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertIsNone(s["prime_pct"])   # no range sales -> labor_pct/prime_pct None
+        self.assertIsNone(s["prime"])       # prime$ pairs with prime_pct
 
 
 if __name__ == "__main__":
