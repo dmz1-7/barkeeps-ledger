@@ -1068,8 +1068,11 @@ def product_purchase_report():
     start, end = cogs.parse_range(request.args.get("start"), request.args.get("end"))
     rows = db.get_db().execute(
         "SELECT ii.name AS product, c.category_type, c.name AS category, "
-        "       ii.unit AS report_by, COALESCE(SUM(ii.qty),0) AS units, "
-        "       COALESCE(SUM(ii.total),0) AS spend "
+        "       MIN(ii.unit) AS report_by, COALESCE(SUM(ii.qty),0) AS units, "
+        "       COALESCE(SUM(ii.total),0) AS spend, "
+        # one product bought in different units (case vs btl) makes SUM(qty) meaningless;
+        # count distinct units so the UI can flag "(mixed)" instead of a bogus total.
+        "       COUNT(DISTINCT NULLIF(TRIM(COALESCE(ii.unit,'')),'')) AS unit_count "
         "FROM invoice_items ii JOIN invoices inv ON inv.id = ii.invoice_id "
         "LEFT JOIN categories c ON c.id = ii.category_id "
         "WHERE inv.location_id IS ? AND inv.invoice_date >= ? AND inv.invoice_date <= ? "
@@ -1077,7 +1080,8 @@ def product_purchase_report():
         "GROUP BY ii.name, ii.category_id ORDER BY spend DESC",
         (db.active_location_id(), start.isoformat(), end.isoformat()),
     ).fetchall()
-    out = [{**dict(r), "units": round(r["units"], 2), "spend": round(r["spend"], 2)}
+    out = [{**dict(r), "units": round(r["units"], 2), "spend": round(r["spend"], 2),
+            "mixed_units": (r["unit_count"] or 0) > 1}
            for r in rows]
     return jsonify({"rows": out,
                     "period": {"start": start.isoformat(), "end": end.isoformat()}})

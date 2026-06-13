@@ -587,6 +587,18 @@ def init_db():
     # default (e.g. from an old DB) onto the default store so it's not invisible.
     conn.execute(
         "UPDATE sales_mix SET location_id=(SELECT MIN(id) FROM locations) WHERE location_id=0")
+    # Scrub any orphaned invoice_items left by a historical delete that ran with
+    # foreign_keys OFF (the CASCADE didn't fire). They're invisible to every report
+    # (all inner-JOIN invoices) but are dead data that would fail a future
+    # foreign_key_check / table rebuild. Idempotent.
+    conn.execute("DELETE FROM invoice_items WHERE invoice_id NOT IN (SELECT id FROM invoices)")
+    # Defensive: NULL any dangling category_id. On a MIGRATED DB invoice_items.category_id
+    # has no ON DELETE SET NULL FK (ALTER ADD COLUMN can't carry it), so if a category were
+    # ever hard-deleted a reference would dangle. Categories are only soft-deleted today, so
+    # this is a no-op now, but it keeps the FK-less column self-healing. (NULL refs are
+    # untouched: `NULL NOT IN (...)` is NULL, not true.)
+    conn.execute("UPDATE invoice_items SET category_id=NULL "
+                 "WHERE category_id IS NOT NULL AND category_id NOT IN (SELECT id FROM categories)")
     # Build indexes LAST — after every location_id column is populated — so the
     # uq_inv_loc_name unique index sees real (non-NULL) location ids and a genuine
     # duplicate is caught by the guarded CREATE rather than a later unguarded UPDATE.

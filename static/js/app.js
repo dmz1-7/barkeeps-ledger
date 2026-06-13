@@ -879,9 +879,11 @@ async function renderInvoiceDetail(parts) {
     $("#back").addEventListener("click", () => { location.hash = "#/orders"; });
     $("#del-inv").addEventListener("click", async () => {
       if (!confirm("Delete this invoice?")) return;
-      await api("DELETE", `/api/invoices/${id}`);
-      toast("Removed.");
-      location.hash = "#/orders";
+      try {
+        await api("DELETE", `/api/invoices/${id}`);
+        toast("Removed.");
+        location.hash = "#/orders";
+      } catch (e) { if (e.message !== "unauthorized") toast(e.message); }
     });
   } catch (e) { view().innerHTML = `<p class="err">${esc(e.message)}</p>`; }
 }
@@ -989,9 +991,11 @@ async function openItemEditor(it) {
   });
   if (!isNew) $("#del-item").addEventListener("click", async () => {
     if (!confirm("Remove this item from inventory?")) return;
-    await api("DELETE", `/api/products/${it.id}`);
-    toast("Removed.");
-    location.hash = "#/inventory";
+    try {
+      await api("DELETE", `/api/products/${it.id}`);
+      toast("Removed.");
+      location.hash = "#/inventory";
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message); }
   });
 }
 
@@ -1699,8 +1703,9 @@ async function renderPurchaseReport() {
         { key: "product", label: "Product", cls: "strong", fmt: (r) => esc(r.product) },
         { key: "category_type", label: "Type", fmt: (r) => r.category_type ? typePill(r.category_type) : "—" },
         { key: "category", label: "Category", fmt: (r) => esc(r.category || "—") },
-        { key: "report_by", label: "Report By", fmt: (r) => esc(r.report_by || "—") },
-        { key: "units", label: "Units", align: "right", fmt: (r) => fmtQty(r.units) },
+        { key: "report_by", label: "Report By", fmt: (r) => r.mixed_units ? "mixed" : esc(r.report_by || "—") },
+        // suppress the SUM(qty) when units are mixed (case + btl can't be added meaningfully)
+        { key: "units", label: "Units", align: "right", fmt: (r) => r.mixed_units ? "—" : fmtQty(r.units) },
         { key: "spend", label: "Spend", align: "right", fmt: (r) => money(r.spend) },
       ], d.rows, { search: true, initialSort: { key: "spend", dir: -1 },
         footer: { product: `${d.rows.length} products`, spend: `<b>${money(total)}</b>` } }));
@@ -1856,7 +1861,7 @@ async function recipeEditor(id) {
       <select class="ri-prod"><option value="">— product —</option>${prodOptions}</select>
       <input class="ri-qty" type="number" step="0.0001" placeholder="qty" value="${num(it.qty)}">
       <input class="ri-unit" list="unit-list" placeholder="unit" value="${esc(it.unit || "")}" style="max-width:5.5rem">
-      <button class="btn btn-sm btn-ghost ri-del">&times;</button>
+      <button class="btn btn-sm btn-ghost ri-del" aria-label="remove ingredient" title="remove">&times;</button>
     </div>`);
     if (it.product_id) row.querySelector(".ri-prod").value = String(it.product_id);
     row.querySelector(".ri-del").addEventListener("click", () => { row.remove(); recalc(); });

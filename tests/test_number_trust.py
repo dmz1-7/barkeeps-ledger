@@ -4022,5 +4022,150 @@ class KeylessBreakIsPaid(Base):
         self.assertEqual(cost, 60.0)                   # 4 * $15
 
 
+# ============================================================================
+# Twentieth audit-fix regression tests (2026-06-12, 20th re-audit)
+# ============================================================================
+
+class NetSalesServiceCharge(Base):
+    def test_service_charge_subtracted_net_amounts_frame(self):
+        order = {"net_amounts": {"total_money": {"amount": 1180},
+                                 "tax_money": {"amount": 100},
+                                 "tip_money": {"amount": 80},
+                                 "service_charge_money": {"amount": 50}}}
+        self.assertEqual(square_client._net_sales_cents(order), 950)   # 1180-100-80-50
+
+    def test_service_charge_subtracted_order_level_frame(self):
+        order = {"total_money": {"amount": 1180}, "total_tax_money": {"amount": 100},
+                 "total_tip_money": {"amount": 80}, "total_service_charge_money": {"amount": 50}}
+        self.assertEqual(square_client._net_sales_cents(order), 950)
+
+
+class PurchaseReportMixedUnits(Base):
+    def test_mixed_units_flagged(self):
+        with flask_app.app_context():
+            d = get_db()
+            for unit, qty in (("case", 3), ("btl", 24)):
+                iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                                "VALUES(1,'V','2026-06-05',10)").lastrowid
+                d.execute("INSERT INTO invoice_items(invoice_id,name,unit,qty,total) "
+                          "VALUES(?,'Gin',?,?,10)", (iid, unit, qty))
+            d.commit()
+        rows = self.client.get("/api/products/purchase-report"
+                               "?start=2026-06-01&end=2026-06-30").get_json()["rows"]
+        gin = [r for r in rows if r["product"] == "Gin"][0]
+        self.assertTrue(gin["mixed_units"])   # case + btl can't be summed
+
+
+class OrphanInvoiceItemScrub(Base):
+    def test_init_db_removes_orphaned_invoice_items(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.commit()                          # close any open txn so PRAGMA takes effect
+            d.execute("PRAGMA foreign_keys=OFF")  # mimic the historical FK-off delete that orphaned it
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(999999,'orphan',5)")
+            d.commit()
+            d.execute("PRAGMA foreign_keys=ON")
+        db.init_db()   # idempotent migration includes the orphan scrub
+        with flask_app.app_context():
+            n = get_db().execute("SELECT COUNT(*) c FROM invoice_items "
+                                 "WHERE invoice_id=999999").fetchone()["c"]
+        self.assertEqual(n, 0)
+
+
+class GetSalesOutboundLocation(Base):
+    def _capture(self, fn, loc_setting):
+        captured = {}
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return {"orders": [], "cursor": None}
+
+        def fake_post(url, **kw):
+            captured["body"] = kw.get("json")
+            return FakeResp()
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            db.set_setting("active_location_id", loc_setting)
+            with mock.patch.object(square_client.requests, "post", side_effect=fake_post):
+                fn(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        return captured["body"]
+
+    def test_get_sales_posts_active_store_location(self):
+        self.assertEqual(self._capture(square_client.get_sales, "1")["location_ids"], [_DC_SQID])
+        self.assertEqual(self._capture(square_client.get_sales, "2")["location_ids"], ["LS1WRASW8V02R"])
+
+    def test_get_daily_sales_posts_active_store_location(self):
+        self.assertEqual(self._capture(square_client.get_daily_sales, "2")["location_ids"],
+                         ["LS1WRASW8V02R"])
+
+
+class InventoryRouteIsolation(AuthGateCoverage):
+    def test_foreign_inventory_put_and_delete_404(self):
+        with flask_app.app_context():
+            iid = get_db().execute("INSERT INTO inventory_items(location_id,name,unit_cost) "
+                                   "VALUES(2,'NycGin',9)").lastrowid
+            get_db().commit()
+        token = self.client.post("/api/login", json={"password": "secret"}).get_json()["token"]
+        h1 = {"Authorization": "Bearer " + token, "X-Location-Id": "1"}
+        self.assertEqual(self.client.put(f"/api/inventory/{iid}", headers=h1,
+                                         json={"unit_cost": 999}).status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/inventory/{iid}", headers=h1).status_code, 404)
+        with flask_app.app_context():
+            row = get_db().execute("SELECT unit_cost, archived FROM inventory_items "
+                                   "WHERE id=?", (iid,)).fetchone()
+        self.assertEqual((row["unit_cost"], row["archived"]), (9, 0))   # untouched
+
+
+class VendorItemRouteIsolation(AuthGateCoverage):
+    def test_foreign_vendor_item_put_and_delete_404(self):
+        with flask_app.app_context():
+            vi = get_db().execute("INSERT INTO vendor_items(location_id,vendor_item_name) "
+                                  "VALUES(2,'NYC case')").lastrowid
+            get_db().commit()
+        token = self.client.post("/api/login", json={"password": "secret"}).get_json()["token"]
+        h1 = {"Authorization": "Bearer " + token, "X-Location-Id": "1"}
+        self.assertEqual(self.client.put(f"/api/vendor-items/{vi}", headers=h1,
+                                         json={"vendor_item_name": "HACK"}).status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/vendor-items/{vi}", headers=h1).status_code, 404)
+        with flask_app.app_context():
+            row = get_db().execute("SELECT vendor_item_name, archived FROM vendor_items "
+                                   "WHERE id=?", (vi,)).fetchone()
+        self.assertEqual((row["vendor_item_name"], row["archived"]), ("NYC case", 0))
+
+
+class PriceAlertsTenantIsolation(Base):
+    def _hike(self, loc, old, new):
+        with flask_app.app_context():
+            d = get_db()
+            for date, price in (("2026-06-01", old), ("2026-06-20", new)):
+                iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                                "VALUES(?,'Acme',?,?)", (loc, date, price)).lastrowid
+                d.execute("INSERT INTO invoice_items(invoice_id,name,unit_cost,qty,total) "
+                          "VALUES(?,'Gin',?,1,?)", (iid, price, price))
+            d.commit()
+
+    def test_alerts_exclude_other_store(self):
+        self._hike(1, 10.0, 20.0)   # store-1 hike
+        self._hike(2, 10.0, 99.0)   # store-2 hike, must not appear for store 1
+        with flask_app.app_context():
+            db.set_setting("active_location_id", "1")
+            res = reports.price_alerts(lookback_days=60, min_pct=10)
+        news = [a["new_price"] for a in res["alerts"] if a["name"] == "Gin"]
+        self.assertIn(20.0, news)
+        self.assertNotIn(99.0, news)   # store-2 price never surfaces for store 1
+
+
+class ShiftBreakOpenEnd(Base):
+    def test_unpaid_break_without_end_deducted_to_shift_end(self):
+        # an open unpaid break (no end_at) must still be deducted (to the shift end),
+        # not silently left in paid hours.
+        s = {"start_at": "2026-06-01T18:00:00Z", "end_at": "2026-06-01T22:00:00Z",
+             "wage": {"hourly_rate": {"amount": 1500}},
+             "breaks": [{"is_paid": False, "start_at": "2026-06-01T20:00:00Z"}]}   # no end_at
+        cost, hours, _ = square_client._shift_cost(s, 0.0)
+        self.assertEqual(hours, 2.0)   # 18-22 shift minus the 20:00->22:00 open break
+        self.assertEqual(cost, 30.0)   # 2h * $15
+
+
 if __name__ == "__main__":
     unittest.main()
