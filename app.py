@@ -337,8 +337,17 @@ def save_settings():
     _NUMERIC_SETTINGS = ("target_cogs_pct", "target_labor_pct", "default_hourly_wage",
                          "price_alert_pct")
     for key in _NUMERIC_SETTINGS:
-        if key in data and _scalar(data[key]) and _f(data[key]) is None:
-            return jsonify({"error": f"{key} must be a number."}), 400
+        if key in data and _scalar(data[key]):
+            v = _f(data[key])
+            if v is None:
+                return jsonify({"error": f"{key} must be a number."}), 400
+            # Reject negatives: a negative price_alert_pct would fire an alert on
+            # every change, a negative target would render nonsensically. Percent
+            # fields also can't exceed 100.
+            if v < 0:
+                return jsonify({"error": f"{key} must not be negative."}), 400
+            if key in ("target_cogs_pct", "target_labor_pct") and v > 100:
+                return jsonify({"error": f"{key} must be between 0 and 100."}), 400
     for key in ("square_env", "square_version", "ai_model") + _NUMERIC_SETTINGS:
         if key in data and _scalar(data[key]):
             db.set_setting(key, data[key])
@@ -586,6 +595,14 @@ def invoice_update(inv_id):
     # from COGS, the dashboard and every date-ranged report while still showing in
     # date-agnostic totals — a number-trust inconsistency.
     inv_date = str(cogs._iso_or_400(d.get("invoice_date")))
+    # Editing an invoice to collide with ANOTHER existing one (same vendor+number, or
+    # vendor+date+total) would create two records for one delivery — the same
+    # double-count the create guard prevents. Check, excluding this invoice itself.
+    if not d.get("confirm_duplicate"):
+        dup = _find_duplicate_invoice(database, loc, vendor, d.get("invoice_number", ""),
+                                      inv_date, _f(d.get("total")), exclude_id=inv_id)
+        if dup:
+            return jsonify({"error": "duplicate", "duplicate": dup}), 409
     database.execute(
         "UPDATE invoices SET vendor=?, invoice_date=?, invoice_number=?, category=?, "
         "subtotal=?, tax=?, total=?, notes=?, status=?, payment_account=? "
@@ -756,13 +773,16 @@ def count_save():
         (loc, _s(d.get("note")), taken_at),
     )
     count_id = cur.lastrowid
-    total_value = 0.0
+    # Collapse to one entry per item_id (last qty wins) before summing — a client
+    # that submits the same item twice would otherwise double-count it in the $
+    # snapshot (counts.value) while last_count keeps only the final qty, leaving the
+    # stored inventory value inconsistent with the line set (it feeds usage-COGS).
+    deduped = {}
     for ln in lines:
-        if not isinstance(ln, dict):
-            continue
-        item_id = _i(ln.get("item_id"))
-        if item_id is None:
-            continue
+        if isinstance(ln, dict) and _i(ln.get("item_id")) is not None:
+            deduped[_i(ln.get("item_id"))] = ln
+    total_value = 0.0
+    for item_id, ln in deduped.items():
         item = database.execute(
             "SELECT unit_cost FROM inventory_items WHERE id=? AND location_id IS ?",
             (item_id, loc),
@@ -1517,20 +1537,23 @@ def _reconcile(subtotal, tax, total, line_items):
             "delta": delta_c / 100.0, "ok": ok}
 
 
-def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, total):
+def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, total, exclude_id=None):
     """Return a brief {id, vendor, invoice_date, invoice_number, total} for an
     existing invoice in this location that looks like the same one, else None.
+    `exclude_id` skips a specific invoice (so an EDIT doesn't match itself).
 
     Strong signal: same vendor + a non-empty invoice number. Fallback when there's
     no number: same vendor + date + total (within a cent)."""
     vendor = _s(vendor)
     num = _s(invoice_number)
     cols = "id, vendor, invoice_date, invoice_number, total"
+    excl = " AND id <> ?" if exclude_id is not None else ""
+    excl_args = [exclude_id] if exclude_id is not None else []
     if vendor and num:
         row = database.execute(
             f"SELECT {cols} FROM invoices WHERE location_id IS ? AND lower(vendor)=lower(?) "
-            "AND invoice_number <> '' AND lower(invoice_number)=lower(?) ORDER BY id DESC LIMIT 1",
-            (loc, vendor, num),
+            f"AND invoice_number <> '' AND lower(invoice_number)=lower(?){excl} ORDER BY id DESC LIMIT 1",
+            (loc, vendor, num, *excl_args),
         ).fetchone()
         if row:
             return dict(row)
@@ -1539,9 +1562,9 @@ def _find_duplicate_invoice(database, loc, vendor, invoice_number, inv_date, tot
         row = database.execute(
             f"SELECT {cols} FROM invoices WHERE location_id IS ? AND lower(vendor)=lower(?) "
             "AND invoice_date=? AND total IS NOT NULL "
-            "AND CAST(ROUND(total*100) AS INTEGER) = CAST(ROUND(?*100) AS INTEGER) "
+            f"AND CAST(ROUND(total*100) AS INTEGER) = CAST(ROUND(?*100) AS INTEGER){excl} "
             "ORDER BY id DESC LIMIT 1",
-            (loc, vendor, inv_date, total),
+            (loc, vendor, inv_date, total, *excl_args),
         ).fetchone()
         if row:
             return dict(row)
@@ -1557,9 +1580,10 @@ def _resolve_vendor_item(database, vendor, inv_date, line, loc):
     if not name:
         return None, cat_id
     row = database.execute(
+        # COLLATE NOCASE (not lower()) so the idx_vendoritems_loc_name index is seekable
         "SELECT id, category_id FROM vendor_items "
-        "WHERE location_id IS ? AND lower(COALESCE(vendor_name,'')) = lower(?) "
-        "  AND lower(vendor_item_name) = lower(?)",
+        "WHERE location_id IS ? AND COALESCE(vendor_name,'') = ? COLLATE NOCASE "
+        "  AND vendor_item_name = ? COLLATE NOCASE",
         (loc, vendor or "", name),
     ).fetchone()
     # A credit/return line carries a non-positive unit_cost — it's not a real
@@ -1579,7 +1603,7 @@ def _resolve_vendor_item(database, vendor, inv_date, line, loc):
         )
         return row["id"], (row["category_id"] or cat_id)
     vrow = database.execute(
-        "SELECT id FROM vendors WHERE location_id IS ? AND lower(name)=lower(?)",
+        "SELECT id FROM vendors WHERE location_id IS ? AND name = ? COLLATE NOCASE",
         (loc, vendor or ""),
     ).fetchone()
     cur = database.execute(

@@ -90,7 +90,7 @@ class Importer:
         if not name:
             return None
         r = self.c.execute(
-            "SELECT id FROM vendors WHERE location_id IS ? AND lower(name)=lower(?)",
+            "SELECT id FROM vendors WHERE location_id IS ? AND name = ? COLLATE NOCASE",
             (self.loc, name)).fetchone()
         if r:
             return r["id"]

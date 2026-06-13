@@ -309,6 +309,10 @@ function openDrawer() {
 }
 $("#navtoggle").addEventListener("click", openDrawer);
 $("#scrim").addEventListener("click", closeDrawer);
+// Escape closes the open drawer (keyboard users can't reach the scrim)
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && $("#sidebar").classList.contains("open")) closeDrawer();
+});
 
 /* ---------- theme toggle (light/dark, persisted per device) ---------- */
 const THEME_KEY = "ledger_theme";
@@ -449,7 +453,10 @@ async function renderDashboard() {
     dashRange = { start: $("#d-start").value, end: $("#d-end").value, key: "custom" };
     loadDash();
   });
-  setRange(dashRange.key, true);
+  // On mount always load: setRange's silent guard skips loadDash for a "custom"
+  // key (so chip toggles don't refetch stale custom data), but on a fresh mount
+  // with a previously-chosen custom range that would leave the dashboard blank.
+  dashRange.key === "custom" ? loadDash() : setRange(dashRange.key, true);
 }
 
 function setRange(key, silent) {

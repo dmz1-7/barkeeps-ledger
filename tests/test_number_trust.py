@@ -4167,5 +4167,112 @@ class ShiftBreakOpenEnd(Base):
         self.assertEqual(cost, 30.0)   # 2h * $15
 
 
+# ============================================================================
+# Twenty-first audit-fix regression tests (2026-06-12, 21st re-audit)
+# ============================================================================
+
+class VendorLookupIndexed(Base):
+    def test_vendor_item_and_vendor_lookups_use_indexes(self):
+        with flask_app.app_context():
+            d = get_db()
+            def plan(sql, args):
+                return " ".join(r[3] for r in d.execute("EXPLAIN QUERY PLAN " + sql, args))
+            vi = plan("SELECT id FROM vendor_items WHERE location_id IS ? AND "
+                      "COALESCE(vendor_name,'') = ? COLLATE NOCASE AND vendor_item_name = ? COLLATE NOCASE",
+                      (1, "Acme", "Gin"))
+            ve = plan("SELECT id FROM vendors WHERE location_id IS ? AND name = ? COLLATE NOCASE",
+                      (1, "Acme"))
+        self.assertIn("idx_vendoritems_loc_name", vi)   # seek, not full SCAN
+        self.assertIn("idx_vendors_loc_name", ve)
+
+
+class UsageCoincidentColdCache(Base):
+    def test_coincident_counts_cold_cache_falls_back_to_purchases(self):
+        with flask_app.app_context():
+            d = get_db()
+            for day, val in (("2026-06-01", 1000.0), ("2026-06-30", 800.0)):   # ON the range endpoints
+                d.execute("INSERT INTO counts(location_id,taken_at,value) VALUES(1,?,?)",
+                          (f"{day} 12:00:00", val))
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-15',500)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',500)", (iid,))
+            d.commit()
+            with mock.patch.object(square_client, "is_configured", return_value=True), \
+                    mock.patch.object(square_client, "get_sales",
+                                      return_value={"sales": 2000.0, "orders": 1, "error": None}), \
+                    mock.patch.object(square_client, "get_labor", return_value=dict(_LABOR0)), \
+                    mock.patch.object(square_client, "daily_sales_cached", side_effect=lambda b, e: {}):
+                s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        # cold cache -> interval basis not established -> don't divide usage COGS by a
+        # range denominator that still includes the opening day's sales; use purchases.
+        self.assertEqual(s["cogs_method"], "purchases")
+        self.assertEqual(s["cogs"], 500.0)
+
+
+class SettingsNumericBounds(Base):
+    def test_negative_and_over_100_rejected(self):
+        self.assertEqual(self.client.post("/api/settings", json={"price_alert_pct": -10}).status_code, 400)
+        self.assertEqual(self.client.post("/api/settings", json={"target_cogs_pct": -5}).status_code, 400)
+        self.assertEqual(self.client.post("/api/settings", json={"target_labor_pct": 150}).status_code, 400)
+        self.assertEqual(self.client.post("/api/settings", json={"price_alert_pct": 15}).status_code, 200)
+
+
+class InvoiceEditDuplicateGuard(Base):
+    def _post(self, num, total):
+        return self.client.post("/api/invoices", json={
+            "vendor": "Acme", "invoice_number": num, "invoice_date": "2026-06-05",
+            "total": total, "line_items": []}).get_json()["id"]
+
+    def test_editing_to_collide_is_409_unless_confirmed(self):
+        self._post("INV1", 100)
+        b = self._post("INV2", 50)
+        # edit B's number to collide with A -> duplicate
+        r = self.client.put(f"/api/invoices/{b}", json={
+            "vendor": "Acme", "invoice_number": "INV1", "invoice_date": "2026-06-05",
+            "total": 50, "line_items": []})
+        self.assertEqual(r.status_code, 409)
+        # editing B's own other fields (no collision) is fine
+        ok = self.client.put(f"/api/invoices/{b}", json={
+            "vendor": "Acme", "invoice_number": "INV2", "invoice_date": "2026-06-06",
+            "total": 55, "line_items": []})
+        self.assertEqual(ok.status_code, 200)
+        # confirm_duplicate overrides
+        forced = self.client.put(f"/api/invoices/{b}", json={
+            "vendor": "Acme", "invoice_number": "INV1", "invoice_date": "2026-06-05",
+            "total": 50, "confirm_duplicate": True, "line_items": []})
+        self.assertEqual(forced.status_code, 200)
+
+
+class CountDuplicateItemId(Base):
+    def test_same_item_twice_does_not_double_count(self):
+        with flask_app.app_context():
+            d = get_db()
+            pid = d.execute("INSERT INTO inventory_items(location_id,name,unit_cost) "
+                            "VALUES(1,'Gin',10)").lastrowid
+            d.commit()
+        r = self.client.post("/api/counts", json={"lines": [
+            {"item_id": pid, "qty": 2}, {"item_id": pid, "qty": 3}]}).get_json()
+        self.assertEqual(r["value"], 30.0)   # last qty 3 * $10, not (2+3) * $10 = 50
+
+
+class InvoiceParseSuccess(InvoiceParseEndpoint):
+    def test_success_persists_image_and_returns_png_path(self):
+        if not invoice_ai.HAVE_PIL:
+            self.skipTest("PIL not installed")
+        buf = io.BytesIO()
+        invoice_ai.Image.new("RGB", (2, 2)).save(buf, "PNG")
+        parsed = {"vendor": "Acme", "invoice_date": "2026-06-01", "invoice_number": "",
+                  "subtotal": None, "tax": None, "total": 10, "line_items": []}
+        with mock.patch.object(app_module, "parse_invoice", return_value=parsed):
+            r = self.client.post("/api/invoices/parse", data={
+                "image": (io.BytesIO(buf.getvalue()), "p.png")},
+                content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["image_path"].endswith(".png"))
+        self.assertEqual(j["parsed"]["vendor"], "Acme")
+        self.assertTrue(os.path.exists(os.path.join(app_module.UPLOAD_DIR, j["image_path"])))
+
+
 if __name__ == "__main__":
     unittest.main()

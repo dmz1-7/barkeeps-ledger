@@ -212,14 +212,16 @@ def summary(start, end):
             if interval_sales:
                 cogs_sales, cogs_sales_basis = interval_sales, "interval"
 
-    # If usage COGS spans an interval WIDER than the requested range but we couldn't
-    # establish the matching interval-sales denominator (cold/partial cache), then
-    # cogs_amount/range-sales would be inflated up to ~2x. Fall back to the
-    # range-consistent purchases basis rather than surface an inflated usage COGS%.
+    # If usage COGS is active but we couldn't establish the matching interval-sales
+    # denominator (cold/partial cache), cogs_amount/range-sales is misaligned: even
+    # in the COINCIDENT case (counts on the range endpoints) purchases drop b_date's
+    # deliveries while range sales still include b_date's sales, so COGS% drifts by a
+    # day. Fall back to the range-consistent purchases basis whenever the interval
+    # basis didn't take (a warm cache already set basis 'interval', so this is safe).
     # Only when Square is configured: with no sales, cogs_pct is None anyway and the
     # usage COGS dollar figure is still the useful one.
     if (usage_cogs is not None and square_client.is_configured()
-            and cogs_sales_basis == "range" and (b_date != start or e_date != end)):
+            and cogs_sales_basis == "range"):
         cogs_amount = purch["total"]
         cogs_method = "purchases"
         usage_period = None
