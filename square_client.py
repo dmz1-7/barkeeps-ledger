@@ -158,7 +158,10 @@ def _net_sales_cents(o):
     if not isinstance(o, dict):   # orders:[null] or a non-object order in a 200 body
         return 0
     na = o.get("net_amounts")
-    if na:
+    # Test the actual sub-field, not dict truthiness: a present-but-empty
+    # net_amounts:{} would be falsy and silently switch to the order-level frame
+    # (gross, NOT net-of-refunds) — mixing the two frames the docstring forbids.
+    if isinstance(na, dict) and na.get("total_money") is not None:
         return (_amt(na.get("total_money")) - _amt(na.get("tax_money"))
                 - _amt(na.get("tip_money")) - _amt(na.get("service_charge_money")))
     return (_amt(o.get("total_money")) - _amt(o.get("total_tax_money"))
