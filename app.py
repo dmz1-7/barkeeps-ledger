@@ -345,20 +345,28 @@ def save_settings():
     # value would be silently dropped and the user's save would appear to succeed.
     _NUMERIC_SETTINGS = ("target_cogs_pct", "target_labor_pct", "default_hourly_wage",
                          "price_alert_pct")
+    _PCT_SETTINGS = ("target_cogs_pct", "target_labor_pct", "price_alert_pct")
     for key in _NUMERIC_SETTINGS:
         if key in data and _scalar(data[key]):
+            # Reject a bool explicitly: _f(True)==1.0 would pass, then the RAW True is
+            # stored as 'True' and silently dropped (float('True') fails on read).
+            if isinstance(data[key], bool):
+                return jsonify({"error": f"{key} must be a number."}), 400
             v = _f(data[key])
             if v is None:
                 return jsonify({"error": f"{key} must be a number."}), 400
-            # Reject negatives: a negative price_alert_pct would fire an alert on
-            # every change, a negative target would render nonsensically. Percent
-            # fields also can't exceed 100.
+            # Reject negatives and absurd ceilings: a negative price_alert_pct fires on
+            # every change; a fat-fingered 1500 wage (meant 15.00) would ~100x Labor%.
             if v < 0:
                 return jsonify({"error": f"{key} must not be negative."}), 400
-            if key in ("target_cogs_pct", "target_labor_pct") and v > 100:
+            if key in _PCT_SETTINGS and v > 100:
                 return jsonify({"error": f"{key} must be between 0 and 100."}), 400
+            if key == "default_hourly_wage" and v > 1000:
+                return jsonify({"error": f"{key} looks too large."}), 400
     for key in ("square_env", "square_version", "ai_model") + _NUMERIC_SETTINGS:
         if key in data and _scalar(data[key]):
+            # Raw value (a stray bool — which would str() to 'True' and be silently
+            # dropped on read — was already rejected for numeric keys above).
             db.set_setting(key, data[key])
     # The Square location is per-store now: write it onto the active store's row,
     # not a shared global setting.
@@ -827,7 +835,11 @@ def count_save():
         # Clamp negatives: a count is a physical on-hand quantity (>=0). A negative
         # would deflate counts.value, the begin/end bracket that feeds usage-COGS.
         qty = max(_f(ln.get("qty"), 0) or 0, 0.0)
-        total_value += qty * unit_cost
+        # Guard the multiply too: a huge-but-finite qty * unit_cost can overflow to
+        # +inf, which money.normalize turns into NULL -> a later round(None) crashes
+        # the dashboard for any range bracketing this count. Drop a non-finite line.
+        inc = qty * unit_cost
+        total_value += inc if math.isfinite(inc) else 0.0
         database.execute(
             "INSERT INTO count_lines(count_id, item_id, qty, unit_cost) VALUES(?,?,?,?)",
             (count_id, item_id, qty, unit_cost),

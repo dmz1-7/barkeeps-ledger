@@ -424,12 +424,24 @@ def _seed_taxonomy(conn):
 
 
 def _seed_locations(conn):
-    """Insert seeded stores that aren't present yet (idempotent)."""
+    """Insert seeded stores that aren't present yet (idempotent). Also RE-BIND a
+    seeded store whose Square id was blanked back to its seed id, so an accidentally
+    cleared binding — and the daily_sales cache orphaned under that id (the cache
+    keys only on square_location_id) — is recovered. Non-destructive: only fills a
+    BLANK id, and only when no OTHER store already holds it (the partial unique index
+    would reject a collision)."""
     for name, sq in LOCATIONS:
         conn.execute(
             "INSERT OR IGNORE INTO locations(name, square_location_id) VALUES(?,?)",
             (name, sq),
         )
+        if sq:
+            conn.execute(
+                "UPDATE locations SET square_location_id=? "
+                "WHERE name=? AND COALESCE(square_location_id,'')='' "
+                "  AND NOT EXISTS (SELECT 1 FROM locations WHERE square_location_id=? AND name<>?)",
+                (sq, name, sq, name),
+            )
 
 
 def _predrop_legacy_sales_mix(conn):
@@ -619,6 +631,12 @@ def init_db():
     # this is a no-op now, but it keeps the FK-less column self-healing. (NULL refs are
     # untouched: `NULL NOT IN (...)` is NULL, not true.)
     conn.execute("UPDATE invoice_items SET category_id=NULL "
+                 "WHERE category_id IS NOT NULL AND category_id NOT IN (SELECT id FROM categories)")
+    # Symmetric scrubs for the other FK-less ALTER-added columns (a migrated DB has no
+    # ON DELETE SET NULL on these), keeping every such column self-healing.
+    conn.execute("UPDATE invoice_items SET vendor_item_id=NULL "
+                 "WHERE vendor_item_id IS NOT NULL AND vendor_item_id NOT IN (SELECT id FROM vendor_items)")
+    conn.execute("UPDATE inventory_items SET category_id=NULL "
                  "WHERE category_id IS NOT NULL AND category_id NOT IN (SELECT id FROM categories)")
     # Build indexes LAST — after every location_id column is populated — so the
     # uq_inv_loc_name unique index sees real (non-NULL) location ids and a genuine

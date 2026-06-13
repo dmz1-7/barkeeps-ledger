@@ -133,7 +133,10 @@ def _inventory_value_near(target, prefer_before=True):
         ).fetchone()
     if not row:
         return None
-    return {"value": round(row["value"], 2), "taken_at": row["taken_at"]}
+    # Defensive `or 0`: a historical count row with a NULL value (e.g. from a pre-fix
+    # overflow) must not crash round(None) and take out the dashboard. A 0 value then
+    # fails the positive-bracket guard in summary(), falling back to purchases COGS.
+    return {"value": round(row["value"] or 0, 2), "taken_at": row["taken_at"]}
 
 
 def summary(start, end):

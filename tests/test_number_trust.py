@@ -4538,5 +4538,111 @@ class PriceMoversMultiSku(Base):
         self.assertEqual(byname["Rum"]["new_price"], 8.0)
 
 
+# ============================================================================
+# Twenty-fifth audit-fix regression tests (2026-06-12, 25th re-audit)
+# ============================================================================
+
+class CountOverflowNoDashboard500(Base):
+    def test_overflowing_qty_does_not_null_value_or_500(self):
+        with flask_app.app_context():
+            pid = get_db().execute("INSERT INTO inventory_items(location_id,name,unit_cost) "
+                                   "VALUES(1,'Gin',10)").lastrowid
+            get_db().commit()
+        # a huge-but-finite qty * unit_cost overflows to +inf; the line must be
+        # dropped (value finite), not stored as NULL.
+        r = self.client.post("/api/counts", json={"lines": [{"item_id": pid, "qty": 1e308}]}).get_json()
+        self.assertIsNotNone(r["value"])
+        # and a count row that somehow holds NULL value must not crash the dashboard
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO counts(location_id,taken_at,value) "
+                             "VALUES(1,'2026-06-05 12:00:00',NULL)")
+            get_db().commit()
+            s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertIn("cogs", s)   # summary computed, did not raise on round(None)
+
+
+class ParseInvoiceArrayIs422(InvoiceParseEndpoint):
+    def test_top_level_json_array_yields_422_not_500(self):
+        if not invoice_ai.HAVE_PIL:
+            self.skipTest("PIL not installed")
+        import sys
+        import types
+        mod = types.ModuleType("anthropic")
+        mod.APIError = type("APIError", (Exception,), {})
+
+        class Block:
+            type = "text"
+            def __init__(self, t): self.text = t
+
+        class Messages:
+            def create(self, **kw):
+                class R:
+                    content = [Block("[1, 2, 3]")]   # model emits a top-level ARRAY
+                return R()
+
+        class Client:
+            def __init__(self, **kw): self.messages = Messages()
+        mod.Anthropic = Client
+        buf = io.BytesIO()
+        invoice_ai.Image.new("RGB", (2, 2)).save(buf, "PNG")
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}), \
+                mock.patch.dict(sys.modules, {"anthropic": mod}):
+            r = self.client.post("/api/invoices/parse", data={
+                "image": (io.BytesIO(buf.getvalue()), "p.png")},
+                content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 422)        # not a 500
+        self.assertIn("image_path", r.get_json())   # manual-entry fallback preserved
+
+
+class SettingsBoolAndCeiling(Base):
+    def test_bool_value_rejected(self):
+        r = self.client.post("/api/settings", json={"target_cogs_pct": True})
+        self.assertEqual(r.status_code, 400)
+        with flask_app.app_context():
+            self.assertNotEqual(db.get_setting("target_cogs_pct"), "True")
+
+    def test_absurd_wage_and_pct_rejected(self):
+        self.assertEqual(self.client.post("/api/settings",
+                                          json={"default_hourly_wage": 1500}).status_code, 400)
+        self.assertEqual(self.client.post("/api/settings",
+                                          json={"price_alert_pct": 250}).status_code, 400)
+        self.assertEqual(self.client.post("/api/settings",
+                                          json={"default_hourly_wage": 22.5}).status_code, 200)
+
+
+class GetLaborMultiPageSuccess(Base):
+    def test_two_success_pages_sum_labor(self):
+        def shift(hrs, rate):
+            return {"start_at": "2026-06-01T18:00:00Z",
+                    "end_at": f"2026-06-01T{18 + hrs:02d}:00:00Z",
+                    "wage": {"hourly_rate": {"amount": rate}}}
+
+        class FakeResp:
+            def __init__(self, d): self._d = d
+            def raise_for_status(self): pass
+            def json(self): return self._d
+        p1 = {"shifts": [shift(4, 1500)], "cursor": "c"}
+        p2 = {"shifts": [shift(2, 1500)], "cursor": None}
+        with flask_app.app_context():
+            db.set_setting("square_token", "tok")
+            with mock.patch.object(square_client.requests, "post",
+                                   side_effect=[FakeResp(p1), FakeResp(p2)]):
+                info = square_client.get_labor(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
+        self.assertEqual(info["labor"], 90.0)   # (4h + 2h) * $15, summed across pages
+        self.assertEqual(info["shifts"], 2)
+
+
+class BlankSquareIdRebound(Base):
+    def test_init_db_rebinds_blank_seeded_square_id(self):
+        with flask_app.app_context():
+            d = get_db()
+            d.execute("UPDATE locations SET square_location_id='' WHERE id=1")   # clear DC's id
+            d.commit()
+        db.init_db()   # _seed_locations re-binds the blank seeded id back to its value
+        with flask_app.app_context():
+            sqid = get_db().execute("SELECT square_location_id FROM locations WHERE id=1").fetchone()[0]
+        self.assertEqual(sqid, _DC_SQID)   # recovered (re-links any orphaned daily_sales)
+
+
 if __name__ == "__main__":
     unittest.main()
