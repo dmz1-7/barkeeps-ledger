@@ -130,6 +130,15 @@ class Importer:
                 "JOIN inventory_items ii ON ii.id = cl.item_id "
                 "WHERE ii.location_id IS ?", (self.loc,))
         }
+        # Preserve user-entered recipe sizes by name: the MarginEdge export has no
+        # size column, so re-inserting a product would NULL size_qty/size_unit and
+        # silently revert recipe lines to the raw qty*unit_cost fallback. Snapshot
+        # them now and re-apply after import (see relink_sizes).
+        self._size_links = {
+            r["name"].lower(): (r["size_qty"], r["size_unit"]) for r in self.c.execute(
+                "SELECT name, size_qty, size_unit FROM inventory_items "
+                "WHERE location_id IS ? AND size_qty IS NOT NULL", (self.loc,))
+        }
         self.c.execute("DELETE FROM inventory_items WHERE location_id IS ?", (self.loc,))
         self.c.execute("DELETE FROM vendors WHERE location_id IS ?", (self.loc,))
         print(f"  cleared prior data for location {self.loc} (invoices, items, vendor_items, products, vendors)")
@@ -147,6 +156,14 @@ class Importer:
                 relinked += 1
         if self._recipe_links:
             print(f"  re-linked {relinked}/{len(self._recipe_links)} recipe ingredients by name")
+
+    def relink_sizes(self):
+        """Re-apply user-entered size_qty/size_unit (snapshotted in clear_location) to
+        the re-imported products by name, so recipe unit-conversion survives a re-import."""
+        for name_lc, (sq, su) in getattr(self, "_size_links", {}).items():
+            self.c.execute(
+                "UPDATE inventory_items SET size_qty=?, size_unit=? "
+                "WHERE location_id IS ? AND name = ? COLLATE NOCASE", (sq, su, self.loc, name_lc))
 
     def relink_counts(self):
         """Re-attach count lines to the re-imported products by name (count_lines.item_id
@@ -291,6 +308,7 @@ def main():
     print(f"  category report: {os.path.basename(category_report)}")
     imp.clear_location()
     imp.import_products(_read(products))
+    imp.relink_sizes()     # restore user-entered recipe sizes the wipe cleared
     imp.relink_recipes()   # restore recipe ingredient links the inventory wipe NULLed
     imp.relink_counts()    # and count-line product links
     imp.import_vendor_items(_read(vendor_items))
