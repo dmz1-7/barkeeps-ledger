@@ -258,11 +258,13 @@ function buildNav() {
   const sub = location.hash;   // keep the leading '#' so it matches child hrefs (e.g. "#/recipes")
   $("#nav").innerHTML = NAV.map((n) => {
     const active = n.tab === section;
-    let html = `<a class="nav-link ${active ? "active" : ""}" href="${esc(n.href)}">
+    // aria-current="page" so screen readers announce the current section/screen,
+    // not just the visual .active styling.
+    let html = `<a class="nav-link ${active ? "active" : ""}" href="${esc(n.href)}"${active ? ' aria-current="page"' : ""}>
       <span class="ic">${esc(n.icon)}</span><span>${esc(n.label)}</span></a>`;
     if (n.children && active) {
       html += `<div class="nav-sub">` + n.children.map((c) =>
-        `<a href="${esc(c.href)}" class="${c.href === sub ? "active" : ""}">${esc(c.label)}</a>`).join("") + `</div>`;
+        `<a href="${esc(c.href)}" class="${c.href === sub ? "active" : ""}"${c.href === sub ? ' aria-current="page"' : ""}>${esc(c.label)}</a>`).join("") + `</div>`;
     }
     return html;
   }).join("");
@@ -272,7 +274,7 @@ function buildNav() {
   const tb = $("#tabbar");
   if (tb) {
     tb.innerHTML = NAV.map((n) =>
-      `<a href="${esc(n.href)}" class="${n.tab === section ? "active" : ""}">
+      `<a href="${esc(n.href)}" class="${n.tab === section ? "active" : ""}"${n.tab === section ? ' aria-current="page"' : ""}>
         <span class="ic">${esc(n.icon)}</span><b>${esc(n.label)}</b></a>`).join("");
   }
 }

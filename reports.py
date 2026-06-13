@@ -25,6 +25,15 @@ def _r(n):
     return round(n or 0, 2)
 
 
+def _same_rate(a, b):
+    """Compare two unit_cost rates by rounded value. unit_cost is a plain REAL
+    (deliberately NOT penny-normalized for sub-cent rates), so two economically
+    identical prices entered via different derivations (8.00/24 vs a stored
+    0.333333) carry different float tails and `==` would call them distinct. Round
+    to 4dp so a price 'epoch' boundary is robust to that float noise."""
+    return round(a or 0, 4) == round(b or 0, 4)
+
+
 # --- Category Report --------------------------------------------------------
 
 def category_report(start, end, vendor=None, status=None, search=None):
@@ -354,7 +363,7 @@ def price_movers(start, end):
         # later dip-and-return to the SAME value can't fold those earlier units in
         # (which charged the full delta on pre-dip units and overstated impact).
         if not g["epoch_ended"]:
-            if r["price"] == g["new_price"]:
+            if _same_rate(r["price"], g["new_price"]):
                 g["qty"] += (r["qty"] or 0)
             elif r["price"] is not None:
                 g["epoch_ended"] = True
@@ -362,27 +371,31 @@ def price_movers(start, end):
     pvkey = _PM_VENDOR.format(vi="v", inv="xi")
     pnkey = _PM_NAME.format(vi="v", ii="x")
     cat_names = {r["id"]: r["name"] for r in db.execute("SELECT id, name FROM categories")}
+    # Prior price (latest BEFORE the window) for every SKU in ONE pass, keyed on the
+    # same (vendor, item) identity — instead of a correlated subquery per moving SKU
+    # over a non-sargable lower(TRIM(...)) key (an N+1 that grows with history).
+    prior_price = {}
+    for r in db.execute(
+            f"SELECT {pvkey} AS vk, {pnkey} AS nk, x.unit_cost AS p FROM invoice_items x "
+            "JOIN invoices xi ON xi.id=x.invoice_id "
+            "LEFT JOIN vendor_items v ON v.id = x.vendor_item_id "
+            "WHERE xi.location_id IS ? AND xi.invoice_date < ? AND x.unit_cost > 0 "
+            "ORDER BY xi.invoice_date ASC, x.id ASC",   # ascending so the LAST seen per key wins (=latest)
+            (loc, start.isoformat())):
+        prior_price[(r["vk"], r["nk"])] = r["p"]
     movers = []
     for (gv, gn), g in groups.items():
         new_price, qty = g["new_price"], (g["qty"] or 0)
         if new_price is None or not qty:     # no price or nothing bought -> no signal
             continue
-        prior = db.execute(
-            "SELECT x.unit_cost AS p FROM invoice_items x JOIN invoices xi ON xi.id=x.invoice_id "
-            "LEFT JOIN vendor_items v ON v.id = x.vendor_item_id "
-            "WHERE xi.location_id IS ? AND xi.invoice_date < ? AND x.unit_cost > 0 "
-            f"  AND {pvkey} = ? AND {pnkey} = ? "
-            "ORDER BY xi.invoice_date DESC, x.id DESC LIMIT 1",
-            (loc, start.isoformat(), gv, gn),
-        ).fetchone()
-        old_price = prior["p"] if prior else None
+        old_price = prior_price.get((gv, gn))
         if old_price is None:
             # No price before the window — fall back to the earliest price seen
             # WITHIN it, so a change that happens entirely in-window still shows.
             ep = g.get("earliest_price")
-            if ep is not None and ep != new_price:
+            if ep is not None and not _same_rate(ep, new_price):
                 old_price = ep
-        if old_price is None or old_price == new_price:
+        if old_price is None or _same_rate(old_price, new_price):
             continue
         q = _r(qty)   # use the DISPLAYED qty for impact so Δprice x shown-qty reconciles
         movers.append({
@@ -455,11 +468,11 @@ def price_alerts(lookback_days=30, min_pct=10.0):
             # that same date at a DIFFERENT price is an intra-day correction or a
             # second SKU collapsing onto this key, so the current price is
             # ambiguous — suppress rather than risk a phantom hike.
-            if r["price"] == g["new_price"]:
+            if _same_rate(r["price"], g["new_price"]):
                 g["new_qty"] += (r["qty"] or 0)
             else:
                 g["ambiguous"] = True
-        elif r["price"] != g["new_price"]:
+        elif not _same_rate(r["price"], g["new_price"]):
             g["old_price"] = r["price"]   # most recent EARLIER-dated price that differs
             g["done"] = True
         # else: earlier date at the same price -> no change yet, keep scanning.

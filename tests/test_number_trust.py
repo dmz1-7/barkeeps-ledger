@@ -2947,7 +2947,9 @@ class SquareMalformed200(Base):
     def test_wrong_shape_fails_soft_with_error(self):
         with flask_app.app_context():
             db.set_setting("square_token", "tok")
-            bad = {"orders": [{"net_amounts": ["not", "a", "dict"]}], "cursor": None}
+            # a non-numeric money amount: parsing reaches arithmetic ("abc" - 0) and
+            # raises TypeError, which the broadened except turns into a soft error.
+            bad = {"orders": [{"net_amounts": {"total_money": {"amount": "abc"}}}], "cursor": None}
             with mock.patch.object(square_client.requests, "post", return_value=self._resp(bad)):
                 info = square_client.get_sales(dt.date(2026, 6, 1), dt.date(2026, 6, 2))
         self.assertEqual(info["sales"], 0.0)
@@ -4434,6 +4436,106 @@ class PrimePairsWithPct(Base):
                 s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
         self.assertIsNone(s["prime_pct"])   # no range sales -> labor_pct/prime_pct None
         self.assertIsNone(s["prime"])       # prime$ pairs with prime_pct
+
+
+# ============================================================================
+# Twenty-fourth audit-fix regression tests (2026-06-12, 24th re-audit)
+# ============================================================================
+
+class PriceEpochFloatTolerance(Base):
+    def _line(self, date, price, qty):
+        d = get_db()
+        iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                        "VALUES(1,'Acme',?,?)", (date, price * qty)).lastrowid
+        d.execute("INSERT INTO invoice_items(invoice_id,name,unit_cost,qty,total) "
+                  "VALUES(?,'Gin',?,?,?)", (iid, price, qty, price * qty))
+
+    def test_same_economic_price_different_float_tail_is_one_epoch(self):
+        with flask_app.app_context():
+            self._line("2026-05-15", 0.20, 1)        # prior (before window)
+            self._line("2026-06-10", 0.33331, 3)     # earlier in-window, same rate (round-4)
+            self._line("2026-06-20", 0.33330, 2)     # newest in-window
+            get_db().commit()
+            res = reports.price_movers(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        gin = [m for m in res["movers"] if m["name"] == "Gin"][0]
+        # both in-window lines are the SAME price epoch despite float tails -> qty 5
+        self.assertEqual(gin["qty"], 5.0)
+
+
+class RenameToArchivedName(Base):
+    def test_rename_reclaims_a_soft_deleted_name(self):
+        pid = self.client.post("/api/products", json={"name": "House Gin"}).get_json()["id"]
+        self.assertEqual(self.client.delete(f"/api/products/{pid}").status_code, 200)  # archived
+        other = self.client.post("/api/products", json={"name": "Well Gin"}).get_json()["id"]
+        # renaming the live product to the deleted name must succeed (reclaim), not 400
+        r = self.client.put(f"/api/products/{other}", json={"name": "house gin"})
+        self.assertEqual(r.status_code, 200)
+        with flask_app.app_context():
+            d = get_db()
+            live = d.execute("SELECT name FROM inventory_items WHERE id=?", (other,)).fetchone()
+            archived = d.execute("SELECT COUNT(*) c FROM inventory_items "
+                                 "WHERE id=? AND archived=1", (pid,)).fetchone()["c"]
+        self.assertEqual(live["name"].lower(), "house gin")
+        self.assertEqual(archived, 0)   # the invisible placeholder was reclaimed
+
+    def test_rename_to_a_LIVE_name_still_400s(self):
+        self.client.post("/api/products", json={"name": "Vodka"})
+        pid = self.client.post("/api/products", json={"name": "Rum"}).get_json()["id"]
+        r = self.client.put(f"/api/products/{pid}", json={"name": "Vodka"})  # live collision
+        self.assertEqual(r.status_code, 400)
+
+
+class SquareCacheDropOnReassign(Base):
+    def test_reassigning_square_id_purges_its_cached_daily_sales(self):
+        with flask_app.app_context():
+            get_db().execute("INSERT INTO daily_sales(square_location_id,date,net_sales,fetched_at) "
+                             "VALUES('FRESHID','2026-06-01',500.0,'2020-01-01')")
+            get_db().commit()
+        # assign FRESHID to store 1 -> its stale cache must be purged
+        r = self.client.post("/api/settings", json={"square_location_id": "FRESHID"},
+                             headers={"X-Location-Id": "1"})
+        self.assertEqual(r.status_code, 200)
+        with flask_app.app_context():
+            n = get_db().execute("SELECT COUNT(*) c FROM daily_sales "
+                                 "WHERE square_location_id='FRESHID'").fetchone()["c"]
+        self.assertEqual(n, 0)
+
+
+class NetAmountsFrameSelection(Base):
+    def test_empty_or_partial_net_amounts_uses_order_level(self):
+        # net_amounts present but WITHOUT total_money must NOT use a broken 0-total net
+        # frame — fall to the order-level frame instead.
+        order = {"net_amounts": {"tax_money": {"amount": 100}},
+                 "total_money": {"amount": 1000}, "total_tax_money": {"amount": 100}}
+        self.assertEqual(square_client._net_sales_cents(order), 900)   # 1000-100 (order-level)
+        # a present-but-empty net_amounts likewise falls to order-level
+        empty = {"net_amounts": {}, "total_money": {"amount": 500}}
+        self.assertEqual(square_client._net_sales_cents(empty), 500)
+
+    def test_full_net_amounts_still_wins(self):
+        order = {"net_amounts": {"total_money": {"amount": 1180}, "tax_money": {"amount": 100},
+                                 "tip_money": {"amount": 80}},
+                 "total_money": {"amount": 9999}}
+        self.assertEqual(square_client._net_sales_cents(order), 1000)   # net frame wins
+
+
+class PriceMoversMultiSku(Base):
+    def test_hoisted_prior_price_handles_multiple_skus(self):
+        with flask_app.app_context():
+            d = get_db()
+            for name, old, new in (("Gin", 10.0, 12.0), ("Rum", 5.0, 8.0)):
+                for date, price in (("2026-05-10", old), ("2026-06-15", new)):
+                    iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                                    "VALUES(1,'Acme',?,?)", (date, price)).lastrowid
+                    d.execute("INSERT INTO invoice_items(invoice_id,name,unit_cost,qty,total) "
+                              "VALUES(?,?,?,1,?)", (iid, name, price, price))
+            d.commit()
+            res = reports.price_movers(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        byname = {m["name"]: m for m in res["movers"]}
+        self.assertEqual(byname["Gin"]["old_price"], 10.0)   # prior-price lookup correct per SKU
+        self.assertEqual(byname["Gin"]["new_price"], 12.0)
+        self.assertEqual(byname["Rum"]["old_price"], 5.0)
+        self.assertEqual(byname["Rum"]["new_price"], 8.0)
 
 
 if __name__ == "__main__":

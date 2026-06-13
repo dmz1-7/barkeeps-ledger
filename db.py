@@ -625,6 +625,17 @@ def init_db():
     # duplicate is caught by the guarded CREATE rather than a later unguarded UPDATE.
     _apply_post_indexes(conn)
     conn.commit()
+    # Defensive: after the scrubs, surface (don't crash on) any remaining FK
+    # violation — e.g. a future hard-delete on a migrated DB that forgot to NULL an
+    # FK-less child ref would dangle silently otherwise. Logs loudly for the operator.
+    try:
+        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if bad:
+            tables = sorted({row[0] for row in bad})
+            print(f"  [!] foreign_key_check: {len(bad)} dangling reference(s) in {tables} — "
+                  "investigate a hard-delete that skipped child cleanup.")
+    except Exception:
+        pass
     conn.close()
 
 

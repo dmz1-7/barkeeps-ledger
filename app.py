@@ -680,6 +680,21 @@ def _revive_archived_item(database, loc, name, field_updates):
     return row["id"]
 
 
+def _reclaim_archived_name(database, loc, name, keep_id):
+    """Hard-delete a SOFT-DELETED (archived) product holding `name` in this store
+    (other than keep_id), so a LIVE product can be RENAMED to it. The archived row
+    is invisible with no unarchive path, so otherwise the rename would 400 on the
+    unique index with no recovery. Child refs survive via the original ON DELETE
+    SET NULL FKs (invoice_items.inventory_item_id / recipe_items.product_id /
+    count_lines.item_id). Returns True if it removed one."""
+    if not name:
+        return False
+    cur = database.execute(
+        "DELETE FROM inventory_items WHERE location_id IS ? AND name = ? COLLATE NOCASE "
+        "AND archived=1 AND id <> ?", (loc, name, keep_id))
+    return cur.rowcount > 0
+
+
 @app.post("/api/inventory")
 def inventory_create():
     d = body()
@@ -722,11 +737,16 @@ def inventory_update(item_id):
             vals.append(_coerce_col(key, d[key]))
     if not sets:
         return jsonify({"ok": True})
-    vals += [item_id, db.active_location_id()]
+    loc = db.active_location_id()
+    # Renaming to a name held by a SOFT-DELETED product: reclaim it (it's invisible
+    # with no unarchive path) so the rename succeeds instead of a misleading 400.
+    if "name" in d:
+        _reclaim_archived_name(db.get_db(), loc, _s(d["name"]), item_id)
+    vals += [item_id, loc]
     try:
         cur = db.get_db().execute(
             f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
-    except sqlite3.IntegrityError:   # renamed to a name already used in this store
+    except sqlite3.IntegrityError:   # renamed to a name held by a LIVE product
         return jsonify({"error": "That name already exists in this store."}), 400
     if cur.rowcount == 0:
         abort(404, description="Not found.")
@@ -1187,11 +1207,16 @@ def product_update(pid):
         if key in d:
             sets.append(f"{key}=?"); vals.append(_coerce_col(key, d[key]))
     if sets:
-        vals += [pid, db.active_location_id()]
+        loc = db.active_location_id()
+        # Reclaim a soft-deleted same-name product so a rename to it succeeds (see
+        # _reclaim_archived_name) instead of a misleading 'already exists' 400.
+        if "name" in d:
+            _reclaim_archived_name(db.get_db(), loc, _s(d["name"]), pid)
+        vals += [pid, loc]
         try:
             cur = db.get_db().execute(
                 f"UPDATE inventory_items SET {','.join(sets)} WHERE id=? AND location_id IS ?", vals)
-        except sqlite3.IntegrityError:   # renamed to a name already used in this store
+        except sqlite3.IntegrityError:   # renamed to a name held by a LIVE product
             return jsonify({"error": "That name already exists in this store."}), 400
         if cur.rowcount == 0:
             abort(404, description="Not found.")
