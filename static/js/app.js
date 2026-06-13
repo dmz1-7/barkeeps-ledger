@@ -501,25 +501,7 @@ async function loadDash() {
     body.appendChild(el(`<div class="note">${esc(d.labor_warning)}</div>`));
   }
 
-  // Proactive price-increase alerts, fetched separately so a hiccup here never
-  // breaks the dashboard. Only shown when there's something to flag.
-  try {
-    const pa = await api("GET", "/api/alerts/price-increases");
-    if (pa.count) {
-      const ac = el(`<div class="card"><div class="card-band">⚠ Price Increases
-        <span>${pa.count}</span></div><div class="card-body" id="pa"></div></div>`);
-      const box = ac.querySelector("#pa");
-      box.appendChild(el(`<p class="muted" style="font-size:.82rem;margin:0 0 .4rem">Vendor items up
-        ${pct(pa.min_pct)}+ vs their prior price, purchased in the last ${pa.lookback_days} days.</p>`));
-      pa.alerts.forEach((a) => box.appendChild(el(
-        `<div class="kv"><span>${esc(a.name)} <span class="muted">&middot; ${esc(a.vendor)}</span></span>
-          <b class="neg">${money(a.old_price)} &rarr; ${money(a.new_price)}
-          <span class="muted">(+${pct(a.change_pct)})</span></b></div>`)));
-      body.appendChild(ac);
-    }
-  } catch (e) { /* best-effort: alerts never block the dashboard */ }
-
-  body.appendChild(el(`
+  const statGrid = el(`
     <div class="stat-grid">
       <div class="stat wide accent-ind">
         <div class="label">Net Sales &middot; Square</div>
@@ -547,7 +529,24 @@ async function loadDash() {
         <div class="sub">${money(d.prime)} (COGS + Labor) &middot; target ${primeTarget}%</div>
         ${bar(d.prime_pct, primeTarget)}
       </div>
-    </div>`));
+    </div>`);
+  body.appendChild(statGrid);
+  // Proactive price-increase alerts: fetched WITHOUT blocking the tiles above, so a
+  // slow/hanging alerts endpoint never delays the headline COGS/Labor/Prime render.
+  // Inserted above the stat-grid on resolve. Best-effort: a failure is swallowed.
+  api("GET", "/api/alerts/price-increases").then((pa) => {
+    if (!pa || !pa.count) return;
+    const ac = el(`<div class="card"><div class="card-band">⚠ Price Increases
+      <span>${pa.count}</span></div><div class="card-body" id="pa"></div></div>`);
+    const box = ac.querySelector("#pa");
+    box.appendChild(el(`<p class="muted" style="font-size:.82rem;margin:0 0 .4rem">Vendor items up
+      ${pct(pa.min_pct)}+ vs their prior price, purchased in the last ${pa.lookback_days} days.</p>`));
+    pa.alerts.forEach((a) => box.appendChild(el(
+      `<div class="kv"><span>${esc(a.name)} <span class="muted">&middot; ${esc(a.vendor)}</span></span>
+        <b class="neg">${money(a.old_price)} &rarr; ${money(a.new_price)}
+        <span class="muted">(+${pct(a.change_pct)})</span></b></div>`)));
+    if (statGrid.parentNode === body) body.insertBefore(ac, statGrid);
+  }).catch(() => {});
   if (d.cogs_sales_basis === "interval") {
     // COGS% is measured over the inventory-count interval (a different span than
     // the labor/sales range), so Prime% is COGS% + Labor% — it won't equal

@@ -19,9 +19,18 @@ import time
 import uuid
 
 # Load .env before importing modules that read the environment at import time.
+_ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+# .env holds APP_SECRET (the session-token signing key) and APP_PASSWORD in plaintext.
+# The auth model rests on filesystem perms (see db._restrict_db_perms for the DB), so
+# tighten .env to owner-only too — by umask it can land world-readable.
+try:
+    if os.path.exists(_ENV_PATH) and (os.stat(_ENV_PATH).st_mode & 0o077):
+        os.chmod(_ENV_PATH, 0o600)
+except OSError:
+    pass
 try:
     from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+    load_dotenv(_ENV_PATH)
 except ImportError:
     pass
 
@@ -362,6 +371,11 @@ def save_settings():
             return jsonify({"error": "That Square location is already assigned to another store."}), 400
         db.get_db().execute("UPDATE locations SET square_location_id=? WHERE id=?",
                             (sqid, db.active_location_id()))
+        # Drop any cached daily_sales for the newly-assigned id: the cache keys only
+        # on square_location_id, so a sequentially-reused id could otherwise serve a
+        # previous store's stale net_sales without a historical refetch.
+        if sqid:
+            db.get_db().execute("DELETE FROM daily_sales WHERE square_location_id=?", (sqid,))
         db.get_db().commit()
     # Only persist a Square token if a non-blank one is supplied (so the UI can
     # show "set" without round-tripping the secret).
@@ -790,7 +804,9 @@ def count_save():
         if not item:
             continue  # ignore items that don't belong to the active store
         unit_cost = item["unit_cost"] or 0
-        qty = _f(ln.get("qty"), 0) or 0
+        # Clamp negatives: a count is a physical on-hand quantity (>=0). A negative
+        # would deflate counts.value, the begin/end bracket that feeds usage-COGS.
+        qty = max(_f(ln.get("qty"), 0) or 0, 0.0)
         total_value += qty * unit_cost
         database.execute(
             "INSERT INTO count_lines(count_id, item_id, qty, unit_cost) VALUES(?,?,?,?)",
