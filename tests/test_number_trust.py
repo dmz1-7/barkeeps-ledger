@@ -3559,7 +3559,8 @@ class ShiftCostClamp(Base):
     def test_breaks_longer_than_shift_clamp_to_zero(self):
         s = {"start_at": "2026-06-01T18:00:00Z", "end_at": "2026-06-01T19:00:00Z",
              "wage": {"hourly_rate": {"amount": 1500}},
-             "breaks": [{"start_at": "2026-06-01T18:00:00Z", "end_at": "2026-06-01T21:00:00Z"}]}
+             "breaks": [{"is_paid": False, "start_at": "2026-06-01T18:00:00Z",
+                         "end_at": "2026-06-01T21:00:00Z"}]}
         cost, hours, _ = square_client._shift_cost(s, 0.0)
         self.assertEqual((cost, hours), (0.0, 0.0))   # 3h unpaid break > 1h shift -> floored
 
@@ -3926,6 +3927,99 @@ class ParseInvoiceApiError(ParseInvoiceEndToEnd):
                 flask_app.app_context():
             with self.assertRaises(invoice_ai.InvoiceError):
                 invoice_ai.parse_invoice(b"img", "image/png")
+
+
+# ============================================================================
+# Nineteenth audit-fix regression tests (2026-06-12, 19th re-audit)
+# ============================================================================
+
+class VendorMutationIsolation(AuthGateCoverage):
+    def test_foreign_vendor_put_and_delete_are_404_and_unchanged(self):
+        with flask_app.app_context():
+            vid = get_db().execute("INSERT INTO vendors(location_id,name) VALUES(2,'NYCSupply')").lastrowid
+            get_db().commit()
+        token = self.client.post("/api/login", json={"password": "secret"}).get_json()["token"]
+        h1 = {"Authorization": "Bearer " + token, "X-Location-Id": "1"}
+        self.assertEqual(self.client.put(f"/api/vendors/{vid}", headers=h1,
+                                         json={"name": "HACK"}).status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/vendors/{vid}", headers=h1).status_code, 404)
+        with flask_app.app_context():
+            row = get_db().execute("SELECT name, archived FROM vendors WHERE id=?", (vid,)).fetchone()
+        self.assertEqual((row["name"], row["archived"]), ("NYCSupply", 0))   # untouched
+
+
+class VendorGetIsolation(Base):
+    def test_foreign_vendor_404_and_spend_excludes_other_store(self):
+        with flask_app.app_context():
+            d = get_db()
+            # same-named vendor in both stores, each with its own invoice
+            d.execute("INSERT INTO vendors(location_id,name) VALUES(1,'Acme')")
+            v2 = d.execute("INSERT INTO vendors(location_id,name) VALUES(2,'Acme')").lastrowid
+            d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) VALUES(1,'Acme','2026-06-01',100)")
+            d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) VALUES(2,'Acme','2026-06-01',999)")
+            v1 = d.execute("SELECT id FROM vendors WHERE location_id IS 1 AND name='Acme'").fetchone()["id"]
+            d.commit()
+        # store 1 can't fetch store 2's vendor
+        self.assertEqual(self.client.get(f"/api/vendors/{v2}",
+                                         headers={"X-Location-Id": "1"}).status_code, 404)
+        # store-1 detail spend excludes the store-2 same-named vendor's $999
+        out = self.client.get(f"/api/vendors/{v1}", headers={"X-Location-Id": "1"}).get_json()
+        self.assertEqual(out["spend"], 100.0)
+
+
+class ArchivedNameRevive(Base):
+    def test_recreating_a_deleted_product_name_revives_it(self):
+        pid = self.client.post("/api/products", json={"name": "Tito's"}).get_json()["id"]
+        self.assertEqual(self.client.delete(f"/api/products/{pid}").status_code, 200)  # soft-delete
+        # re-adding the same name must succeed (revive), not 400 on the hidden row
+        r = self.client.post("/api/products", json={"name": "tito's", "unit_cost": 22})
+        self.assertEqual(r.status_code, 200)
+        with flask_app.app_context():
+            row = get_db().execute("SELECT archived, unit_cost FROM inventory_items "
+                                   "WHERE id=?", (pid,)).fetchone()
+        self.assertEqual(r.get_json()["id"], pid)     # same row revived
+        self.assertEqual((row["archived"], row["unit_cost"]), (0, 22))
+
+
+class SettingsNumericValidation(Base):
+    def test_non_numeric_setting_rejected(self):
+        r = self.client.post("/api/settings", json={"target_cogs_pct": "thirty"})
+        self.assertEqual(r.status_code, 400)
+        # a valid numeric value still saves
+        self.assertEqual(self.client.post("/api/settings", json={"target_cogs_pct": "28"}).status_code, 200)
+        with flask_app.app_context():
+            self.assertEqual(db.get_setting("target_cogs_pct"), "28")
+
+
+class PnlStaysPurchasesBasisWhenDashboardUsage(Base):
+    def test_pl_total_cogs_is_purchases_basis_even_in_usage_mode(self):
+        with flask_app.app_context():
+            d = get_db()
+            for day, val in (("2026-05-30", 1000.0), ("2026-07-02", 800.0)):
+                d.execute("INSERT INTO counts(location_id,taken_at,value) VALUES(1,?,?)",
+                          (f"{day} 12:00:00", val))
+            iid = d.execute("INSERT INTO invoices(location_id,vendor,invoice_date,total) "
+                            "VALUES(1,'V','2026-06-15',500)").lastrowid
+            d.execute("INSERT INTO invoice_items(invoice_id,name,total) VALUES(?,'x',500)", (iid,))
+            d.commit()
+            with mock.patch.object(square_client, "is_configured", return_value=False):
+                s = cogs.summary(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+                pl = reports.controllable_pl(dt.date(2026, 6, 1), dt.date(2026, 6, 30))
+        self.assertEqual(s["cogs_method"], "usage")   # dashboard uses usage COGS (1000+500-800=700)
+        self.assertEqual(s["cogs"], 700.0)
+        self.assertEqual(pl["total_cogs"], 500.0)     # P&L stays purchases-basis line total (differs)
+
+
+class KeylessBreakIsPaid(Base):
+    def test_break_missing_is_paid_treated_as_paid(self):
+        # is_paid is a required Square field; a MISSING key must default to paid
+        # (not subtracted), so a contract change can't silently understate Labor%.
+        s = {"start_at": "2026-06-01T18:00:00Z", "end_at": "2026-06-01T22:00:00Z",
+             "wage": {"hourly_rate": {"amount": 1500}},
+             "breaks": [{"start_at": "2026-06-01T19:00:00Z", "end_at": "2026-06-01T19:30:00Z"}]}
+        cost, hours, _ = square_client._shift_cost(s, 0.0)
+        self.assertEqual(hours, 4.0)                   # full 4h paid (break NOT subtracted)
+        self.assertEqual(cost, 60.0)                   # 4 * $15
 
 
 if __name__ == "__main__":
