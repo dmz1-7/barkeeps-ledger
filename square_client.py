@@ -441,9 +441,11 @@ def _shift_cost(shift, fallback_rate=0.0):
     if not start or not end:
         return 0.0, 0.0, 0.0
     seconds = (end - start).total_seconds()
-    # Subtract unpaid breaks.
+    # Subtract unpaid breaks. is_paid is a required field on Square Break objects;
+    # default a MISSING key to paid (True) so a contract/shape change can't silently
+    # reclassify breaks as unpaid and understate Labor%.
     for br in shift.get("breaks", []) or []:
-        if br.get("is_paid"):
+        if br.get("is_paid", True):
             continue
         b_start = _parse_ts(br.get("start_at"))
         b_end = _parse_ts(br.get("end_at"))

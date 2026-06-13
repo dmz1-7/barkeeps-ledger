@@ -331,8 +331,15 @@ def config():
 @app.post("/api/settings")
 def save_settings():
     data = body()
-    for key in ("square_env", "square_version", "ai_model", "target_cogs_pct",
-                "target_labor_pct", "default_hourly_wage", "price_alert_pct"):
+    # Reject a non-numeric value for the numeric settings rather than store it
+    # verbatim: consumers defensively fall back to the hard-coded default, so a bad
+    # value would be silently dropped and the user's save would appear to succeed.
+    _NUMERIC_SETTINGS = ("target_cogs_pct", "target_labor_pct", "default_hourly_wage",
+                         "price_alert_pct")
+    for key in _NUMERIC_SETTINGS:
+        if key in data and _scalar(data[key]) and _f(data[key]) is None:
+            return jsonify({"error": f"{key} must be a number."}), 400
+    for key in ("square_env", "square_version", "ai_model") + _NUMERIC_SETTINGS:
         if key in data and _scalar(data[key]):
             db.set_setting(key, data[key])
     # The Square location is per-store now: write it onto the active store's row,
@@ -549,7 +556,7 @@ def invoice_delete(inv_id):
         "SELECT DISTINCT vendor_item_id FROM invoice_items "
         "WHERE invoice_id=? AND vendor_item_id IS NOT NULL", (inv_id,))]
     db_.execute("DELETE FROM invoices WHERE id=? AND location_id IS ?", (inv_id, loc))
-    _recompute_last_price(db_, affected)
+    _recompute_last_price(db_, affected, loc)
     db_.commit()
     if row["image_path"]:
         try:
@@ -606,7 +613,7 @@ def invoice_update(inv_id):
             (inv_id, _s(it.get("name")), _f(it.get("qty")), _s(it.get("unit")) or None,
              _f(it.get("unit_cost")), money.normalize(it.get("total")), vi_id, cat_id),
         )
-    _recompute_last_price(database, old_vis - new_vis)   # only the orphaned SKUs
+    _recompute_last_price(database, old_vis - new_vis, loc)   # only the orphaned SKUs
     database.commit()
     return jsonify({"id": inv_id,
                     "reconciliation": _reconcile(d.get("subtotal"), d.get("tax"),
@@ -624,22 +631,49 @@ def inventory_list():
     return jsonify([dict(r) for r in rows])
 
 
+def _revive_archived_item(database, loc, name, field_updates):
+    """If a SOFT-DELETED (archived) product with this case-insensitive name already
+    exists in the store, revive it — un-archive and apply the new fields — and
+    return its id; else None. The uq_inv_loc_name index spans archived rows, so
+    without this a deleted-then-recreated name would hit a misleading 'already
+    exists' 400 for a product hidden everywhere in the UI (no unarchive path)."""
+    row = database.execute(
+        "SELECT id FROM inventory_items WHERE location_id IS ? AND name = ? COLLATE NOCASE "
+        "AND archived=1", (loc, name)).fetchone()
+    if not row:
+        return None
+    fu = {**field_updates, "archived": 0}
+    sets = ",".join(f"{k}=?" for k in fu)
+    database.execute(f"UPDATE inventory_items SET {sets} WHERE id=?",
+                     list(fu.values()) + [row["id"]])
+    return row["id"]
+
+
 @app.post("/api/inventory")
 def inventory_create():
     d = body()
-    if not _s(d.get("name")):   # name is NOT NULL; reject a blank like every sibling create does
+    name = _s(d.get("name"))
+    if not name:   # name is NOT NULL; reject a blank like every sibling create does
         return jsonify({"error": "Name is required."}), 400
+    database, loc = db.get_db(), db.active_location_id()
+    fields = {"name": name, "category": _s(d.get("category")) or "other", "unit": _s(d.get("unit")),
+              "par_level": _f(d.get("par_level"), 0), "last_count": _f(d.get("last_count"), 0),
+              "unit_cost": _f(d.get("unit_cost"), 0), "vendor": _s(d.get("vendor")),
+              "sort_order": _i(d.get("sort_order"), 0)}
+    revived = _revive_archived_item(database, loc, name, fields)
+    if revived is not None:
+        database.commit()
+        return jsonify({"id": revived})
     try:
-        cur = db.get_db().execute(
+        cur = database.execute(
             "INSERT INTO inventory_items(location_id, name, category, unit, par_level, last_count, "
             "unit_cost, vendor, sort_order) VALUES(?,?,?,?,?,?,?,?,?)",
-            (db.active_location_id(), _s(d.get("name")), _s(d.get("category")) or "other", _s(d.get("unit")),
-             _f(d.get("par_level"), 0), _f(d.get("last_count"), 0),
-             _f(d.get("unit_cost"), 0), _s(d.get("vendor")), _i(d.get("sort_order"), 0)),
+            (loc, fields["name"], fields["category"], fields["unit"], fields["par_level"],
+             fields["last_count"], fields["unit_cost"], fields["vendor"], fields["sort_order"]),
         )
-    except sqlite3.IntegrityError:   # UNIQUE(location_id, name) — clean 400, not a 500
+    except sqlite3.IntegrityError:   # UNIQUE(location_id, name) on a LIVE row — clean 400
         return jsonify({"error": "That name already exists in this store."}), 400
-    db.get_db().commit()
+    database.commit()
     return jsonify({"id": cur.lastrowid})
 
 
@@ -1009,16 +1043,23 @@ def product_create():
     if "name" not in cols:
         cols.append("name")
     cols.append("location_id")
-    vals = [name if k == "name" else (db.active_location_id() if k == "location_id"
+    database, loc = db.get_db(), db.active_location_id()
+    vals = [name if k == "name" else (loc if k == "location_id"
                                       else _coerce_col(k, d.get(k))) for k in cols]
+    # Revive a soft-deleted same-name product instead of erroring on the index.
+    revived = _revive_archived_item(database, loc, name,
+                                    {k: v for k, v in zip(cols, vals) if k != "location_id"})
+    if revived is not None:
+        database.commit()
+        return jsonify({"id": revived})
     placeholders = ",".join("?" * len(cols))
     try:
-        cur = db.get_db().execute(
+        cur = database.execute(
             f"INSERT INTO inventory_items({','.join(cols)}) VALUES({placeholders})", vals
         )
-    except sqlite3.IntegrityError:   # UNIQUE(location_id, name) — clean 400, not a 500
+    except sqlite3.IntegrityError:   # UNIQUE(location_id, name) on a LIVE row — clean 400
         return jsonify({"error": "That name already exists in this store."}), 400
-    db.get_db().commit()
+    database.commit()
     return jsonify({"id": cur.lastrowid})
 
 
@@ -1613,10 +1654,11 @@ def _coerce_col(key, v):
     return v if _scalar(v) else None
 
 
-def _recompute_last_price(database, vi_ids):
+def _recompute_last_price(database, vi_ids, loc):
     """Re-point each vendor_item's last price/date at its newest remaining
     positive-priced line (or NULL if none), so removing/editing-out a delivery
-    can't strand a stale 'last price'."""
+    can't strand a stale 'last price'. Scoped to `loc` so the isolation invariant
+    is local to the query, not an assumption about the caller."""
     for vi_id in vi_ids:
         if vi_id is None:
             continue
@@ -1630,7 +1672,7 @@ def _recompute_last_price(database, vi_ids):
             "    JOIN invoices inv ON inv.id=ii.invoice_id "
             "    WHERE ii.vendor_item_id=vendor_items.id AND ii.unit_cost>0 "
             "    ORDER BY inv.invoice_date DESC, ii.id DESC LIMIT 1) "
-            "WHERE id=?", (vi_id,))
+            "WHERE id=? AND location_id IS ?", (vi_id, loc))
 
 
 def _own_product_id(database, v):
