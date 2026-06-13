@@ -455,10 +455,12 @@ async function renderDashboard() {
     dashRange = { start: $("#d-start").value, end: $("#d-end").value, key: "custom" };
     loadDash();
   });
-  // On mount always load: setRange's silent guard skips loadDash for a "custom"
-  // key (so chip toggles don't refetch stale custom data), but on a fresh mount
-  // with a previously-chosen custom range that would leave the dashboard blank.
-  dashRange.key === "custom" ? loadDash() : setRange(dashRange.key, true);
+  // On mount, always run setRange so the active chip, the custom-range row
+  // visibility, and the From/To inputs are repopulated from dashRange (a stale
+  // "custom" range would otherwise show a blank From/To). setRange's silent guard
+  // skips loadDash for a custom key, so trigger the fetch ourselves in that case.
+  setRange(dashRange.key, true);
+  if (dashRange.key === "custom") loadDash();
 }
 
 function setRange(key, silent) {

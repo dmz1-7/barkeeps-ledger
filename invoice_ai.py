@@ -179,6 +179,12 @@ def _num(v):
 
 
 def _normalize(data):
+    # The model can emit a syntactically-valid top-level JSON ARRAY (or other
+    # non-object); data.get() would AttributeError and escape as a 500. Raise the
+    # friendly InvoiceError so the endpoint returns its 422 + image_path (which
+    # preserves the saved photo for manual entry) instead.
+    if not isinstance(data, dict):
+        raise InvoiceError("Could not read a structured result from the image. Try a clearer photo.")
     items = []
     for it in data.get("line_items") or []:
         if not isinstance(it, dict):
