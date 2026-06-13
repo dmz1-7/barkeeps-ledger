@@ -253,9 +253,10 @@ def get_daily_sales(start, end):
             r.raise_for_status()
             data = r.json()
             for o in data.get("orders", []):
-                day = _business_day(o.get("closed_at"))
-                if not day:
-                    continue
+                # Fall back to the range end if closed_at is unparseable, so a
+                # COMPLETED order counts in the per-day total exactly as it does in
+                # get_sales (which sums unconditionally) — the two paths must agree.
+                day = _business_day(o.get("closed_at")) or end.isoformat()
                 # accumulate integer cents (matches get_sales), convert once below
                 by_day[day] = by_day.get(day, 0) + _net_sales_cents(o)
             cursor = data.get("cursor")

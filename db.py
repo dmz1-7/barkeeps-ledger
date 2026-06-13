@@ -217,6 +217,12 @@ CREATE INDEX IF NOT EXISTS idx_items_vendoritem ON invoice_items(vendor_item_id)
 -- Case-insensitive product-name seek: the MarginEdge importer resolves each row
 -- with lower(name)=lower(?) per store; without this, every row is a per-store scan.
 CREATE INDEX IF NOT EXISTS idx_inv_loc_name ON inventory_items(location_id, name COLLATE NOCASE);
+-- Case-insensitive, location-scoped seeks for the per-invoice-line vendor/vendor-item
+-- resolution (_resolve_vendor_item) and the MarginEdge importer — without these the
+-- lower()-wrapped lookups full-SCAN vendor_items / vendors once per line/row.
+CREATE INDEX IF NOT EXISTS idx_vendoritems_loc_name ON vendor_items(
+    location_id, COALESCE(vendor_name,'') COLLATE NOCASE, vendor_item_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_vendors_loc_name ON vendors(location_id, name COLLATE NOCASE);
 -- Drop the redundant date-only invoice index: every invoice query also scopes by
 -- location_id, so idx_invoices_loc_date (location_id, invoice_date) already covers
 -- it and the single-column index only added write cost.
